@@ -577,11 +577,15 @@ def test_sync_idle_injects_pair_with_synthesized_marker(tmp_path: Path) -> None:
     # First is assistant (call), second is user (result).
     assert entries[0].role == "assistant"
     assert entries[1].role == "user"
-    call_block = entries[0].content[0]
+    # Assistant entry: [TextBlock(summary), ToolCallBlock(notification)]
+    assert len(entries[0].content) == 2
+    from lingtai_kernel.llm.interface import TextBlock
+    assert isinstance(entries[0].content[0], TextBlock)
+    call_block = entries[0].content[1]
     result_block = entries[1].content[0]
     assert isinstance(call_block, ToolCallBlock)
     assert call_block.name == "system"
-    assert call_block.args == {"action": "notification"}
+    assert call_block.args["action"] == "notification"
     assert isinstance(result_block, ToolResultBlock)
     assert result_block.synthesized is True
 

@@ -519,24 +519,38 @@ class ChatInterface:
         with the same id. Removes both entries and returns True. Returns
         False if no such strict pair exists.
 
-        The strict-shape requirement (each entry contains exactly one
-        block of the expected type) is intentional: this helper exists
+        The strict-shape requirement is intentional: this helper exists
         to maintain the single-slot invariant for synthesized appendix
         pairs (soul flow), which always have exactly that shape. Refusing
         to operate on mixed-content entries protects regular tool-call
         history from being corrupted by accidental id collisions.
+
+        The assistant entry may contain one ``ToolCallBlock`` plus any
+        number of ``TextBlock``s (the synthesized notification pair
+        carries a leading text summary alongside the tool call).  The
+        user entry must still be exactly one ``ToolResultBlock``.
         """
         for i in range(len(self._entries) - 1):
             a = self._entries[i]
             u = self._entries[i + 1]
             if a.role != "assistant" or u.role != "user":
                 continue
-            if len(a.content) != 1 or len(u.content) != 1:
+            if len(u.content) != 1:
                 continue
-            cblock = a.content[0]
+            # Assistant entry: exactly one ToolCallBlock, rest must be TextBlocks
+            cblock = None
+            for blk in a.content:
+                if isinstance(blk, ToolCallBlock):
+                    if cblock is not None:
+                        cblock = None  # multiple tool calls — skip
+                        break
+                    cblock = blk
+                elif not isinstance(blk, TextBlock):
+                    cblock = None
+                    break
+            if cblock is None:
+                continue
             rblock = u.content[0]
-            if not isinstance(cblock, ToolCallBlock):
-                continue
             if not isinstance(rblock, ToolResultBlock):
                 continue
             if cblock.id != call_id or rblock.id != call_id:
@@ -560,18 +574,33 @@ class ChatInterface:
         notification pairs only. Refusing to operate on mixed-content
         entries or non-notification calls protects regular tool-call
         history from being corrupted.
+
+        The assistant entry may contain one ``ToolCallBlock`` plus any
+        number of ``TextBlock``s (the synthesized notification pair
+        carries a leading text summary alongside the tool call).  The
+        user entry must still be exactly one ``ToolResultBlock``.
         """
         for i in range(len(self._entries) - 1):
             a = self._entries[i]
             u = self._entries[i + 1]
             if a.role != "assistant" or u.role != "user":
                 continue
-            if len(a.content) != 1 or len(u.content) != 1:
+            if len(u.content) != 1:
                 continue
-            cblock = a.content[0]
+            # Assistant entry: exactly one ToolCallBlock, rest must be TextBlocks
+            cblock = None
+            for blk in a.content:
+                if isinstance(blk, ToolCallBlock):
+                    if cblock is not None:
+                        cblock = None  # multiple tool calls — skip
+                        break
+                    cblock = blk
+                elif not isinstance(blk, TextBlock):
+                    cblock = None
+                    break
+            if cblock is None:
+                continue
             rblock = u.content[0]
-            if not isinstance(cblock, ToolCallBlock):
-                continue
             if not isinstance(rblock, ToolResultBlock):
                 continue
             if cblock.args.get("action") != "notification":
