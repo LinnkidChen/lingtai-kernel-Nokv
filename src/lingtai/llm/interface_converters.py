@@ -176,44 +176,6 @@ def _to_openai_block(block: ContentBlock) -> dict:
     return {"type": "text", "text": str(block)}
 
 
-def from_openai(messages: list[dict]) -> ChatInterface:
-    """Convert OpenAI message list to canonical interface."""
-    iface = ChatInterface()
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "system":
-            iface.add_system(content)
-        elif role == "user":
-            if isinstance(content, str):
-                iface.add_user_message(content)
-            elif isinstance(content, list):
-                iface.add_user_blocks([_from_openai_block(b) for b in content])
-        elif role == "assistant":
-            blocks: list[ContentBlock] = []
-            if content:
-                blocks.append(TextBlock(text=content))
-            for tc in msg.get("tool_calls", []):
-                fn = tc.get("function", {})
-                try:
-                    args = json.loads(fn.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-                blocks.append(ToolCallBlock(id=tc["id"], name=fn["name"], args=args))
-            iface.add_assistant_message(blocks)
-        elif role == "tool":
-            iface.add_tool_results([
-                ToolResultBlock(id=msg["tool_call_id"], name="", content=msg.get("content", "")),
-            ])
-    return iface
-
-
-def _from_openai_block(b: dict) -> ContentBlock:
-    if b.get("type") == "text":
-        return TextBlock(text=b["text"])
-    return TextBlock(text=str(b))
-
-
 # ---------------------------------------------------------------------------
 # OpenAI Responses API (input items)
 # ---------------------------------------------------------------------------
