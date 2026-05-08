@@ -161,130 +161,18 @@ def test_system_show_action_rejected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# nap action (formerly sleep / clock.wait)
+# nap removed — was broken (blocked notifications/soul flow while inside
+# tool handler). _nap_wake / _wake_nap remain as general-purpose heartbeat
+# nudges used by notification sync.
 # ---------------------------------------------------------------------------
 
 
-def test_nap_wake_event_exists(tmp_path):
-    """Agent should have _nap_wake threading.Event and _nap_wake_reason str."""
+def test_system_nap_returns_unknown_action(tmp_path):
+    """nap is no longer a valid system action."""
     agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    assert isinstance(agent._nap_wake, threading.Event)
-    assert not agent._nap_wake.is_set()
-    assert agent._nap_wake_reason == ""
-
-
-def test_system_nap_with_seconds(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-
-    start = time.monotonic()
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": 0.1})
-    elapsed = time.monotonic() - start
-
-    assert result["status"] == "ok"
-    assert result["reason"] == "timeout"
-    assert elapsed >= 0.09
-
-
-def test_system_nap_wakes_on_mail(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-
-    def fire_mail():
-        time.sleep(0.1)
-        agent._wake_nap("mail_arrived")
-
-    t = threading.Thread(target=fire_mail, daemon=True)
-    t.start()
-
-    start = time.monotonic()
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": 10})
-    elapsed = time.monotonic() - start
-
-    assert result["status"] == "ok"
-    assert result["reason"] == "mail_arrived"
-    assert elapsed < 5
-    t.join(timeout=1)
-
-
-def test_system_nap_requires_seconds(tmp_path):
-    """nap without seconds returns error — indefinite wait not allowed."""
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    result = agent._intrinsics["system"]({"action": "nap"})
+    result = agent._intrinsics["system"]({"action": "nap", "seconds": 1})
     assert result["status"] == "error"
-    assert "required" in result["message"]
-
-
-def test_system_nap_caps_at_300(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-
-    def fire_wake():
-        time.sleep(0.1)
-        agent._wake_nap("mail_arrived")
-
-    t = threading.Thread(target=fire_wake, daemon=True)
-    t.start()
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": 9999})
-    assert result["status"] == "ok"
-    t.join(timeout=1)
-
-
-def test_system_nap_wakes_on_interrupt(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-
-    def fire_interrupt():
-        time.sleep(0.1)
-        agent._cancel_event.set()
-
-    t = threading.Thread(target=fire_interrupt, daemon=True)
-    t.start()
-
-    start = time.monotonic()
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": 10})
-    elapsed = time.monotonic() - start
-
-    assert result["status"] == "ok"
-    assert result["reason"] == "interrupted"
-    assert elapsed < 5
-    t.join(timeout=1)
-
-
-def test_system_nap_negative_seconds(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": -5})
-    assert result["status"] == "error"
-
-
-def test_nap_clears_stale_event(tmp_path):
-    """Nap should NOT exit immediately if _nap_wake was set before the nap started."""
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    # Simulate stale event from earlier mail
-    agent._wake_nap("mail_arrived")
-
-    start = time.monotonic()
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": 0.3})
-    elapsed = time.monotonic() - start
-
-    assert result["status"] == "ok"
-    assert result["reason"] == "timeout"
-    # Should have actually waited, not exited instantly
-    assert elapsed >= 0.25
-
-
-def test_nap_returns_soul_arrived_reason(tmp_path):
-    """Nap should return reason='soul_arrived' when woken by soul flow."""
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-
-    def fire_soul():
-        time.sleep(0.1)
-        agent._wake_nap("soul_arrived")
-
-    t = threading.Thread(target=fire_soul, daemon=True)
-    t.start()
-
-    result = agent._intrinsics["system"]({"action": "nap", "seconds": 10})
-
-    assert result["status"] == "ok"
-    assert result["reason"] == "soul_arrived"
-    t.join(timeout=1)
+    assert "Unknown system action" in result["message"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,6 @@
 """System intrinsic — runtime, lifecycle, and synchronization.
 
 Actions (voluntary, agent-callable):
-    nap       — pause execution; wakes on incoming message or timeout
     refresh   — stop, reload MCP servers and config from working dir, restart
     sleep     — self only, go to sleep (no karma needed)
     lull      — put another agent to sleep (requires karma)
@@ -27,7 +26,6 @@ Identity, runtime, and stamina state surface via other channels:
       when the agent wants the deep dive
 
 Sub-modules:
-    nap.py           — _nap() function.
     preset.py        — _preset_ref_in(), _check_context_fits(), _refresh(), _presets().
     karma.py         — _KARMA_ACTIONS, _NIRVANA_ACTIONS, _check_karma_gate(),
                        _sleep(), _lull(), _suspend(), _cpr(), _interrupt(),
@@ -57,9 +55,6 @@ from ...notifications import (  # noqa: F401
     submit as publish_notification,
     clear as clear_notification,
 )
-
-# Nap
-from .nap import _nap  # noqa: F401
 
 # Preset
 from .preset import _preset_ref_in, _check_context_fits, _refresh, _presets  # noqa: F401
@@ -98,7 +93,6 @@ def handle(agent, args: dict) -> dict:
         from ...notifications import collect_notifications
         return collect_notifications(agent._working_dir)
     handler = {
-        "nap": _nap,
         "refresh": _refresh,
         "sleep": _sleep,
         "lull": _lull,

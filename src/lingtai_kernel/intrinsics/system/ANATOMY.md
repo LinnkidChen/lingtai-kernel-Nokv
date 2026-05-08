@@ -1,6 +1,6 @@
 # intrinsics/system
 
-System intrinsic — runtime, lifecycle, and synchronization. Provides the agent with nap (pause execution), refresh (hot-reload config/presets), karma-gated lifecycle actions on other agents (sleep, lull, suspend, cpr, interrupt, clear, nirvana), preset listing, voluntary notification reads (`action="notification"`), and a deprecated `dismiss` no-op shim. The system module is also the **conceptual home** of the notification surface — it re-exports `publish_notification` / `clear_notification` from the kernel-root `notifications.py` so any in-process producer (intrinsic, capability, or wired-in MCP server) submits through one canonical entry point.
+System intrinsic — runtime, lifecycle, and synchronization. Provides the agent with refresh (hot-reload config/presets), karma-gated lifecycle actions on other agents (sleep, lull, suspend, cpr, interrupt, clear, nirvana), preset listing, voluntary notification reads (`action="notification"`), and a deprecated `dismiss` no-op shim. The system module is also the **conceptual home** of the notification surface — it re-exports `publish_notification` / `clear_notification` from the kernel-root `notifications.py` so any in-process producer (intrinsic, capability, or wired-in MCP server) submits through one canonical entry point.
 
 > **Maintenance:** see the `lingtai-kernel-anatomy` skill. **Coding agents** update this file in the same commit as code changes. **LingTai agents** report drift as issues.
 
@@ -12,9 +12,6 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
   - **`publish_notification` / `clear_notification`** (re-exported from `lingtai_kernel.notifications` as `submit` / `clear`) — canonical producer entry point. Importable as `from lingtai_kernel.intrinsics.system import publish_notification, clear_notification`. The system module owns the notification surface conceptually; the implementation lives at the kernel root so non-intrinsic callers (and external scripts) can import it without going through the intrinsic surface.
   - All handler functions re-exported from sub-modules for backward compatibility.
   - `handle()` (`__init__.py:87-115`) — main dispatcher with explicit dispatch table. The `notification` action takes a fast path that returns `collect_notifications(agent._working_dir)` directly without going through the dispatch table — voluntary reads of the agent's own `.notification/` state.
-
-- `nap.py` — Nap action.
-  - `_nap()` (`nap.py:12-56`) — pause execution; polls for wake signals (cancel, nap_wake) or timeout. Max wait capped at 300s.
 
 - `preset.py` — Preset management and refresh.
   - `_preset_ref_in()` (`preset.py:13-33`) — normalized membership test for preset path strings (~/foo vs absolute).
@@ -54,6 +51,5 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 - The `notification` action is now agent-callable: it returns the bare `collect_notifications(workdir)` dict (no `_synthesized` envelope, since the call wasn't synthesized). Kernel-synthesized notification reads happen via the wire-injection path in `BaseAgent._inject_notification_pair` and carry `_synthesized: true` in their JSON body.
 - Karma gate checks resolve addresses through `_check_karma_gate()` which validates admin flags before any filesystem mutation.
 - `_dismiss` is a deprecation no-op: it always returns `{"status": "ok", "note": "..."}` regardless of input. Logs every call as `system_dismiss_deprecated` so unintended invocations surface in agent logs.
-- `_nap` clears stale wake signals before sleeping and uses a TOCTOU-safe clear-then-wait pattern.
 - Preset swap has two guards: authorization (allowed list) and context-fit (current tokens ≤ target context_limit).
 - Producer notification writes (`publish_notification`) are atomic (`tmp + rename` inside `notifications.publish`) — readers never see a half-written file.
