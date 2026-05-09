@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...i18n import t
@@ -119,6 +121,14 @@ def get_schema(lang: str = "en") -> dict:
                 "minimum": 5,
                 "description": t(lang, "daemon.timeout"),
             },
+            "backend": {
+                "type": "string",
+                "enum": ["lingtai", "claude-code", "codex"],
+                "description": (
+                    "Execution backend: 'lingtai' (default built-in emanation), "
+                    "'claude-code' (Claude Code CLI), or 'codex' (Codex CLI)."
+                ),
+            },
         },
         "required": ["action"],
     }
@@ -150,11 +160,13 @@ class DaemonManager:
 
     def handle(self, args: dict) -> dict:
         action = args.get("action")
+        backend = args.get("backend", "lingtai")
         if action == "emanate":
             return self._handle_emanate(
                 args.get("tasks", []),
                 max_turns=args.get("max_turns"),
                 timeout=args.get("timeout"),
+                backend=backend,
             )
         elif action == "list":
             return self._handle_list()
@@ -484,6 +496,128 @@ class DaemonManager:
             run_dir.mark_failed(e)
             raise
 
+    def _find_claude_session_id(self, em_id: str) -> str | None:
+        """Search ~/.claude/projects/ for the session JSONL whose customTitle matches em_id.
+
+        Claude Code stores sessions as JSONL files under
+        ``~/.claude/projects/<project-hash>/``. The first line of each session
+        file is a JSON object with ``type: "custom-title"`` containing the
+        ``customTitle`` and ``sessionId``.
+        """
+        projects_dir = Path.home() / ".claude" / "projects"
+        if not projects_dir.is_dir():
+            return None
+        for jsonl_path in projects_dir.rglob("*.jsonl"):
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                if not first_line:
+                    continue
+                obj = json.loads(first_line)
+                if (obj.get("type") == "custom-title"
+                        and obj.get("customTitle") == em_id):
+                    return obj.get("sessionId")
+            except (OSError, json.JSONDecodeError):
+                continue
+        return None
+
+    def _run_claude_code_emanation(
+        self,
+        em_id: str,
+        run_dir: DaemonRunDir,
+        task: str,
+        cancel_event: threading.Event,
+        timeout_event: threading.Event | None = None,
+    ) -> str:
+        """Run a Claude Code CLI session as the emanation backend.
+
+        Spawns ``claude --print --dangerously-skip-permissions --name <em_id> <task>``
+        and streams stdout back via ``_notify_parent()``. After the process
+        finishes, discovers the session ID from the JSONL files and stores it
+        in run_dir's daemon.json as ``claude_session_id``.
+        """
+        def _exit_cancelled() -> str:
+            if timeout_event is not None and timeout_event.is_set():
+                run_dir.mark_timeout()
+            else:
+                run_dir.mark_cancelled()
+            return "[cancelled]"
+
+        if cancel_event.is_set():
+            return _exit_cancelled()
+
+        cmd = [
+            "claude",
+            "--print",
+            "--dangerously-skip-permissions",
+            "--output-format", "text",
+            "--name", em_id,
+            task,
+        ]
+        self._log("daemon_claude_code_start", em_id=em_id, cmd=" ".join(cmd))
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(self._agent._working_dir),
+            )
+        except FileNotFoundError:
+            exc = RuntimeError("'claude' CLI not found on PATH")
+            run_dir.mark_failed(exc)
+            raise exc
+        except OSError as e:
+            exc = RuntimeError(f"Failed to start claude CLI: {e}")
+            run_dir.mark_failed(exc)
+            raise exc
+
+        output_lines: list[str] = []
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if cancel_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return _exit_cancelled()
+                output_lines.append(line)
+                stripped = line.rstrip("\n")
+                if stripped:
+                    self._notify_parent(em_id, stripped)
+
+            proc.wait()
+        except Exception as e:
+            proc.kill()
+            proc.wait()
+            run_dir.mark_failed(e)
+            raise
+
+        full_output = "".join(output_lines)
+
+        if proc.returncode != 0:
+            exc = RuntimeError(
+                f"claude CLI exited with code {proc.returncode}: "
+                f"{full_output[-500:]}"
+            )
+            run_dir.mark_failed(exc)
+            raise exc
+
+        # Discover the Claude Code session ID from the session JSONL files
+        session_id = self._find_claude_session_id(em_id)
+        if session_id:
+            run_dir._state["claude_session_id"] = session_id
+            run_dir._atomic_write_json(run_dir.daemon_json_path, run_dir._state)
+            self._log("daemon_claude_code_session",
+                      em_id=em_id, session_id=session_id)
+
+        text = full_output.strip() or "[no output]"
+        run_dir.mark_done(text)
+        return text
+
     def _notify_parent(self, em_id: str, text: str) -> None:
         """Send a [daemon] notification to parent's inbox."""
         notification = f"[daemon:{em_id}]\n\n{text}"
@@ -502,7 +636,8 @@ class DaemonManager:
 
     def _handle_emanate(self, tasks: list[dict],
                         max_turns: int | None = None,
-                        timeout: float | None = None) -> dict:
+                        timeout: float | None = None,
+                        backend: str = "lingtai") -> dict:
         if not tasks:
             return {"status": "error", "message": "No tasks provided"}
 
@@ -543,6 +678,14 @@ class DaemonManager:
         self._emanations = {k: v for k, v in self._emanations.items()
                             if not v["future"].done()}
         self._pools = [(p, c) for p, c in self._pools if not c.is_set()]
+
+        # --- Claude Code / Codex backend: skip preset resolution entirely ---
+        if backend in ("claude-code", "codex"):
+            return self._handle_emanate_cli(
+                tasks, backend=backend,
+                effective_max_turns=effective_max_turns,
+                effective_timeout=effective_timeout,
+            )
 
         # Pre-flight: resolve any per-task presets BEFORE scheduling.
         # If any preset is invalid, refuse the whole batch. Presets are
@@ -693,6 +836,89 @@ class DaemonManager:
 
         return {"status": "dispatched", "count": len(tasks), "ids": ids}
 
+    def _handle_emanate_cli(
+        self,
+        tasks: list[dict],
+        backend: str,
+        effective_max_turns: int,
+        effective_timeout: float,
+    ) -> dict:
+        """Dispatch emanations via an external CLI backend (claude-code, codex).
+
+        Skips preset resolution — the CLI manages its own tools/model/provider.
+        Creates a DaemonRunDir for tracking and streams output via the parent
+        notification channel.
+        """
+        cancel_event = threading.Event()
+        timeout_event = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=len(tasks))
+        self._pools.append((pool, cancel_event))
+
+        ids = []
+        parent_addr = self._agent._working_dir.name
+        parent_pid = os.getpid()
+
+        for spec in tasks:
+            em_id = f"em-{self._next_id}"
+            self._next_id += 1
+            ids.append(em_id)
+
+            system_prompt = f"[{backend} backend — task delegated to external CLI]"
+            try:
+                run_dir = DaemonRunDir(
+                    parent_working_dir=self._agent._working_dir,
+                    handle=em_id,
+                    task=spec["task"],
+                    tools=spec.get("tools", []),
+                    model=backend,
+                    max_turns=effective_max_turns,
+                    timeout_s=effective_timeout,
+                    parent_addr=parent_addr,
+                    parent_pid=parent_pid,
+                    system_prompt=system_prompt,
+                    log_callback=self._log,
+                    backend=backend,
+                )
+            except OSError as e:
+                return {"status": "error",
+                        "message": f"Failed to create daemon folder: {e}"}
+
+            future = pool.submit(
+                self._run_claude_code_emanation,
+                em_id, run_dir, spec["task"],
+                cancel_event, timeout_event,
+            )
+            future.add_done_callback(
+                lambda f, eid=em_id, task=spec["task"]:
+                    self._on_emanation_done(eid, task, f)
+            )
+            self._emanations[em_id] = {
+                "future": future,
+                "task": spec["task"],
+                "start_time": time.time(),
+                "cancel_event": cancel_event,
+                "timeout_event": timeout_event,
+                "followup_buffer": "",
+                "followup_lock": threading.Lock(),
+                "run_dir": run_dir,
+                "backend": backend,
+            }
+
+        # Start watchdog
+        watchdog = threading.Thread(
+            target=self._watchdog,
+            args=(cancel_event, timeout_event, effective_timeout),
+            daemon=True,
+        )
+        watchdog.start()
+
+        self._log("daemon_emanate", ids=ids, count=len(tasks), backend=backend,
+                  tasks=[{"task": s["task"][:80], "tools": s.get("tools", [])}
+                         for s in tasks])
+
+        return {"status": "dispatched", "count": len(tasks), "ids": ids,
+                "backend": backend}
+
     def _handle_list(self) -> dict:
         emanations = []
         running = 0
@@ -728,6 +954,11 @@ class DaemonManager:
         entry = self._emanations.get(em_id)
         if not entry:
             return {"status": "error", "message": f"Unknown emanation: {em_id}"}
+
+        # Claude Code backend: resume the session with --resume <session-id>
+        if entry.get("backend") in ("claude-code", "codex"):
+            return self._handle_ask_cli(em_id, entry, message)
+
         if entry["future"].done():
             return {"status": "error", "message": "not running"}
         with entry["followup_lock"]:
@@ -737,6 +968,55 @@ class DaemonManager:
                 entry["followup_buffer"] = message
         self._log("daemon_ask", em_id=em_id, message_length=len(message))
         return {"status": "sent", "id": em_id}
+
+    def _handle_ask_cli(self, em_id: str, entry: dict, message: str) -> dict:
+        """Send a follow-up message to a Claude Code session via --resume."""
+        run_dir = entry.get("run_dir")
+        if run_dir is None:
+            return {"status": "error", "message": f"emanation {em_id} has no run_dir"}
+
+        session_id = run_dir._state.get("claude_session_id")
+        if not session_id:
+            return {"status": "error",
+                    "message": f"No claude session ID found for {em_id}. "
+                               "The emanation may still be running its initial task."}
+
+        cmd = [
+            "claude",
+            "--resume", session_id,
+            "--print",
+            "--dangerously-skip-permissions",
+            "--output-format", "text",
+            message,
+        ]
+        self._log("daemon_claude_code_ask", em_id=em_id,
+                  session_id=session_id, message_length=len(message))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(self._agent._working_dir),
+                timeout=self._timeout,
+            )
+        except FileNotFoundError:
+            return {"status": "error",
+                    "message": "'claude' CLI not found on PATH"}
+        except subprocess.TimeoutExpired:
+            return {"status": "error",
+                    "message": f"claude --resume timed out after {self._timeout}s"}
+
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            return {"status": "error",
+                    "message": f"claude CLI exited {result.returncode}: "
+                               f"{(result.stderr or output)[-500:]}"}
+
+        if output:
+            self._notify_parent(em_id, output)
+
+        return {"status": "sent", "id": em_id, "output": output}
 
     # Hard cap on `last` to bound memory in case events.jsonl has grown large
     # (long-running emanations under the new 3600s timeout default can write

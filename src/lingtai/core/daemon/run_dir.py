@@ -48,6 +48,7 @@ class DaemonRunDir:
         preset_name: str | None = None,
         preset_provider: str | None = None,
         preset_model: str | None = None,
+        backend: str = "lingtai",
     ):
         self._handle = handle
         self._parent_token_ledger = parent_working_dir / "logs" / "token_ledger.jsonl"
@@ -94,6 +95,8 @@ class DaemonRunDir:
             "preset_name": preset_name,
             "preset_provider": preset_provider,
             "preset_model": preset_model,
+            "backend": backend,
+            "claude_session_id": None,
         }
 
         self._atomic_write_json(self.daemon_json_path, self._state)
