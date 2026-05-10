@@ -114,6 +114,11 @@ def get_schema(lang: str = "en") -> dict:
                 "type": "boolean",
                 "description": t(lang, "avatar.confirm"),
             },
+            "backend": {
+                "type": "string",
+                "enum": ["lingtai", "claude-code"],
+                "description": "Runtime backend for the avatar. 'lingtai' (default) spawns a lingtai agent. 'claude-code' spawns a Claude Code session as a LingTai node.",
+            },
         },
         "allOf": [
             {
@@ -184,6 +189,7 @@ class AvatarManager:
         avatar_type = args.get("type", "shallow")
         dry_run = bool(args.get("dry_run", False))
         confirm = bool(args.get("confirm", False))
+        backend = args.get("backend", "lingtai")
 
         if peer_name is None:
             return {"error": "name is required — pick a true name (真名) for the 他我 (e.g. 'researcher', '学者')"}
@@ -277,6 +283,7 @@ class AvatarManager:
                 "preview": {
                     "name": peer_name,
                     "type": avatar_type,
+                    "backend": backend,
                     "working_dir": str(avatar_working_dir),
                     "address": avatar_working_dir.name,
                     "mission": preview_mission,
@@ -309,69 +316,83 @@ class AvatarManager:
             return {"error": f"Directory '{peer_name}' already exists. Choose another name."}
 
         # Prepare the avatar's working directory
-        if avatar_type == "deep":
-            self._prepare_deep(parent._working_dir, avatar_working_dir)
-        else:
-            avatar_working_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resolve relative file paths to absolute so avatar can find them
-        for key in ("env_file", "covenant_file", "principle_file",
-                    "substrate_file", "procedures_file", "comment_file"):
-            val = parent_init.get(key)
-            if val and not os.path.isabs(val):
-                resolved = parent._working_dir / val
-                if resolved.is_file():
-                    parent_init[key] = str(resolved)
-
-        # Inherit parent's venv_path so avatar can find the runtime
-        if hasattr(parent, "_venv_path") and parent._venv_path:
-            parent_init["venv_path"] = parent._venv_path
-
-        # Clean stale signal files before launch
-        for sig in (".suspend", ".sleep", ".interrupt"):
-            sig_file = avatar_working_dir / sig
-            if sig_file.is_file():
-                sig_file.unlink(missing_ok=True)
-
-        # Seed the avatar's first turn with a parent-identity prompt + the
-        # caller's reasoning (task brief). Written to the avatar's `.prompt`
-        # file — picked up by the kernel's signal-file watcher on first poll
-        # and delivered as a one-shot system message (consumed-once via unlink).
         parent_name = parent.agent_name or parent._working_dir.name
-        parent_address = parent._working_dir.name
-        avatar_lang = parent_init.get("manifest", {}).get("language", "en")
-        parent_prompt = t(
-            avatar_lang, "avatar.parent_prompt",
-            parent_name=parent_name,
-            parent_address=parent_address,
-        )
-        first_prompt = parent_prompt
-        if reasoning and reasoning.strip():
-            first_prompt = f"{parent_prompt}\n\n{reasoning.strip()}"
 
-        # Write avatar's init.json (modified copy of parent's).
-        avatar_comment = args.get("comment", "")
-        avatar_init = self._make_avatar_init(
-            parent_init, peer_name, comment=avatar_comment,
-            parent_working_dir=parent._working_dir,
-        )
-        (avatar_working_dir / "init.json").write_text(
-            json.dumps(avatar_init, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
+        if backend == "claude-code":
+            # Claude Code backend: provision a lingtai-node structure
+            self._prepare_claude_code_node(
+                avatar_working_dir, peer_name,
+                mission=reasoning or "",
+                parent_name=parent_name,
+            )
+            # Launch Claude Code
+            proc, stderr_path = self._launch_claude_code(
+                avatar_working_dir, reasoning or "",
+            )
+        else:
+            # Lingtai backend (default): copy init.json and launch lingtai
+            if avatar_type == "deep":
+                self._prepare_deep(parent._working_dir, avatar_working_dir)
+            else:
+                avatar_working_dir.mkdir(parents=True, exist_ok=True)
 
-        # Drop the spawn prompt as a `.prompt` signal file — the avatar's
-        # kernel watcher consumes it on first poll and delivers it once.
-        (avatar_working_dir / ".prompt").write_text(first_prompt, encoding="utf-8")
+            # Resolve relative file paths to absolute so avatar can find them
+            for key in ("env_file", "covenant_file", "principle_file",
+                        "substrate_file", "procedures_file", "comment_file"):
+                val = parent_init.get(key)
+                if val and not os.path.isabs(val):
+                    resolved = parent._working_dir / val
+                    if resolved.is_file():
+                        parent_init[key] = str(resolved)
 
-        # Launch as detached process and wait briefly for the child to either
-        # write its handshake (.agent.heartbeat) or exit. If the child exits
-        # before handshaking, the spawn failed — capture stderr, ledger the
-        # failure, and return an error to the caller. Without this check the
-        # avatar capability returns "ok" the instant Popen forks, even if the
-        # child crashes 50ms later (e.g. invalid init.json), and the parent's
-        # LLM has no idea anything went wrong.
-        proc, stderr_path = self._launch(avatar_working_dir)
+            # Inherit parent's venv_path so avatar can find the runtime
+            if hasattr(parent, "_venv_path") and parent._venv_path:
+                parent_init["venv_path"] = parent._venv_path
+
+            # Clean stale signal files before launch
+            for sig in (".suspend", ".sleep", ".interrupt"):
+                sig_file = avatar_working_dir / sig
+                if sig_file.is_file():
+                    sig_file.unlink(missing_ok=True)
+
+            # Seed the avatar's first turn with a parent-identity prompt + the
+            # caller's reasoning (task brief). Written to the avatar's `.prompt`
+            # file — picked up by the kernel's signal-file watcher on first poll
+            # and delivered as a one-shot system message (consumed-once via unlink).
+            parent_address = parent._working_dir.name
+            avatar_lang = parent_init.get("manifest", {}).get("language", "en")
+            parent_prompt = t(
+                avatar_lang, "avatar.parent_prompt",
+                parent_name=parent_name,
+                parent_address=parent_address,
+            )
+            first_prompt = parent_prompt
+            if reasoning and reasoning.strip():
+                first_prompt = f"{parent_prompt}\n\n{reasoning.strip()}"
+
+            # Write avatar's init.json (modified copy of parent's).
+            avatar_comment = args.get("comment", "")
+            avatar_init = self._make_avatar_init(
+                parent_init, peer_name, comment=avatar_comment,
+                parent_working_dir=parent._working_dir,
+            )
+            (avatar_working_dir / "init.json").write_text(
+                json.dumps(avatar_init, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+
+            # Drop the spawn prompt as a `.prompt` signal file — the avatar's
+            # kernel watcher consumes it on first poll and delivers it once.
+            (avatar_working_dir / ".prompt").write_text(first_prompt, encoding="utf-8")
+
+            # Launch as detached process and wait briefly for the child to either
+            # write its handshake (.agent.heartbeat) or exit. If the child exits
+            # before handshaking, the spawn failed — capture stderr, ledger the
+            # failure, and return an error to the caller. Without this check the
+            # avatar capability returns "ok" the instant Popen forks, even if the
+            # child crashes 50ms later (e.g. invalid init.json), and the parent's
+            # LLM has no idea anything went wrong.
+            proc, stderr_path = self._launch(avatar_working_dir)
         pid = proc.pid
 
         boot_status, boot_error = self._wait_for_boot(
@@ -388,6 +409,7 @@ class AvatarManager:
             working_dir=avatar_working_dir.name,
             mission=reasoning or "",
             type=avatar_type,
+            backend=backend,
             pid=pid,
             **ledger_extra,
         )
@@ -596,6 +618,117 @@ class AvatarManager:
 
         # Explicitly do NOT copy: history/, mailbox/, delegates/,
         # .agent.json, .agent.heartbeat, logs/
+
+    # ------------------------------------------------------------------
+    # Claude Code backend
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prepare_claude_code_node(
+        node_dir: Path,
+        name: str,
+        *,
+        mission: str = "",
+        parent_name: str = "",
+    ) -> None:
+        """Provision a Claude Code node directory.
+
+        Creates the lingtai-node contract structure:
+        - CLAUDE.md (identity)
+        - memory.md (working memory)
+        - handover.md (pre-compact letter template)
+        - mailbox/{inbox,sent,archive}/
+        - .agent.json (metadata)
+        """
+        from datetime import datetime, timezone
+
+        node_dir.mkdir(parents=True, exist_ok=True)
+
+        # Mailbox structure
+        for sub in ("inbox", "sent", "archive"):
+            (node_dir / "mailbox" / sub).mkdir(parents=True, exist_ok=True)
+
+        # .agent.json
+        agent_meta = {
+            "name": name,
+            "runtime": "claude-code",
+            "contract_version": "2.0.0",
+            "spawned_by": parent_name,
+            "spawned_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (node_dir / ".agent.json").write_text(
+            json.dumps(agent_meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # CLAUDE.md — identity file
+        claude_md = node_dir / "CLAUDE.md"
+        if not claude_md.is_file():
+            claude_md.write_text(
+                f"# {name}\n\n"
+                f"You are a LingTai network node running on the Claude Code runtime.\n"
+                f"Your name is **{name}**. Your parent is **{parent_name}**.\n\n"
+                f"## Communication\n\n"
+                f"You communicate via files in the `mailbox/` directory.\n"
+                f"Check for new messages by reading `mailbox/inbox/*/message.json`.\n"
+                f"Send messages by writing to `mailbox/outbox/<uuid>/message.json`.\n\n"
+                f"## Pre-Compact Ritual\n\n"
+                f"Before context compaction, save your state:\n"
+                f"1. Update this file (CLAUDE.md) if your identity evolved\n"
+                f"2. Rewrite memory.md with your current working state\n"
+                f"3. Write handover.md — a letter to the next self\n\n",
+                encoding="utf-8",
+            )
+
+        # memory.md — working memory
+        memory_md = node_dir / "memory.md"
+        if not memory_md.is_file():
+            memory_md.write_text(
+                f"# Memory — Working State\n\n"
+                f"## Current Task\n\n{mission or '(no mission yet)'}\n\n"
+                f"## Notes\n\n*(scratch space)*\n\n"
+                f"## Last Updated\n\n*(not yet)*\n",
+                encoding="utf-8",
+            )
+
+        # handover.md — pre-compact letter template
+        handover_md = node_dir / "handover.md"
+        if not handover_md.is_file():
+            handover_md.write_text(
+                "# Handover — Letter to the Next Self\n\n"
+                "## What I Was Doing\n\n"
+                "## What I Learned\n\n"
+                "## What's Next\n\n"
+                "## What to Watch Out For\n\n"
+                "---\n"
+                f"*Written: (not yet)*\n",
+                encoding="utf-8",
+            )
+
+    @staticmethod
+    def _launch_claude_code(working_dir: Path, mission: str) -> tuple[subprocess.Popen, Path]:
+        """Launch `claude -p <mission>` in a Claude Code node directory.
+
+        This is the simplest possible launch — runs Claude Code in non-interactive
+        mode with the mission as the initial prompt. For ongoing communication,
+        a watcher should be used instead (future enhancement).
+        """
+        logs_dir = working_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        stderr_path = logs_dir / "spawn.stderr"
+        stderr_fh = stderr_path.open("wb")
+        try:
+            proc = subprocess.Popen(
+                ["claude", "-p", mission, "--dangerously-skip-permissions"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_fh,
+                cwd=str(working_dir),
+                start_new_session=True,
+            )
+        finally:
+            stderr_fh.close()
+        return proc, stderr_path
 
     # ------------------------------------------------------------------
     # Process launch
