@@ -31,9 +31,10 @@ TOP_KNOWN: set[str] = {
     "comment", "comment_file",
     # "soul" / "soul_file" — retired in v0.7.6. The soul-flow voice is
     # now owned by the agent via soul(action='voice') and stored under
-    # manifest.soul.{voice,voice_prompt}. Existing init.json files
-    # carrying these top-level fields will emit "unknown field" warnings
-    # until a host migration cleans them up.
+    # manifest.soul.{voice,voice_prompt}. Kept in TOP_KNOWN so existing
+    # init.json files carrying these fields are silently ignored rather
+    # than emitting confusing "unknown field" warnings.
+    "soul", "soul_file",
 }
 
 MANIFEST_REQUIRED: dict[str, type | tuple[type, ...]] = {
@@ -76,9 +77,8 @@ def validate_init(data: dict) -> list[str]:
 
     # Text fields: inline value OR _file path (at least one required).
     # Note: "soul" / "soul_file" was removed in v0.7.6 — the soul-flow
-    # voice lives at manifest.soul.{voice,voice_prompt} now. Existing
-    # init.json files may still carry the legacy fields; they fall
-    # through to the unknown-key warning below rather than raising.
+    # voice lives at manifest.soul.{voice,voice_prompt} now. The legacy
+    # fields are kept in TOP_KNOWN for silent ignore (no warning).
     for key in ("principle", "covenant", "pad", "prompt"):
         file_key = f"{key}_file"
         has_inline = key in data
