@@ -86,7 +86,10 @@ def get_schema(lang: str = "en") -> dict:
                     "properties": {
                         "task": {"type": "string"},
                         "tools": {"type": "array", "items": {"type": "string"}},
-                        "preset": {"type": "string"},
+                        "preset": {
+                            "type": "string",
+                            "description": t(lang, "daemon.tasks.preset"),
+                        },
                     },
                     "required": ["task", "tools"],
                 },
