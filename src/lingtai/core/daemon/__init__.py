@@ -125,8 +125,10 @@ def get_schema(lang: str = "en") -> dict:
                 "type": "string",
                 "enum": ["lingtai", "claude-code", "codex"],
                 "description": (
-                    "Execution backend: 'lingtai' (default built-in emanation), "
-                    "'claude-code' (Claude Code CLI), or 'codex' (Codex CLI)."
+                    "Execution backend: 'lingtai' (default — parallel LLM reasoning, uses your current model), "
+                    "'claude-code' (coding tasks, code review, file manipulation via Claude Code CLI), "
+                    "'codex' (coding tasks via OpenAI Codex CLI). "
+                    "CLI backends use external tools with no LLM overhead from the parent."
                 ),
             },
         },
