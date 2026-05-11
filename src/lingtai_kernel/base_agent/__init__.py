@@ -388,7 +388,7 @@ class BaseAgent:
         # while the agent is mid-tool-chain; consumed (and reset to None)
         # by _inject_notification_meta inside SessionManager.send().
         self._pending_notification_meta: str | None = None
-        self._pending_notification_fp: str | None = None
+        self._pending_notification_fp: tuple | None = None
         # Per-turn flag: prevents _check_molt_pressure from incrementing
         # _compaction_warnings more than once per turn. Reset at turn
         # boundaries in _handle_request / _handle_tc_wake.
@@ -836,7 +836,11 @@ class BaseAgent:
 
         if not notifications:
             # All cleared — wire now has zero notification blocks.
+            # Also drop any ACTIVE-state stash: it may contain a channel
+            # that was just dismissed and must not be injected later.
             self._notification_fp = fp
+            self._pending_notification_meta = None
+            self._pending_notification_fp = None
             return
 
         # --- Inject new block based on current state ---

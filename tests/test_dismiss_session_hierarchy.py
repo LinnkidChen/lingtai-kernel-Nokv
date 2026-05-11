@@ -64,4 +64,4 @@ def test_dismiss_shim_is_safe_against_production_agent_shape():
     agent = _ProductionLikeAgent()
     res = sys_intrinsic._dismiss(agent, {"ids": ["notif_anything"]})
     assert res["status"] == "ok"
-    assert "deprecated" in res["note"].lower()
+    assert "legacy ids ignored" in res["note"]

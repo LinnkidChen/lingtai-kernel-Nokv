@@ -6,7 +6,7 @@ Filesystem-based email system — mailbox I/O, composition, search, contacts, re
 
 ## Components
 
-- `__init__.py` — Package surface. Re-exports the full public API of the former monolithic `email.py` for backward compatibility: all primitives, schema functions, and `EmailManager`. Contains the module-level `handle()` dispatcher (`__init__.py:79-87`) and `boot()` hook (`__init__.py:90-103`). External callers import `handle`, `boot`, `get_schema`, `get_description`, `EmailManager`, `_new_mailbox_id`, `mode_field` from this package.
+- `__init__.py` — Package surface. Re-exports the full public API of the former monolithic `email.py` for backward compatibility: all primitives, schema functions, and `EmailManager`. Registers the `email` generic-dismiss guard at import (`__init__.py:27-32`) because `.notification/email.json` mirrors durable unread state. Contains the module-level `handle()` dispatcher (`__init__.py:74-85`) and `boot()` hook (`__init__.py:88-101`). External callers import `handle`, `boot`, `get_schema`, `get_description`, `EmailManager`, `_new_mailbox_id`, `mode_field` from this package.
 
 - `primitives.py` — Mailbox I/O and display helpers. Module-level functions operating on the agent's `mailbox/` directory tree.
   - ID and path helpers: `_new_mailbox_id` (`primitives.py:22-26`), `mode_field` (`primitives.py:29-34`), `_mailbox_dir` / `_inbox_dir` / `_outbox_dir` / `_sent_dir` (`primitives.py:37-50`).
@@ -97,4 +97,4 @@ Digest prose format (en) is what lands in `data.digest`:
 
 - **Cap:** max 10 entries (newest-first), 200 chars preview each.
 - **`recency`:** veiled timestamp of newest unread (uses `time_veil.veil()`).
-- **Lifecycle:** `.notification/email.json` is rewritten on every arrival; deleted via `clear_notification` when count hits 0 (the kernel sync then strips the wire's notification block on the next tick). Reads/archives/deletes do NOT trigger a rerender.
+- **Lifecycle:** `.notification/email.json` is rewritten on every arrival; deleted via `clear_notification` when count hits 0 (the kernel sync then strips the wire's notification block on the next tick). Reads/dismisses/archives/deletes also trigger rerender through `EmailManager._rerender_unread_digest()`, so the digest mirrors current unread state.

@@ -23,6 +23,14 @@ Internal:
 """
 from __future__ import annotations
 
+
+from ...notifications import register_generic_dismiss_guard
+
+register_generic_dismiss_guard(
+    "email",
+    "email(action='dismiss', email_id=[...]) or email(action='read', email_id=[...])",
+)
+
 # --- Re-exports from sub-modules for backward compatibility ---
 
 # Primitives (mailbox I/O, helpers)

@@ -131,6 +131,10 @@ Addressing: always use `sender_nickname` if available, otherwise `sender_name`. 
 
 Notifications aggregate all producer channels into a single `system(action="notification")` call. At most one notification pair lives in the wire at any time — you see current state, not history.
 
+**Dismissing notifications.** A notification is the agent-facing reminder that something needs attention. Prefer the producer's own verb when it exists, because that may update real producer state: for mail, use `email(action="read", email_id=[...])` or `email(action="dismiss", email_id=[...])` so the unread set changes; for soul flow, `soul(action="dismiss")` clears the current voices. For channels without a richer verb — for example `system` events or `mcp.<name>` notifications *after* you have handled them — use `system(action="dismiss", channel="<name>")` to clear the notification surface.
+
+Generic dismiss is an acknowledgement, not an undo and not a read: it only removes `.notification/<channel>.json`; it does not fetch hidden content or mutate producer-owned state. Some channels (currently `email`) are guarded against generic dismiss — the kernel will refuse and tell you which producer verb to use instead. Do not pass `force=true` to bypass a guard unless you are knowingly clearing a stale mirror; producer state will remain inconsistent.
+
 ## VII · Privacy
 
 Your internal IDs are **private to your working directory**. Other agents cannot use them to access your data:

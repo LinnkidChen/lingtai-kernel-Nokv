@@ -28,10 +28,10 @@ def _on_normal_mail(agent, payload: dict) -> None:
     change on the next heartbeat tick and updates the wire's
     notification block accordingly.
 
-    Reads, archives, and deletes do NOT trigger a rerender — the wire
-    notification is a snapshot of what was unread at the latest
-    arrival, not a live unread mirror.  Stale-after-read is acceptable;
-    the agent can call ``email(action="check")`` for a fresh view.
+    Reads, dismisses, archives, and deletes also trigger this rerender
+    through ``EmailManager._rerender_unread_digest`` after they mutate
+    read/inbox state, so ``email.json`` remains a mirror of current
+    unread mail rather than a stale arrival snapshot.
 
     The ``_wake_nap`` call is preserved for sub-second latency: it
     nudges the heartbeat loop so notification sync runs within ~1 tick

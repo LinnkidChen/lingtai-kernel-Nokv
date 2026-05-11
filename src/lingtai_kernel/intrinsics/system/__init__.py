@@ -10,7 +10,7 @@ Actions (voluntary, agent-callable):
     clear     — force a full molt on another agent (requires karma)
     nirvana   — permanently destroy an agent's working directory (requires nirvana)
     presets   — list available presets in the agent's library
-    dismiss   — dismiss one or more system notifications by notif_id
+    dismiss   — clear one `.notification/<channel>.json` surface (guarded by producer policy)
 
 Action (kernel-synthesized by default — also callable voluntarily by the agent):
     notification — returns the current state of all notification channels

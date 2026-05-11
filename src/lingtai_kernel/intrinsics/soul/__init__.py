@@ -200,10 +200,11 @@ def handle(agent, args: dict) -> dict:
         return _handle_voice(agent, args)
 
     if action == "dismiss":
-        from ...notifications import clear as clear_notification
-        clear_notification(agent._working_dir, "soul")
-        agent._log("soul_dismiss")
-        return {"status": "ok", "message": "Soul flow notification dismissed."}
+        from ...notifications import dismiss_channel
+        result = dismiss_channel(agent, "soul", invoked_by="soul")
+        if result.get("status") == "ok":
+            result.setdefault("message", "Soul flow notification dismissed.")
+        return result
 
     return {
         "error": (

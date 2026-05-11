@@ -99,7 +99,7 @@ def test_arrival_then_voluntary_dismiss():
 
     res = sys_intrinsic._dismiss(agent, {"ids": ["notif_a"]})
     assert res["status"] == "ok"
-    assert "deprecated" in res.get("note", "").lower()
+    assert "legacy ids ignored" in res.get("note", "")
     # Wire untouched — no dismiss path under the new model.
     assert len(agent._session.chat.interface.conversation_entries()) == 2
 
@@ -148,7 +148,7 @@ def test_race_dismiss_before_splice():
 
     res = sys_intrinsic._dismiss(agent, {"ids": ["notif_d"]})
     assert res["status"] == "ok"
-    assert "deprecated" in res.get("note", "").lower()
+    assert "legacy ids ignored" in res.get("note", "")
     # Queue remains — dismiss no longer touches tc_inbox.
     assert len(agent._tc_inbox) == 1
 
@@ -212,7 +212,7 @@ def test_bounce_persists_until_voluntary_dismiss():
     # under the producer-managed-state model.  Test will be deleted in Phase 3.
     res = sys_intrinsic._dismiss(agent, {"ids": [notif_id]})
     assert res["status"] == "ok"
-    assert "deprecated" in res.get("note", "").lower()
+    assert "legacy ids ignored" in res.get("note", "")
     assert len(agent._session.chat.interface.conversation_entries()) == 2
 
 

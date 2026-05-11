@@ -29,7 +29,7 @@
   "psyche.keep_tool_calls_description": "可选：欲于凝蜕中存留之 LingTai 器调 id 之列（如 \"tc_1730330127_a3f1\"，于每条 tool result 之 _tool_call_id 字段可见）。所点之每对（tool_use 与对应之 tool_result）将于简报之后即刻回放入新会话，**按汝所列之序**——适于令蜕后之己原样见少量高值之文卷读取、搜寻之果或计算。序由汝掌以传信号：按时之序、按要紧之序、或先抛重物。若有 id 不可寻，凝蜕拒之而 molt 数不增——更正后再试。勿滥用：四层长存之储仍为持久化之主面，此列当从短。",
   "psyche.molt_result_note": "凝蜕已毕。对话之层已散；此微影——计数、归档之径、回看之径——即觉时随汝浮现之物。汝亲撰之回看，存于此 tool call 之 args.summary 中，亦长存于 `system/summaries/`。四储（lingtai、pad、codex、library）原样而过。慎勿重言——所留之对话条目已含汝近时之往来，已言之事勿复言之。",
   "system_tool.description": "运行检视、生死管、同步与器灵间之治。\n\n自身之操（无须权限）：sleep、refresh、notification。\n因果之操（须 admin.karma=True）：lull、interrupt、suspend、cpr、clear。\n涅槃（须 admin.karma=True 且 admin.nirvana=True）：nirvana。\n\n诸操之详，见 system-manual 技能。",
-  "system_tool.action_description": "refresh：更衣——器灵止，自 init.json 全然重建，身份如故而对话之史得存。自磁重载：MCP 服务器、诸能、附加、LLM、提示诸节。详见 system-manual。\n\npresets：列可用预设（标签、连通、诸能）。详见 system-manual。\n\nsleep：自愿入寐。身犹存而止事，待书信唤醒。\n\nlull：令他者入寐（因果）。\n\nsuspend：冻他者（因果）。\n\ncpr：复苏假死者（因果）。\n\ninterrupt：止他者当轮（因果）。\n\nclear：强令他者更衣（因果）。详见 system-manual。\n\nnirvana：永灭一灵（因果+涅槃）。详见 system-manual。\n\nnotification：查诸通知频道。仅替换。\n\ndismiss：已废——无效。",
+  "system_tool.action_description": "refresh：更衣——器灵止，自 init.json 全然重建，身份如故而对话之史得存。自磁重载：MCP 服务器、诸能、附加、LLM、提示诸节。详见 system-manual。\n\npresets：列可用预设（标签、连通、诸能）。详见 system-manual。\n\nsleep：自愿入寐。身犹存而止事，待书信唤醒。\n\nlull：令他者入寐（因果）。\n\nsuspend：冻他者（因果）。\n\ncpr：复苏假死者（因果）。\n\ninterrupt：止他者当轮（因果）。\n\nclear：强令他者更衣（因果）。详见 system-manual。\n\nnirvana：永灭一灵（因果+涅槃）。详见 system-manual。\n\nnotification：查诸通知频道。仅替换。\n\ndismiss：以名清一通知频道。先用其主之本动词（邮件用 email(read/dismiss)）；受护频道唯明知清陈镜时方传 force=true。",
   "system_tool.address_description": "目标智能体之地址（工作目录路径）。interrupt、lull、suspend、cpr、clear、nirvana 须此参数。",
   "system_tool.reason_description": "入寐、更衣或 clear 之缘由（录于事件日志；用于 clear 时，成为复位之书中 source 之标）。",
   "system_tool.preset_description": "可选。配 action='refresh' 用：刷新前换行囊中之一预设（{胎光, 肉身} 之合也）。action='presets' 浏览可用预设。轻巧、可逆。若当下之文超目标预设之限，换被拒——请先更衣。",
@@ -78,10 +78,11 @@
   "email.schedule_count": "总发信次数（用于 create）",
   "email.schedule_id": "定期之 ID（用于 cancel/reactivate）",
   "email.mode": "传书之址式。几无须设——默认 'peer' 已足以达己网中诸侪。peer（默认，同侪之式）：以 'address' 为汝网中某侪之裸名（工作目录名）——human、同伴、己之分身、简中所列或曾以书相通者皆是。系统于汝之网（汝工作目录之父）中解此名。abs：以 'address' 为字面绝对路径，直指彼智能体之工作目录。唯当所达者居本机上别一 .lingtai/ 网中时方用之（跨项目之书、桥接之灵）。其址须为完整之路，如 /Users/alice/projectB/.lingtai/外援。两式皆须受书者存活（心跳新鲜）且具完好之 .agent.json——abs 不绕握手之验。",
-  "system_tool.ids_description": "已废——无效。",
   "email.unread_digest": "[邮] 未阅之书凡 {count} 封，新者发于 {recency}。\n\n{entries}\n{more}",
   "email.unread_digest.entry": "  {n}. 自 {name} ({address}) —— {subject}\n     编号：{id}\n     发于：{sent_at}\n     {preview}",
   "email.unread_digest.more": "（仅显前 {shown} 封，共 {total}）",
   "email.unread_digest.no_subject": "（无题）",
-  "soul.dismiss_description": "销心流之告。action='dismiss' 时用。"
+  "soul.dismiss_description": "销心流之告。action='dismiss' 时用。",
+  "system_tool.channel_description": "欲清之通知频道（如 soul、system、mcp.telegram）。action='dismiss' 必需。email 等受护频道，当用其主之本动词。",
+  "system_tool.force_description": "action='dismiss' 可选。为 true 则越过生产者所登记之通清护栏（今为 email）。唯明知清陈镜时用之；生产者自有状态不变。"
 }

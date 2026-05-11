@@ -1,157 +1,188 @@
-"""Tests for the ``system(action='dismiss')`` deprecation shim.
+"""Tests for ``system(action='dismiss', channel=...)``.
 
-Under the legacy ``tc_inbox`` model, agents dismissed individual
-notification pairs by ``notif_id``.  The filesystem redesign replaces
-that lifecycle: producers write `.notification/<tool>.json` files and
-clear them when their state changes; the kernel keeps the wire in sync
-automatically.  There is no per-notification dismiss action under the
-new model.
-
-The shim survives so chat histories that reference dismiss calls don't
-crash on replay.  These tests verify the shim contract:
-
-  * Returns ``{"status": "ok", "note": "<deprecation>"}`` regardless
-    of input shape.
-  * Does NOT mutate the wire chat or tc_inbox queue.
-  * Does NOT validate ``ids`` (no error path) — the call is a no-op.
-  * Logs a ``system_dismiss_deprecated`` event so unintended calls
-    surface in agent logs.
-
-Phase 3 deletes ``_dismiss`` and this test file entirely.
+Generic dismiss clears one `.notification/<channel>.json` file while
+preserving producer-specific state semantics. Legacy ``ids=`` calls are still
+accepted for one release cycle so old chat-history tails do not crash.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
+from uuid import uuid4
 
 from lingtai_kernel.intrinsics import system as sys_intrinsic
-from lingtai_kernel.llm.interface import (
-    ChatInterface, ToolCallBlock, ToolResultBlock,
+from lingtai_kernel.notifications import (
+    collect_notifications,
+    is_generic_dismiss_guarded,
+    publish,
 )
-from lingtai_kernel.tc_inbox import TCInbox, InvoluntaryToolCall
-
-
-class _StubChatSession:
-    def __init__(self, interface: ChatInterface):
-        self.interface = interface
-
-
-@dataclass
-class _StubSession:
-    chat: _StubChatSession
 
 
 @dataclass
 class _StubAgent:
-    _tc_inbox: TCInbox = field(default_factory=TCInbox)
-    _session: _StubSession = field(default=None)
+    _working_dir: Path
     _logs: list[tuple[str, dict]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        if self._session is None:
-            self._session = _StubSession(chat=_StubChatSession(ChatInterface()))
+    _pending_notification_meta: str | None = "stale"
+    _pending_notification_fp: tuple | None = (("soul.json", 1, 2),)
 
     def _log(self, event_type: str, **fields: Any) -> None:
         self._logs.append((event_type, fields))
 
 
-def _enqueue_notification(agent: _StubAgent, notif_id: str) -> str:
-    call_id = f"call_{notif_id}"
-    call = ToolCallBlock(id=call_id, name="system", args={
-        "action": "notification",
-        "notif_id": notif_id,
-    })
-    result = ToolResultBlock(id=call_id, name="system", content="...")
-    agent._session.chat.interface.add_assistant_message(content=[call])
-    agent._session.chat.interface.add_tool_results([result])
-    return call_id
+def _events(agent: _StubAgent, name: str) -> list[dict]:
+    return [fields for event, fields in agent._logs if event == name]
 
 
-# ---------------------------------------------------------------------------
-# Deprecation contract
-# ---------------------------------------------------------------------------
+def test_dismiss_channel_clears_existing_file(tmp_path: Path) -> None:
+    agent = _StubAgent(tmp_path)
+    publish(tmp_path, "soul", {"header": "soul flow"})
+
+    res = sys_intrinsic._dismiss(agent, {"channel": "soul"})
+
+    assert res == {"status": "ok", "channel": "soul", "cleared": True, "forced": False}
+    assert collect_notifications(tmp_path) == {}
+    assert agent._pending_notification_meta is None
+    assert agent._pending_notification_fp is None
+    assert _events(agent, "notification_dismiss")[0]["channel"] == "soul"
+    assert _events(agent, "system_dismiss")[0]["existed"] is True
 
 
-def test_dismiss_returns_ok_with_deprecation_note():
-    agent = _StubAgent()
+def test_dismiss_channel_is_idempotent_when_absent(tmp_path: Path) -> None:
+    agent = _StubAgent(tmp_path)
+
+    res = sys_intrinsic._dismiss(agent, {"channel": "soul"})
+
+    assert res["status"] == "ok"
+    assert res["cleared"] is False
+    assert res["channel"] == "soul"
+    assert agent._pending_notification_meta is None
+    assert agent._pending_notification_fp is None
+
+
+def test_dismiss_mcp_dotted_channel(tmp_path: Path) -> None:
+    agent = _StubAgent(tmp_path)
+    publish(tmp_path, "mcp.telegram", {"header": "telegram event"})
+
+    res = sys_intrinsic.handle(agent, {"action": "dismiss", "channel": "mcp.telegram"})
+
+    assert res["status"] == "ok"
+    assert res["cleared"] is True
+    assert "mcp.telegram" not in collect_notifications(tmp_path)
+
+
+def test_dismiss_validation_errors(tmp_path: Path) -> None:
+    agent = _StubAgent(tmp_path)
+
+    missing = sys_intrinsic._dismiss(agent, {})
+    assert missing["status"] == "error"
+    assert missing["reason"] == "missing_channel"
+
+    for bad in ["", "../escape", "..hidden", "bad/slash"]:
+        res = sys_intrinsic._dismiss(agent, {"channel": bad})
+        assert res["status"] == "error"
+        assert res["reason"] == "invalid_channel"
+
+
+def test_legacy_ids_path_is_accepted_but_ignored(tmp_path: Path) -> None:
+    agent = _StubAgent(tmp_path)
+    publish(tmp_path, "soul", {"header": "still here"})
+
     res = sys_intrinsic._dismiss(agent, {"ids": ["notif_xxx"]})
+
     assert res["status"] == "ok"
-    assert "note" in res
-    assert "deprecated" in res["note"].lower()
+    assert res["cleared"] is False
+    assert "legacy ids ignored" in res["note"]
+    assert "soul" in collect_notifications(tmp_path)
+    assert _events(agent, "system_dismiss_legacy_ids_ignored")[0]["ids"] == ["notif_xxx"]
 
 
-def test_dismiss_does_not_remove_from_chat():
-    """Pre-redesign behavior: dismiss removed wire pairs.  Post-redesign:
-    the wire stays untouched — producers manage state, not dismiss."""
-    agent = _StubAgent()
-    _enqueue_notification(agent, "notif_xxx")
-    sys_intrinsic._dismiss(agent, {"ids": ["notif_xxx"]})
-    # 2 entries (call + result) still present.
-    assert len(agent._session.chat.interface.conversation_entries()) == 2
+def test_email_registers_generic_dismiss_guard() -> None:
+    import lingtai_kernel.intrinsics.email  # noqa: F401 - import performs registration
+
+    suggestion = is_generic_dismiss_guarded("email")
+    assert suggestion is not None
+    assert "email(action='dismiss'" in suggestion
+    assert is_generic_dismiss_guarded("soul") is None
 
 
-def test_dismiss_does_not_remove_from_queue():
-    agent = _StubAgent()
-    call = ToolCallBlock(id="c1", name="system", args={
-        "action": "notification",
-        "notif_id": "notif_q",
-    })
-    result = ToolResultBlock(id="c1", name="system", content="...")
-    agent._tc_inbox.enqueue(InvoluntaryToolCall(
-        call=call, result=result,
-        source="system.notification:notif_q",
-        enqueued_at=0.0, coalesce=False, replace_in_history=False,
-    ))
-    sys_intrinsic._dismiss(agent, {"ids": ["notif_q"]})
-    # Queue still has the item.
-    assert len(agent._tc_inbox) == 1
+def test_guarded_email_refuses_without_force(tmp_path: Path) -> None:
+    import lingtai_kernel.intrinsics.email  # noqa: F401 - import performs registration
+
+    agent = _StubAgent(tmp_path)
+    publish(tmp_path, "email", {"header": "1 unread"})
+
+    res = sys_intrinsic._dismiss(agent, {"channel": "email"})
+
+    assert res["status"] == "error"
+    assert res["reason"] == "guarded"
+    assert "email_id" in res["message"]
+    assert "email" in collect_notifications(tmp_path)
+    assert _events(agent, "system_dismiss_guarded")
 
 
-def test_dismiss_unknown_id_no_error():
-    """Pre-redesign: unknown id returned 'not_found' (still ok).
-    Post-redesign: every call is the same deprecation no-op — there is
-    no per-id status to report."""
-    agent = _StubAgent()
-    res = sys_intrinsic._dismiss(agent, {"ids": ["does_not_exist"]})
+def test_guarded_email_force_clears_surface_but_not_mail_state(tmp_path: Path) -> None:
+    from lingtai.agent import Agent
+
+    import lingtai_kernel.intrinsics.email  # noqa: F401 - import performs registration
+
+    svc = MagicMock()
+    svc.get_adapter.return_value = MagicMock()
+    svc.provider = "gemini"
+    svc.model = "gemini-test"
+    agent = Agent(service=svc, agent_name="test", working_dir=tmp_path / "test")
+
+    email_id = str(uuid4())
+    msg_dir = agent.working_dir / "mailbox" / "inbox" / email_id
+    msg_dir.mkdir(parents=True, exist_ok=True)
+    (msg_dir / "message.json").write_text(json.dumps({
+        "_mailbox_id": email_id,
+        "from": "sender",
+        "to": ["test"],
+        "subject": "topic",
+        "message": "body",
+        "received_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }))
+    agent._on_mail_received({"from": "sender", "subject": "topic", "message": "body"})
+    assert "email" in collect_notifications(agent.working_dir)
+
+    res = sys_intrinsic._dismiss(agent, {"channel": "email", "force": True})
+
     assert res["status"] == "ok"
-    assert "results" not in res
+    assert res["cleared"] is True
+    assert res["forced"] is True
+    assert "email" not in collect_notifications(agent.working_dir)
+
+    check = agent._email_manager.handle({"action": "check"})
+    assert check["total"] == 1
+    assert check["emails"][0]["unread"] is True
 
 
-def test_dismiss_empty_list_no_error():
-    """Pre-redesign: empty/missing ids was an error.  Post-redesign: the
-    call is a no-op shim; argument validation is irrelevant."""
-    agent = _StubAgent()
-    res = sys_intrinsic._dismiss(agent, {"ids": []})
+def test_soul_dismiss_alias_uses_shared_helper(tmp_path: Path) -> None:
+    from lingtai_kernel.intrinsics import soul
+
+    agent = _StubAgent(tmp_path)
+    publish(tmp_path, "soul", {"header": "soul flow"})
+
+    res = soul.handle(agent, {"action": "dismiss"})
+
     assert res["status"] == "ok"
+    assert res["channel"] == "soul"
+    assert "soul" not in collect_notifications(tmp_path)
+    assert _events(agent, "soul_dismiss") == [{}]
+    assert _events(agent, "notification_dismiss")[0]["invoked_by"] == "soul"
 
 
-def test_dismiss_missing_ids_no_error():
-    agent = _StubAgent()
-    res = sys_intrinsic._dismiss(agent, {})
+def test_dismiss_one_channel_preserves_other_channels(tmp_path: Path) -> None:
+    agent = _StubAgent(tmp_path)
+    publish(tmp_path, "email", {"header": "1 unread"})
+    publish(tmp_path, "soul", {"header": "soul flow"})
+
+    res = sys_intrinsic._dismiss(agent, {"channel": "soul"})
+
     assert res["status"] == "ok"
-
-
-def test_dismiss_logs_deprecation():
-    agent = _StubAgent()
-    sys_intrinsic._dismiss(agent, {"ids": ["a", "b"]})
-    deprecated_events = [e for e, _ in agent._logs if e == "system_dismiss_deprecated"]
-    assert len(deprecated_events) == 1
-
-
-# ---------------------------------------------------------------------------
-# Voluntary system(action='notification') is now ALLOWED (was rejected pre-redesign)
-# ---------------------------------------------------------------------------
-
-
-def test_handle_dispatches_voluntary_notification(tmp_path):
-    """Under the .notification/ redesign, agent CAN voluntarily call
-    system(action='notification') to read the current state of the
-    notification surface.  Returns the collect_notifications() dict
-    (or {} when nothing is published).
-    """
-    agent = _StubAgent()
-    agent._working_dir = tmp_path
-    res = sys_intrinsic.handle(agent, {"action": "notification"})
-    # No producers have written; result should be an empty dict.
-    assert isinstance(res, dict)
-    assert res == {}
+    out = collect_notifications(tmp_path)
+    assert set(out) == {"email"}

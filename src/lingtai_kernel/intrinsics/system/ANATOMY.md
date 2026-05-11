@@ -1,6 +1,6 @@
 # intrinsics/system
 
-System intrinsic — runtime, lifecycle, and synchronization. Provides the agent with refresh (hot-reload config/presets), karma-gated lifecycle actions on other agents (sleep, lull, suspend, cpr, interrupt, clear, nirvana), preset listing, voluntary notification reads (`action="notification"`), and a deprecated `dismiss` no-op shim. The system module is also the **conceptual home** of the notification surface — it re-exports `publish_notification` / `clear_notification` from the kernel-root `notifications.py` so any in-process producer (intrinsic, capability, or wired-in MCP server) submits through one canonical entry point.
+System intrinsic — runtime, lifecycle, and synchronization. Provides the agent with refresh (hot-reload config/presets), karma-gated lifecycle actions on other agents (sleep, lull, suspend, cpr, interrupt, clear, nirvana), preset listing, voluntary notification reads (`action="notification"`), and a generic notification dismiss (`dismiss`). The system module is also the **conceptual home** of the notification surface — it re-exports `publish_notification` / `clear_notification` from the kernel-root `notifications.py` so any in-process producer (intrinsic, capability, or wired-in MCP server) submits through one canonical entry point.
 
 > **Maintenance:** see the `lingtai-kernel-anatomy` skill. **Coding agents** update this file in the same commit as code changes. **LingTai agents** report drift as issues.
 
@@ -8,7 +8,7 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 
 - `__init__.py` — Package surface. Re-exports all public API for backward compatibility. Contains:
   - `get_description` / `get_schema` (re-exported from `schema.py`) — tool registration.
-  - `_dismiss` (re-exported from `notification.py`) — deprecation shim retained so back-compat callers and old chat histories don't crash. Returns `{"status":"ok","note":"...deprecated..."}`.
+  - `_dismiss` (re-exported from `notification.py`) — agent-facing generic notification dismiss; routes `channel`/`force` through `notifications.dismiss_channel` and keeps a one-release legacy `ids=` soak path.
   - **`publish_notification` / `clear_notification`** (re-exported from `lingtai_kernel.notifications` as `submit` / `clear`) — canonical producer entry point. Importable as `from lingtai_kernel.intrinsics.system import publish_notification, clear_notification`. The system module owns the notification surface conceptually; the implementation lives at the kernel root so non-intrinsic callers (and external scripts) can import it without going through the intrinsic surface.
   - All handler functions re-exported from sub-modules for backward compatibility.
   - `handle()` (`__init__.py:87-115`) — main dispatcher with explicit dispatch table. The `notification` action takes a fast path that returns `collect_notifications(agent._working_dir)` directly without going through the dispatch table — voluntary reads of the agent's own `.notification/` state.
@@ -30,13 +30,12 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
   - `_clear()` (`karma.py:108-128`) — force a full molt on another agent.
   - `_nirvana()` (`karma.py:131-149`) — permanently destroy an agent's working directory.
 
-- `notification.py` — `dismiss` deprecation shim. The `.notification/` filesystem-as-protocol redesign retired the per-id dismiss lifecycle: producers manage their own state (delete `.notification/email.json` when unread hits 0; rewrite `.notification/system.json` as events expire). This module is a back-compat no-op kept until Phase 3 deletes it.
-  - `_dismiss()` (`notification.py:19-46`) — logs `system_dismiss_deprecated` and returns `{"status": "ok", "note": "...deprecated..."}`. Does NOT touch the wire or any queue.
-  - Producer-side notification submission lives in `notifications.py` at the kernel root and is re-exported by this package's `__init__.py` as `publish_notification` / `clear_notification`. See root `ANATOMY.md` "Notifications" for the full architecture.
+- `notification.py` — agent-facing generic dismiss. The `.notification/` filesystem-as-protocol uses one file per producer channel; `_dismiss()` (`notification.py:12-39`) accepts `channel` + optional `force` and calls `notifications.dismiss_channel(agent, ...)`. Legacy `ids=` calls are accepted for one release, log `system_dismiss_legacy_ids_ignored`, and clear nothing.
+  - Producer-side notification submission lives in `notifications.py` at the kernel root and is re-exported by this package's `__init__.py` as `publish_notification` / `clear_notification`. See root `ANATOMY.md` "Notifications" for the full architecture and dismissal taxonomy.
 
 - `schema.py` — Tool registration.
   - `get_description()` (`schema.py:5-7`) — returns localized tool description.
-  - `get_schema()` (`schema.py:10-47`) — returns JSON schema for the system tool. Action enum includes both legacy `dismiss` (for back-compat) and the new `notification` action.
+  - `get_schema()` (`schema.py:10-47`) — returns JSON schema for the system tool. Action enum includes `dismiss` plus `channel`/`force` parameters for generic notification clearing; legacy `ids` remains handler-only and is no longer taught in schema.
 
 ## Connections
 
@@ -50,6 +49,6 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 - `handle()` uses an explicit dispatch table (`dict.get()`) rather than `globals().get()`, so it works correctly across sub-modules.
 - The `notification` action is now agent-callable: it returns the bare `collect_notifications(workdir)` dict (no `_synthesized` envelope, since the call wasn't synthesized). Kernel-synthesized notification reads happen via the wire-injection path in `BaseAgent._inject_notification_pair` and carry `_synthesized: true` in their JSON body.
 - Karma gate checks resolve addresses through `_check_karma_gate()` which validates admin flags before any filesystem mutation.
-- `_dismiss` is a deprecation no-op: it always returns `{"status": "ok", "note": "..."}` regardless of input. Logs every call as `system_dismiss_deprecated` so unintended invocations surface in agent logs.
+- `_dismiss` is a channel-level generic clear: guarded producer channels (currently email) refuse unless `force=true`; legacy `ids=` calls are ignored and logged for one release.
 - Preset swap has two guards: authorization (allowed list) and context-fit (current tokens ≤ target context_limit).
 - Producer notification writes (`publish_notification`) are atomic (`tmp + rename` inside `notifications.publish`) — readers never see a half-written file.

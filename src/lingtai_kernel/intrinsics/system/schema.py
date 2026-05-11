@@ -33,10 +33,13 @@ def get_schema(lang: str = "en") -> dict:
                 "type": "boolean",
                 "description": t(lang, "system_tool.revert_preset_description"),
             },
-            "ids": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": t(lang, "system_tool.ids_description"),
+            "channel": {
+                "type": "string",
+                "description": t(lang, "system_tool.channel_description"),
+            },
+            "force": {
+                "type": "boolean",
+                "description": t(lang, "system_tool.force_description"),
             },
         },
         "required": ["action"],

@@ -21,7 +21,51 @@ for the implementation specification.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+
+
+_CHANNEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# Channels whose generic dismissal would leak producer-owned state.
+# Producers with durable unread/state mirrors register themselves here at
+# import time so system(action="dismiss", channel=...) can refuse unsafe
+# generic clears and point the agent at the producer-specific verb.
+_GENERIC_DISMISS_GUARDED: dict[str, str] = {}
+
+
+def validate_channel_name(channel: str) -> None:
+    """Validate a `.notification/<channel>.json` channel name.
+
+    The notification filesystem treats the channel as a filename stem.
+    Generic dismiss accepts agent-supplied channel names, so it validates
+    them before constructing a path. Existing producer-side publish/clear
+    calls keep their historical permissive behavior for v1 compatibility.
+    """
+    if not isinstance(channel, str) or not channel:
+        raise ValueError("channel must be a non-empty string")
+    if ".." in channel:
+        raise ValueError("channel must not contain '..'")
+    if _CHANNEL_RE.fullmatch(channel) is None:
+        raise ValueError(
+            "channel must match ^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        )
+
+
+def register_generic_dismiss_guard(channel: str, suggested_verb: str) -> None:
+    """Guard a channel against accidental generic dismissal.
+
+    Category-A producers (notifications that mirror durable producer state)
+    call this at import time. Duplicate registration is idempotent; the
+    newest suggested verb wins so producers can refine guidance.
+    """
+    validate_channel_name(channel)
+    _GENERIC_DISMISS_GUARDED[channel] = str(suggested_verb)
+
+
+def is_generic_dismiss_guarded(channel: str) -> str | None:
+    """Return the producer-specific suggested verb if guarded."""
+    return _GENERIC_DISMISS_GUARDED.get(channel)
 
 
 def notification_fingerprint(workdir: Path) -> tuple:
@@ -99,6 +143,126 @@ def clear(workdir: Path, tool_name: str) -> None:
         target.unlink()
     except (FileNotFoundError, OSError):
         pass
+
+
+def clear_with_result(workdir: Path, channel: str) -> bool:
+    """Delete a notification file and report whether it existed.
+
+    Unlike :func:`clear`, this helper is strict: only a missing file is an
+    idempotent no-op. Other ``OSError`` subclasses propagate to the caller
+    so agent-facing dismiss can surface honest failures.
+    """
+    validate_channel_name(channel)
+    target = workdir / ".notification" / f"{channel}.json"
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def dismiss_channel(agent, channel: str, *, invoked_by: str, force: bool = False) -> dict:
+    """Shared agent-facing notification dismissal helper.
+
+    Used by ``system(action="dismiss")`` and convenience aliases such as
+    ``soul(action="dismiss")``. Generic dismiss clears only the
+    notification surface; producer-owned state is untouched.
+    """
+    try:
+        validate_channel_name(channel)
+    except ValueError as e:
+        try:
+            agent._log(
+                "notification_dismiss_invalid",
+                channel=str(channel)[:100],
+                invoked_by=invoked_by,
+                error=str(e),
+            )
+        except Exception:
+            pass
+        return {
+            "status": "error",
+            "reason": "invalid_channel",
+            "channel": channel,
+            "message": str(e),
+        }
+
+    suggested = is_generic_dismiss_guarded(channel)
+    if suggested and not force:
+        try:
+            if invoked_by == "system":
+                agent._log(
+                    "system_dismiss_guarded",
+                    channel=channel,
+                    suggested_verb=suggested,
+                )
+            agent._log(
+                "notification_dismiss_guarded",
+                channel=channel,
+                invoked_by=invoked_by,
+                suggested_verb=suggested,
+            )
+        except Exception:
+            pass
+        return {
+            "status": "error",
+            "reason": "guarded",
+            "channel": channel,
+            "suggested_verb": suggested,
+            "message": (
+                f"Channel '{channel}' mirrors producer-owned state; use {suggested} "
+                "or pass force=true only when knowingly clearing a stale mirror."
+            ),
+        }
+
+    try:
+        existed = clear_with_result(agent._working_dir, channel)
+    except OSError as e:
+        try:
+            agent._log(
+                "notification_dismiss_error",
+                channel=channel,
+                invoked_by=invoked_by,
+                forced=bool(force),
+                error=str(e)[:200],
+            )
+        except Exception:
+            pass
+        return {
+            "status": "error",
+            "reason": "clear_failed",
+            "channel": channel,
+            "message": str(e),
+        }
+
+    # Any pending ACTIVE-state payload may contain the dismissed channel.
+    # Invalidate unconditionally; the next sync rebuilds from disk.
+    if hasattr(agent, "_pending_notification_meta"):
+        agent._pending_notification_meta = None
+    if hasattr(agent, "_pending_notification_fp"):
+        agent._pending_notification_fp = None
+
+    try:
+        agent._log(
+            "notification_dismiss",
+            channel=channel,
+            invoked_by=invoked_by,
+            existed=existed,
+            forced=bool(force),
+        )
+        if invoked_by == "system":
+            agent._log("system_dismiss", channel=channel, existed=existed, forced=bool(force))
+        elif invoked_by == "soul":
+            agent._log("soul_dismiss")
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "channel": channel,
+        "cleared": existed,
+        "forced": bool(force),
+    }
 
 
 # ---------------------------------------------------------------------------

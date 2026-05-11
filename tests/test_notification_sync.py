@@ -808,6 +808,57 @@ def test_sync_active_stashes_meta(tmp_path: Path) -> None:
     assert len(agent._chat_stub.interface.entries) == 0
 
 
+def test_sync_empty_state_clears_pending_meta(tmp_path: Path) -> None:
+    """If a pending ACTIVE payload exists and producer files vanish before
+    delivery, the empty-state sync must drop the stale pending payload."""
+    from lingtai_kernel.base_agent import BaseAgent
+    from lingtai_kernel.state import AgentState
+
+    chat = _make_chat_stub()
+
+    class _Agent(BaseAgent):
+        def __init__(self, workdir):
+            self._working_dir = workdir
+            self._state = AgentState.ACTIVE
+            self._notification_fp = (("soul.json", 1, 1),)
+            self._notification_block_id = None
+            self._pending_notification_meta = '{"notifications": {"soul": {}}}'
+            self._pending_notification_fp = (("soul.json", 1, 1),)
+            self._chat_stub = chat
+            self._logs = []
+            self.agent_name = "stub"
+            import queue
+            self.inbox = queue.Queue()
+
+        @property
+        def _chat(self):
+            return self._chat_stub
+
+        def _save_chat_history(self, *, ledger_source="main"):
+            pass
+
+        def _log(self, evt, **fields):
+            self._logs.append((evt, fields))
+
+        def _wake_nap(self, *_a, **_kw):
+            pass
+
+        def _set_state(self, *_a, **_kw):
+            pass
+
+        def _reset_uptime(self):
+            pass
+
+    agent = _Agent(tmp_path)
+    # No .notification files exist, so fingerprint changed from the stale
+    # non-empty value above to empty.
+    agent._sync_notifications()
+
+    assert agent._notification_fp == ()
+    assert agent._pending_notification_meta is None
+    assert agent._pending_notification_fp is None
+
+
 def test_inject_notification_meta_prefers_most_recent_block(tmp_path: Path) -> None:
     """Most recent ToolResultBlock has dict content — meta is injected
     there (dict serialized to JSON string), not on the older str block."""
