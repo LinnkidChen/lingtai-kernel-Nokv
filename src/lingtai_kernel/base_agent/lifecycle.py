@@ -369,7 +369,21 @@ def _heartbeat_loop(agent) -> None:
 
 
 def _perform_refresh(agent) -> None:
-    """Refresh = .llm_hang clear + .refresh handshake + deferred relaunch."""
+    """Refresh = .llm_hang clear + .refresh handshake + deferred relaunch.
+
+    Self-sufficient across all call sites — heartbeat, tool-call (intrinsic
+    ``system(action='refresh')``), and AED preset-fallback in ``turn.py`` all
+    call directly. Two filesystem signals drive the watcher subprocess:
+
+      1. ``.refresh.taken`` must exist before the watcher's ack deadline.
+      2. ``.agent.lock`` must clear before the watcher's lock deadline.
+
+    The heartbeat path renames ``.refresh`` → ``.refresh.taken`` before
+    invoking us and sets ``agent._shutdown`` immediately after. Direct
+    callers do neither — so we normalize the handshake here and then set
+    ``_shutdown`` / ``_cancel_event`` ourselves so the watcher's second
+    phase can complete.
+    """
     import subprocess
     import sys
 
@@ -397,12 +411,52 @@ def _perform_refresh(agent) -> None:
         return
 
     working_dir = agent._working_dir
-    # Do NOT touch .refresh here — the heartbeat already renamed it to
-    # .refresh.taken before calling us.  Writing a fresh .refresh would
-    # cause the heartbeat (on the tool-call path) to see it on the next
-    # tick and spawn a duplicate watcher.
+    refresh_path = working_dir / ".refresh"
+    taken_path_obj = working_dir / ".refresh.taken"
+    # Handshake normalization — make the on-disk state look the same
+    # regardless of caller. The watcher polls for `.refresh.taken`; we
+    # guarantee it exists before spawning the watcher, then remove any
+    # remaining `.refresh` so the heartbeat doesn't fire a duplicate
+    # watcher on its next tick.
+    handshake_source = None
+    if taken_path_obj.exists():
+        handshake_source = "preexisting_taken"
+    elif refresh_path.exists():
+        try:
+            refresh_path.rename(taken_path_obj)
+            handshake_source = "renamed_refresh"
+        except OSError:
+            # Rename failed (e.g. cross-device, race). Fall back to a
+            # synthesized ack so the watcher can still proceed.
+            try:
+                taken_path_obj.touch()
+                handshake_source = "synthesized_after_rename_failed"
+            except OSError:
+                handshake_source = "ack_write_failed"
+    else:
+        try:
+            taken_path_obj.touch()
+            handshake_source = "synthesized_direct_call"
+        except OSError:
+            handshake_source = "ack_write_failed"
+    if not taken_path_obj.exists():
+        # Do not spawn a watcher or shut the agent down unless the ack
+        # invariant is actually established. Otherwise an unusual
+        # filesystem failure could turn a failed refresh into a dead
+        # agent with no relaunch. If .refresh still exists, leave it for
+        # the heartbeat path or a later retry rather than consuming it.
+        agent._log("refresh_ack_failed", handshake=handshake_source)
+        return
 
-    taken_path = str(working_dir / ".refresh.taken")
+    # If both files happen to exist (heartbeat renamed but a later
+    # consumer rewrote .refresh), remove the stale .refresh so the
+    # heartbeat does not spawn a second watcher.
+    try:
+        refresh_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    taken_path = str(taken_path_obj)
     lock_path = str(working_dir / ".agent.lock")
     events_path = str(working_dir / "logs" / "events.jsonl")
     agent_name = agent.agent_name
@@ -447,15 +501,28 @@ def _perform_refresh(agent) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    # Clean up .refresh if it exists (tool-call path: the heartbeat
-    # hasn't renamed it yet, so it's still on disk).  Removing it
-    # prevents the heartbeat from seeing it on the next tick and
-    # spawning a duplicate watcher.
-    try:
-        (working_dir / ".refresh").unlink(missing_ok=True)
-    except OSError:
-        pass
-    agent._log("refresh_deferred_relaunch", cmd=cmd[0])
+    agent._log("refresh_deferred_relaunch",
+               cmd=cmd[0], handshake=handshake_source)
+    # Lock-clear signaling — direct callers (intrinsic system tool call,
+    # AED preset fallback) reach this function without going through the
+    # heartbeat's `_shutdown.set()` step at lifecycle.py:212. Without
+    # `_shutdown` set the run loop never exits and `.agent.lock` never
+    # releases, so the watcher times out at phase='lock'. Setting these
+    # events here makes the watcher's second phase complete uniformly
+    # regardless of caller; the heartbeat path's redundant `_shutdown.set()`
+    # is idempotent.
+    cancel_event = getattr(agent, "_cancel_event", None)
+    if cancel_event is not None:
+        try:
+            cancel_event.set()
+        except Exception:
+            pass
+    shutdown_event = getattr(agent, "_shutdown", None)
+    if shutdown_event is not None:
+        try:
+            shutdown_event.set()
+        except Exception:
+            pass
 
 
 def _can_fallback_preset(agent) -> bool:

@@ -395,6 +395,46 @@ def test_refresh_no_preset_arg_unchanged(tmp_path, monkeypatch):
     assert perform_calls == [True]
 
 
+def test_refresh_empty_preset_is_no_swap(tmp_path, monkeypatch):
+    """system(action='refresh', preset='') is treated as no swap requested.
+
+    Tool-call providers sometimes serialize optional string fields as ""
+    instead of omitting them. Without normalization, an empty string flows
+    into the authorization gate and returns 'preset \\'\\' is not in this
+    agent's allowed list' — a confusing error for an unintended swap.
+    """
+    agent = _make_test_agent_for_presets(tmp_path)
+
+    activate_calls = []
+    perform_calls = []
+    monkeypatch.setattr(agent, "_activate_preset",
+                        lambda n: activate_calls.append(n))
+    monkeypatch.setattr(agent, "_perform_refresh",
+                        lambda: perform_calls.append(True))
+
+    result = agent._intrinsics["system"]({"action": "refresh", "preset": ""})
+    assert result["status"] == "ok"
+    assert activate_calls == []  # empty string must not request a swap
+    assert perform_calls == [True]
+
+
+def test_refresh_whitespace_preset_is_no_swap(tmp_path, monkeypatch):
+    """preset='   ' (whitespace-only) normalizes to no swap, same as ''."""
+    agent = _make_test_agent_for_presets(tmp_path)
+
+    activate_calls = []
+    perform_calls = []
+    monkeypatch.setattr(agent, "_activate_preset",
+                        lambda n: activate_calls.append(n))
+    monkeypatch.setattr(agent, "_perform_refresh",
+                        lambda: perform_calls.append(True))
+
+    result = agent._intrinsics["system"]({"action": "refresh", "preset": "   \t\n"})
+    assert result["status"] == "ok"
+    assert activate_calls == []
+    assert perform_calls == [True]
+
+
 def test_presets_action_lists_full_library(tmp_path):
     """system(action='presets') returns full library with descriptions and capabilities."""
     import json
@@ -564,18 +604,48 @@ def test_refresh_revert_preset_with_preset_arg_errors(tmp_path):
     assert "revert" in msg
 
 
-def test_refresh_empty_preset_with_revert_preset_errors(tmp_path):
-    """preset='' (empty string) plus revert_preset=True is still a conflict."""
-    agent = _make_test_agent_for_presets(tmp_path)
+def test_refresh_empty_preset_with_revert_preset_treats_empty_as_absent(
+    tmp_path, monkeypatch
+):
+    """preset='' (empty string) plus revert_preset=True is NOT a conflict.
+
+    Tool-call providers sometimes serialize optional string fields as ""
+    instead of omitting them; normalizing empty/whitespace at the boundary
+    means revert proceeds as if `preset` weren't supplied at all. The old
+    behavior (return conflict error) leaked an implementation detail of
+    JSON tool-call schemas into agent-facing semantics. See lifecycle
+    self-refresh patch.
+    """
+    # Build with an explicit default preset so the revert path can resolve.
+    import json
+    plib = tmp_path / "presets"
+    plib.mkdir()
+    (plib / "home.json").write_text(json.dumps({
+        "name": "home", "description": {"summary": "x"},
+        "manifest": {"llm": {"provider": "p", "model": "m",
+                             "api_key": None, "api_key_env": "PKEY"},
+                     "capabilities": {"file": {}}},
+    }))
+    agent = _make_test_agent_for_presets(
+        tmp_path, presets_path=plib,
+        active_preset="home", default_preset="home",
+    )
+
+    activate_default_calls = []
+    perform_calls = []
+    monkeypatch.setattr(agent, "_activate_default_preset",
+                        lambda: activate_default_calls.append(True))
+    monkeypatch.setattr(agent, "_perform_refresh",
+                        lambda: perform_calls.append(True))
+
     result = agent._intrinsics["system"]({
         "action": "refresh",
         "preset": "",
         "revert_preset": True,
     })
-    assert result["status"] == "error"
-    msg = result["message"].lower()
-    assert "preset" in msg
-    assert "revert" in msg
+    assert result["status"] == "ok"
+    assert activate_default_calls == [True]
+    assert perform_calls == [True]
 
 
 def test_refresh_revert_preset_when_no_preset_configured_errors(tmp_path, monkeypatch):

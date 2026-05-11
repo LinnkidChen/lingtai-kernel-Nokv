@@ -82,7 +82,20 @@ def _refresh(agent, args: dict) -> dict:
     preset_name = args.get("preset")
     revert_preset = args.get("revert_preset", False)
 
+    # Normalize empty/whitespace preset to None. Some tool-call providers
+    # serialize optional string fields as "" instead of omitting them, and
+    # without this an empty string would flow into the authorization gate
+    # below as a requested swap to preset '' — which is never in `allowed`
+    # and always returns "preset '' is not in this agent's allowed list".
+    # Treat absent and empty identically: no swap requested.
+    if isinstance(preset_name, str) and preset_name.strip() == "":
+        preset_name = None
+
     # Conflict: cannot specify both 'preset' and 'revert_preset'.
+    # After the empty-string normalization above, ``preset=''`` is treated
+    # as absent, so ``preset='' + revert_preset=True`` is no longer a
+    # conflict (revert proceeds as if preset weren't given). An explicit
+    # non-empty preset alongside revert is still rejected.
     if preset_name is not None and revert_preset:
         return {
             "status": "error",
