@@ -637,6 +637,9 @@ def test_sync_idle_injects_pair_with_synthesized_marker(tmp_path: Path) -> None:
     assert len(entries[0].content) == 2
     from lingtai_kernel.llm.interface import TextBlock
     assert isinstance(entries[0].content[0], TextBlock)
+    summary_text = entries[0].content[0].text
+    assert "不一定是人类指令" in summary_text
+    assert "辨认来源" in summary_text
     call_block = entries[0].content[1]
     result_block = entries[1].content[0]
     assert isinstance(call_block, ToolCallBlock)
@@ -647,6 +650,8 @@ def test_sync_idle_injects_pair_with_synthesized_marker(tmp_path: Path) -> None:
 
     body = json.loads(result_block.content)
     assert body["_synthesized"] is True
+    assert "not automatically human instructions" in body["_notification_guidance"]
+    assert "source(s): email" in body["_notification_guidance"]
     assert "email" in body["notifications"]
 
     assert agent._notification_block_id == call_block.id
