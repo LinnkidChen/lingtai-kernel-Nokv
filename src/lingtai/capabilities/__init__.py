@@ -14,10 +14,11 @@ if TYPE_CHECKING:
 # relative names.
 _BUILTIN: dict[str, str] = {
     # Always-on floor (lingtai.core)
-    "library": "lingtai.core.library",
+    "knowledge": "lingtai.core.library",
     "skills": "lingtai.core.skills",
     # Deprecated compatibility names. Agent config normalization maps these
     # before setup; direct callers still resolve for one release window.
+    "library": "lingtai.core.library",
     "codex": "lingtai.core.library",
     "bash": "lingtai.core.bash",
     "avatar": "lingtai.core.avatar",
@@ -43,33 +44,42 @@ def canonical_capability_name(name: str) -> str:
     """Return the canonical post-rename capability name for *name*.
 
     Compatibility mapping:
-    - ``codex`` (old durable knowledge) -> ``library``
-    - ``library`` keeps its new meaning here; raw init/preset manifests that
-      predate the rename are normalized by ``normalize_capabilities`` below so
-      old ``library.paths`` becomes ``skills.paths`` before setup.
+    - ``knowledge`` is canonical for the private durable knowledge store.
+    - ``library`` and ``codex`` are compatibility spellings for the same store
+      when they clearly mean durable knowledge.
+    - Raw init/preset manifests that predate the library->skills split are
+      normalized by ``normalize_capabilities`` below so old ``library.paths``
+      becomes ``skills.paths`` before setup.
     """
-    return "library" if name == "codex" else name
+    return "knowledge" if name in {"library", "codex"} else name
 
 
 def normalize_capabilities(capabilities: dict[str, dict]) -> dict[str, dict]:
     """Normalize old capability names to the post-rename surface.
 
-    Old manifests can spell the skill catalog as a bare ``library`` entry, as
-    ``library.paths``, or as a ``codex`` + ``library`` pair. Those old
-    ``library`` entries become ``skills`` while old ``codex`` becomes the new
-    knowledge ``library``. A ``library`` entry with knowledge-library-only kwargs
-    such as ``library_limit`` or ``codex_limit`` is treated as explicit new
-    knowledge config. New manifests should use ``library`` for knowledge and
-    ``skills`` for the skill catalog. If both new keys are present, canonical
-    keys win and missing ``paths`` from the old skill-catalog key are merged
-    into ``skills``.
+    ``knowledge`` is the canonical private durable knowledge capability.
+    ``codex`` is the oldest compatibility name. ``library`` is ambiguous:
+    before the library->skills split it meant the skill catalog, and during the
+    transition it also meant durable knowledge. Normalization keeps old
+    skill-catalog manifests working while routing explicit durable-knowledge
+    manifests to ``knowledge``.
+
+    Rules:
+    - ``knowledge`` always means private durable knowledge.
+    - ``codex`` always means private durable knowledge (compatibility alias).
+    - bare/list ``library`` or ``library: {}`` without explicit ``skills`` means
+      the old skill catalog.
+    - ``library: {paths: [...]}`` without explicit ``skills`` means old
+      ``skills.paths``.
+    - ``library`` with explicit knowledge kwargs, or any ``library`` alongside
+      explicit ``skills``, means private durable knowledge.
     """
     out: dict[str, dict] = {}
 
-    def is_explicit_new_library_config(value: object) -> bool:
-        """True when a ``library`` config clearly means durable knowledge."""
+    def is_explicit_knowledge_config(value: object) -> bool:
+        """True when a config clearly means durable knowledge."""
         return isinstance(value, dict) and any(
-            key in value for key in ("library_limit", "codex_limit")
+            key in value for key in ("knowledge_limit", "library_limit", "codex_limit")
         )
 
     def merge_dict(dst: str, value: object) -> None:
@@ -97,20 +107,22 @@ def normalize_capabilities(capabilities: dict[str, dict]) -> dict[str, dict]:
             out[dst] = merged
 
     for name, kwargs in capabilities.items():
-        if name == "codex":
-            target = "library"
+        if name in {"knowledge", "codex"}:
+            target = "knowledge"
         elif (
             name == "library"
             and "skills" not in capabilities
-            and not is_explicit_new_library_config(kwargs)
+            and not is_explicit_knowledge_config(kwargs)
         ):
             # Legacy ambiguity: before the rename, a bare ``library`` entry was
             # the skill catalog. Keep old ``library``/``library: {}``/``library.paths``
             # manifests on the skill-catalog path. A library entry with
-            # knowledge-library-only kwargs (e.g. ``library_limit``) is treated as
-            # an explicit new durable-knowledge config. New configs that want both
-            # meanings spell them explicitly as ``library`` + ``skills``.
+            # durable-knowledge-only kwargs is treated as explicit knowledge.
+            # New configs that want both meanings spell them explicitly as
+            # ``knowledge`` + ``skills`` (or transitional ``library`` + ``skills``).
             target = "skills"
+        elif name == "library":
+            target = "knowledge"
         else:
             target = name
         merge_dict(target, kwargs)
@@ -163,6 +175,7 @@ def get_all_providers() -> dict[str, dict]:
         "file": "lingtai.core.read",
         "bash": "lingtai.core.bash",
         "web_search": ".web_search",
+        "knowledge": "lingtai.core.library",
         "library": "lingtai.core.library",
         "skills": "lingtai.core.skills",
         "codex": "lingtai.core.library",

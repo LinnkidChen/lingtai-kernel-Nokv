@@ -1,35 +1,58 @@
-# Library capability contract
+# Knowledge capability contract
 
-`library` is the durable long-term knowledge capability. It stores bounded,
+`knowledge` is the agent-private durable knowledge capability. It stores bounded,
 curated entries that survive molts and are summarized into the agent's system
-prompt. This is the public contract for the capability implemented in
-`src/lingtai/core/library/__init__.py`; the code remains the source of truth.
+prompt. The implementation currently lives in `src/lingtai/core/library/` for
+compatibility; the code remains the source of truth.
+
+## Routing Card
+
+**Use this when:**
+- You are editing the private durable knowledge capability.
+- You are reviewing tool schema, persistence, prompt-injection, capacity, or rename compatibility changes.
+- You need to verify the boundary between private knowledge and portable skills.
+
+**Do not use this for:**
+- Skill catalog behavior: read `src/lingtai/core/skills/`.
+- Code navigation only: read `src/lingtai/core/library/ANATOMY.md`.
+- General procedure authoring: read the `skills-manual` skill.
+
+**Fast paths:** tool schema -> §Tool surface; storage -> §Persistence; rename -> §Scope and compatibility; review -> §Verification matrix.
 
 ## Scope and compatibility
 
-- Canonical capability name: `library`.
-- Canonical tool name: `library`.
-- Deprecated compatibility name: `codex`.
+- Canonical capability name: `knowledge`.
+- Canonical tool name: `knowledge`.
+- Compatibility tool/capability name: `library`.
+- Deprecated compatibility tool/capability name: `codex`.
 
-The `codex` capability name normalizes to `library` during agent capability
-setup, and `setup()` still registers a `codex(...)` tool alias on the same
-handler as `library(...)` for one migration window. Direct imports of
-`lingtai.core.codex` also re-export the library implementation.
+`knowledge` means private durable memory: what one agent has learned, decided,
+and discovered. `skills` means portable procedure catalog. Knowledge entries may
+point to public skills; skills must not depend on private knowledge entry ids,
+agent-local paths, mail ids, or other private memory state.
 
-`library` now means durable knowledge. The skill catalog is `skills`. Legacy
-manifests are normalized before setup:
+Manifest normalization:
 
 | Manifest shape | Meaning after normalization |
 |---|---|
-| `"codex"` or `codex: {...}` | durable knowledge `library` |
-| old bare `"library"` / `library: {}` | skill catalog `skills` |
-| old `library: {paths: [...]}` | skill catalog `skills.paths` |
-| `library: {library_limit: N}` | explicit durable knowledge `library` |
-| `library: {}, skills: {...}` or `library: {library_limit: N}, skills: {...}` | explicit new meanings; both capabilities load |
+| `"knowledge"` or `knowledge: {...}` | private durable `knowledge` |
+| `"codex"` or `codex: {...}` | private durable `knowledge` (deprecated alias) |
+| old bare `"library"` / `library: {}` without `skills` | skill catalog `skills` |
+| old `library: {paths: [...]}` without `skills` | skill catalog `skills.paths` |
+| `library: {library_limit: N}` | explicit durable `knowledge` |
+| `library: {}, skills: {...}` | transitional durable `knowledge` + skill catalog `skills` |
 
-When an explicit `skills` key is present, the `library` key is treated as durable
-knowledge and must not carry legacy skill-catalog `paths`; put skill paths under
-`skills.paths`.
+## Knowledge / skill directionality
+
+Knowledge entries MAY reference skills by public path/name when an agent has
+learned that a skill is useful for a recurring situation.
+
+Skills MUST NOT reference private knowledge entry ids, private agent paths, mail
+ids, or agent-local memory state.
+
+Reason: skills are portable shared procedures; knowledge is agent-local
+accumulated memory. The dependency direction is knowledge -> skill, never skill
+-> private knowledge.
 
 ## Tool surface
 
@@ -45,133 +68,66 @@ The schema requires `action` and accepts exactly four actions:
 Unknown actions return an error and do not mutate state. Removed historical
 actions such as `filter` and `export` are intentionally rejected.
 
-### `submit`
-
-`submit` trims string fields. `title` and `summary` must be non-empty after
-trimming; `content` and `supplementary` are optional and default to empty
-strings. If the entry limit has already been reached, `submit` fails with an
-error that includes `entries` and `max` counts.
-
-A successful entry has:
-
-```json
-{
-  "id": "<8 hex chars>",
-  "title": "...",
-  "summary": "...",
-  "content": "...",
-  "supplementary": "...",
-  "created_at": "<UTC ISO-8601 timestamp>"
-}
-```
-
-The id is the first eight hex characters of
-`sha256(title + (content or summary) + created_at)`. `created_at` is generated
-at submit time, so equal titles/content submitted at different times get
-different ids.
-
-### `view`
-
-`view` requires a non-empty `ids` list. Every requested id must exist; any
-unknown id rejects the whole call with `Unknown library IDs: ...`. The result
-preserves the requested id order. Each returned entry contains `id`, `title`,
-`summary`, and `content`. `supplementary` is included only when
-`include_supplementary` is truthy.
-
-### `consolidate`
-
-`consolidate` requires a non-empty `ids` list plus non-empty `title` and
-`summary`. Every requested id must exist; any unknown id rejects the whole call
-without mutation. On success, all requested ids are removed, one replacement
-entry is appended with the same shape as `submit`, and the response reports the
-new `id` plus `removed: len(ids)`. Duplicate ids in the request count toward
-`removed` in the response but remove at most one stored entry per unique id.
-
-### `delete`
-
-`delete` requires a non-empty `ids` list. Every requested id must exist; any
-unknown id rejects the whole call without mutation. On success, all matching
-entries are removed and the response reports the actual number removed.
+`library(...)` and `codex(...)` aliases use the same schema and handler during
+the migration window; new callers should use `knowledge(...)`.
 
 ## Persistence
 
 The store path is intentionally still `<agent>/codex/codex.json`. The rename is
-user-facing; it is not a storage-v2 migration.
-
-The file shape is:
+user-facing; it is not a storage-v2 migration. File shape remains:
 
 ```json
-{
-  "version": 1,
-  "entries": [ ... ]
-}
+{"version": 1, "entries": [ ... ]}
 ```
 
-Writes are atomic within the store directory: create a temporary file in
-`codex/`, write UTF-8 JSON with `ensure_ascii=False`, close it, then
-`os.replace()` it over `codex.json`. If writing fails, the temporary file is
-closed/unlinked best-effort and the exception is re-raised.
-
-Reads are tolerant:
-
-- Missing `codex/codex.json` means an empty library.
-- Invalid JSON or an `OSError` while reading means an empty library.
-- Legacy entries without `title` are backfilled from old `content`: title is
-  the first 50 characters, summary is the first 200 characters, and
-  supplementary becomes an empty string.
+Writes are atomic within `codex/`: create a temporary file, write UTF-8 JSON with
+`ensure_ascii=False`, close it, then `os.replace()` it over `codex.json`. Reads
+are tolerant: missing/invalid/unreadable JSON means an empty store; legacy
+entries without `title` are backfilled from old `content`.
 
 ## Prompt injection
 
-On setup and after every mutating action, the capability rewrites prompt
-sections:
+On setup and after every mutating action, the capability rewrites prompt sections:
 
-- If there are entries, protected prompt section `library` contains a compact
+- If there are entries, protected prompt section `knowledge` contains a compact
   catalog: total count/max count plus one line per entry with `[id] title:
-  summary`, followed by a reminder to call `library(view, ids=[...])` for full
-  content.
-- If there are no entries, protected prompt section `library` is cleared.
-- Protected prompt section `codex` is always cleared so the renamed section owns
-  the catalog.
+  summary`, followed by a reminder to call `knowledge(view, ids=[...])`.
+- If there are no entries, protected prompt section `knowledge` is cleared.
+- Protected prompt sections `library` and `codex` are always cleared so the
+  canonical section owns the catalog.
 
 Only ids, titles, and summaries are always injected. Full `content` and
 `supplementary` stay out of the prompt until loaded through `view`.
 
 ## Capacity configuration
 
-`LibraryManager.DEFAULT_MAX_ENTRIES` is `50`.
+`LibraryManager.DEFAULT_MAX_ENTRIES` is `50`. `knowledge_limit=N` is canonical.
+`library_limit=N` and `codex_limit=N` are compatibility kwargs. Precedence:
+`knowledge_limit`, then `library_limit`, then `codex_limit`, then default 50.
 
-`setup(agent, library_limit=N)` is canonical. `codex_limit=N` is accepted as a
-compatibility kwarg. If both are present, `library_limit` wins. If neither is
-present, the default of 50 applies.
+## Anchored claims
 
-The limit is enforced by `submit`, not by `consolidate`: consolidation removes
-old entries before appending the replacement and is the intended path for
-reducing pressure when the store is full.
+| Claim | Source | Test |
+|---|---|---|
+| `knowledge`, `library`, and `codex` all resolve to the same implementation | `src/lingtai/capabilities/__init__.py:15-22`, `src/lingtai/core/library/__init__.py:326-346` | `tests/test_library_knowledge.py::test_knowledge_setup_registers_tool_and_aliases` |
+| `knowledge` is canonical for manager lookup; compatibility names resolve | `src/lingtai/agent.py:806-812`, `src/lingtai/capabilities/__init__.py:43-54` | `tests/test_library_knowledge.py::test_codex_capability_normalizes_to_knowledge` |
+| Old bare/list `library` still normalizes to `skills` | `src/lingtai/capabilities/__init__.py:57-129` | `tests/test_skills.py::test_old_library_empty_config_normalizes_to_skills_only`, `test_old_library_list_config_normalizes_to_skills_only` |
+| Prompt catalog lives in `knowledge`; `library`/`codex` sections are cleared | `src/lingtai/core/library/__init__.py:100-122` | `tests/test_library_knowledge.py::test_codex_tool_alias_uses_library_store`, skills rename tests |
+| Store remains `codex/codex.json` | `src/lingtai/core/library/__init__.py:93`, `src/lingtai/core/library/__init__.py:128-160` | `tests/test_library_knowledge.py::test_submit_creates_entry` |
+| `knowledge_limit` wins over compatibility limit kwargs | `src/lingtai/core/library/__init__.py:76-91`, `src/lingtai/core/library/__init__.py:309-324` | capacity coverage in `tests/test_library_knowledge.py` |
 
-## Source references
+## Verification matrix
 
-- Schema/actions: `src/lingtai/core/library/__init__.py:31-67`.
-- Manager setup, capacity, and store path: `src/lingtai/core/library/__init__.py:71-89`.
-- Prompt injection: `src/lingtai/core/library/__init__.py:95-115`.
-- Load/save/id generation: `src/lingtai/core/library/__init__.py:121-159`.
-- Dispatch and action implementations: `src/lingtai/core/library/__init__.py:165-299`.
-- Tool registration and `codex` alias: `src/lingtai/core/library/__init__.py:302-337`.
-- Capability rename normalization: `src/lingtai/capabilities/__init__.py:42-117`.
-- Skill-catalog split/legacy `library.paths`: `src/lingtai/core/skills/__init__.py:11-25` and `src/lingtai/core/skills/__init__.py:314-348`.
+| Invariant | Automated test | Manual check | Risk if broken |
+|---|---|---|---|
+| `knowledge(...)` is the canonical tool | `tests/test_library_knowledge.py` | Boot with `capabilities={"knowledge": {}}` and submit | New agents cannot use the intended name |
+| `library(...)` and `codex(...)` aliases still work | `test_codex_tool_alias_uses_library_store` | Call each alias and inspect `knowledge` prompt section | Existing agents break during migration |
+| Old `library.paths` remains skill-catalog config | `tests/test_skills.py::*old_library*` | Boot an old manifest with `library.paths` | Old presets lose skill catalog |
+| Skills do not depend on private knowledge | documented invariant; enforce by review | Check shared skill docs for private ids/paths | Shared skills become non-portable |
+| Full content stays out of prompt catalog | `test_view_returns_content` plus prompt inspection | Submit long content, inspect prompt section | Prompt bloat / private detail leakage |
 
-## Verification
-
-Primary tests:
+Run before merging knowledge changes:
 
 ```bash
-python -m pytest tests/test_library_knowledge.py tests/test_skills.py -q
+python -m pytest tests/test_library_knowledge.py tests/test_skills.py tests/test_check_caps.py -q
 ```
-
-Relevant coverage:
-
-- `tests/test_library_knowledge.py` covers registration, `codex` compatibility,
-  submit/view/consolidate/delete behavior, schema shape, capacity enforcement,
-  and id generation.
-- `tests/test_skills.py::test_old_library_empty_config_normalizes_to_skills_only`
-  through `test_new_library_and_skills_config_registers_both` cover the rename
-  boundary between durable `library` and skill-catalog `skills`.

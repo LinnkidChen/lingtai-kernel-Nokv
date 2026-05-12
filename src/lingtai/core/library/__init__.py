@@ -1,11 +1,11 @@
-"""Library capability — durable long-term knowledge across molts.
+"""Knowledge capability — private durable knowledge across molts.
 
-A journal-shaped knowledge store persisted in the legacy codex/codex.json
-file. Each entry's id + title + summary is always visible in the
-system prompt; content and supplementary material load on demand via view().
+A journal-shaped private knowledge store persisted in the legacy
+codex/codex.json file. Each entry's id + title + summary is always visible in
+the system prompt; content and supplementary material load on demand via view().
 
 Usage:
-    agent = Agent(capabilities=["library"])
+    agent = Agent(capabilities=["knowledge"])
 """
 from __future__ import annotations
 
@@ -77,12 +77,17 @@ class LibraryManager:
         self,
         agent: "BaseAgent",
         *,
+        knowledge_limit: int | None = None,
         library_limit: int | None = None,
         codex_limit: int | None = None,
     ):
         self._agent = agent
         self._working_dir = agent._working_dir
-        limit = library_limit if library_limit is not None else codex_limit
+        limit = (
+            knowledge_limit
+            if knowledge_limit is not None
+            else library_limit if library_limit is not None else codex_limit
+        )
         self._max_entries = limit if limit is not None else self.DEFAULT_MAX_ENTRIES
 
         self._codex_json = self._working_dir / "codex" / "codex.json"
@@ -93,25 +98,27 @@ class LibraryManager:
     # ------------------------------------------------------------------
 
     def _inject_catalog(self) -> None:
-        """Inject library entry index (id + title + summary) into system prompt."""
+        """Inject knowledge entry index (id + title + summary) into system prompt."""
         if not self._entries:
+            self._agent.update_system_prompt("knowledge", "", protected=True)
             self._agent.update_system_prompt("library", "", protected=True)
             self._agent.update_system_prompt("codex", "", protected=True)
             return
 
         lines = [
-            f"Your library has {len(self._entries)}/{self._max_entries} entries:",
+            f"Your knowledge has {len(self._entries)}/{self._max_entries} entries:",
             "",
         ]
         for e in self._entries:
             lines.append(f"- [{e['id']}] {e['title']}: {e['summary']}")
         lines.append("")
         lines.append(
-            "Use library(view, ids=[...]) to read full content. "
+            "Use knowledge(view, ids=[...]) to read full content. "
             "Pass include_supplementary=true for backing material."
         )
 
-        self._agent.update_system_prompt("library", "\n".join(lines), protected=True)
+        self._agent.update_system_prompt("knowledge", "\n".join(lines), protected=True)
+        self._agent.update_system_prompt("library", "", protected=True)
         self._agent.update_system_prompt("codex", "", protected=True)
 
     # ------------------------------------------------------------------
@@ -189,7 +196,7 @@ class LibraryManager:
             return {"error": "summary is required for submit."}
         if len(self._entries) >= self._max_entries:
             return {
-                "error": f"Library is full ({self._max_entries} entries). "
+                "error": f"Knowledge is full ({self._max_entries} entries). "
                 "Consolidate related entries first, "
                 "delete obsolete ones, or use supplementary "
                 "to pack more detail into existing entries.",
@@ -226,7 +233,7 @@ class LibraryManager:
         entries_by_id = {e["id"]: e for e in self._entries}
         invalid = [i for i in ids if i not in entries_by_id]
         if invalid:
-            return {"error": f"Unknown library IDs: {', '.join(invalid)}"}
+            return {"error": f"Unknown knowledge IDs: {', '.join(invalid)}"}
 
         result_entries = []
         for entry_id in ids:
@@ -259,7 +266,7 @@ class LibraryManager:
         existing_ids = {e["id"] for e in self._entries}
         invalid = [i for i in ids if i not in existing_ids]
         if invalid:
-            return {"error": f"Unknown library IDs: {', '.join(invalid)}"}
+            return {"error": f"Unknown knowledge IDs: {', '.join(invalid)}"}
 
         ids_set = set(ids)
         self._entries = [e for e in self._entries if e["id"] not in ids_set]
@@ -287,7 +294,7 @@ class LibraryManager:
         existing_ids = {e["id"] for e in self._entries}
         invalid = [i for i in ids if i not in existing_ids]
         if invalid:
-            return {"error": f"Unknown library IDs: {', '.join(invalid)}"}
+            return {"error": f"Unknown knowledge IDs: {', '.join(invalid)}"}
 
         ids_set = set(ids)
         before = len(self._entries)
@@ -302,32 +309,43 @@ class LibraryManager:
 def setup(
     agent: "BaseAgent",
     *,
+    knowledge_limit: int | None = None,
     library_limit: int | None = None,
     codex_limit: int | None = None,
 ) -> LibraryManager:
-    """Set up the library capability — durable long-term knowledge."""
+    """Set up the knowledge capability — private durable knowledge."""
     lang = agent._config.language
 
     mgr = LibraryManager(
-        agent, library_limit=library_limit, codex_limit=codex_limit,
+        agent,
+        knowledge_limit=knowledge_limit,
+        library_limit=library_limit,
+        codex_limit=codex_limit,
     )
 
     agent.add_tool(
-        "library",
+        "knowledge",
         schema=get_schema(lang),
         handler=mgr.handle,
         description=get_description(lang),
     )
-    # Deprecated compatibility alias for callers that still invoke codex(...).
+    # Compatibility aliases for callers that still invoke library(...) or codex(...).
+    agent.add_tool(
+        "library",
+        schema=get_schema(lang),
+        handler=mgr.handle,
+        description="Compatibility alias for knowledge — use knowledge(...) instead. "
+        + get_description(lang),
+    )
     agent.add_tool(
         "codex",
         schema=get_schema(lang),
         handler=mgr.handle,
-        description="Deprecated alias for library \u2014 use library(...) instead. "
+        description="Deprecated alias for knowledge — use knowledge(...) instead. "
         + get_description(lang),
     )
 
-    # Inject library catalog into system prompt at boot.
+    # Inject knowledge catalog into system prompt at boot.
     mgr._inject_catalog()
 
     return mgr

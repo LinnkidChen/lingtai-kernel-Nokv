@@ -20,24 +20,27 @@ def make_mock_service():
 # ---------------------------------------------------------------------------
 
 
-def test_library_setup_registers_tool(tmp_path):
+def test_knowledge_setup_registers_tool_and_aliases(tmp_path):
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-        capabilities={"library": {"library_limit": 50}},
+        capabilities={"knowledge": {"knowledge_limit": 50}},
     )
-    assert "library" in agent._tool_handlers
+    assert "knowledge" in agent._tool_handlers
+    assert "library" in agent._tool_handlers  # compatibility alias
     assert "codex" in agent._tool_handlers  # deprecated compatibility alias
     agent.stop(timeout=1.0)
 
 
-def test_codex_capability_normalizes_to_library(tmp_path):
+def test_codex_capability_normalizes_to_knowledge(tmp_path):
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities=["codex"],
     )
     try:
+        assert agent.get_capability("knowledge") is not None
         assert agent.get_capability("library") is not None
-        assert agent.get_capability("codex") is None
+        assert agent.get_capability("codex") is not None
+        assert "knowledge" in agent._tool_handlers
         assert "library" in agent._tool_handlers
         assert "codex" in agent._tool_handlers
     finally:
@@ -56,19 +59,19 @@ def test_codex_tool_alias_uses_library_store(tmp_path):
             "summary": "Old codex tool writes to renamed library.",
         })
         assert result["status"] == "ok"
-        prompt = agent._prompt_manager.read_section("library") or ""
+        prompt = agent._prompt_manager.read_section("knowledge") or ""
         assert "Compat" in prompt
         assert (agent.working_dir / "codex" / "codex.json").is_file()
     finally:
         agent.stop(timeout=1.0)
 
 
-def test_library_manager_accessible(tmp_path):
+def test_knowledge_manager_accessible(tmp_path):
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     assert mgr is not None
     agent.stop(timeout=1.0)
 
@@ -94,7 +97,7 @@ def test_submit_creates_entry(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     result = mgr.handle({
         "action": "submit",
         "title": "TCP Retry Logic",
@@ -114,7 +117,7 @@ def test_submit_requires_title(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     result = mgr.handle({"action": "submit", "summary": "s", "content": "c"})
     assert "error" in result
     agent.stop(timeout=1.0)
@@ -125,7 +128,7 @@ def test_submit_enforces_limit(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 2}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     mgr.handle({"action": "submit", "title": "A", "summary": "s", "content": "c"})
     mgr.handle({"action": "submit", "title": "B", "summary": "s", "content": "c"})
     result = mgr.handle({"action": "submit", "title": "C", "summary": "s", "content": "c"})
@@ -145,7 +148,7 @@ def test_submit_without_content(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     result = mgr.handle({
         "action": "submit",
         "title": "A",
@@ -166,7 +169,7 @@ def test_view_returns_content(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     r = mgr.handle({"action": "submit", "title": "X", "summary": "s", "content": "full content here"})
     result = mgr.handle({"action": "view", "ids": [r["id"]]})
     assert result["status"] == "ok"
@@ -181,7 +184,7 @@ def test_view_with_include_supplementary(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     r = mgr.handle({
         "action": "submit", "title": "X", "summary": "s",
         "content": "main", "supplementary": "extra material",
@@ -199,7 +202,7 @@ def test_view_invalid_id(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     result = mgr.handle({"action": "view", "ids": ["nope"]})
     assert "error" in result
     agent.stop(timeout=1.0)
@@ -211,7 +214,7 @@ def test_filter_and_export_actions_rejected(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     for action in ("filter", "export"):
         result = mgr.handle({"action": action})
         assert "error" in result, f"{action} should be rejected"
@@ -229,7 +232,7 @@ def test_consolidate(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     r1 = mgr.handle({"action": "submit", "title": "A", "summary": "s1.", "content": "c1"})
     r2 = mgr.handle({"action": "submit", "title": "B", "summary": "s2.", "content": "c2"})
     result = mgr.handle({
@@ -257,7 +260,7 @@ def test_delete(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"library": {"library_limit": 50}},
     )
-    mgr = agent.get_capability("library")
+    mgr = agent.get_capability("knowledge")
     r1 = mgr.handle({"action": "submit", "title": "A", "summary": "s.", "content": "c"})
     r2 = mgr.handle({"action": "submit", "title": "B", "summary": "s.", "content": "c"})
     result = mgr.handle({"action": "delete", "ids": [r1["id"]]})

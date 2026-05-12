@@ -349,20 +349,45 @@ def test_old_codex_library_pair_normalizes_to_library_and_skills(tmp_path):
         capabilities={"codex": {}, "library": {"paths": [str(extra)]}},
     )
     try:
-        assert set(["library", "codex", "skills"]).issubset(agent._tool_handlers)
+        assert set(["knowledge", "library", "codex", "skills"]).issubset(agent._tool_handlers)
         assert "paired-shared" in (agent._prompt_manager.read_section("skills") or "")
-        result = agent._tool_handlers["library"]({
+        result = agent._tool_handlers["knowledge"]({
             "action": "submit", "title": "Pair", "summary": "knowledge entry"
         })
         assert result["status"] == "ok"
-        assert "Pair" in (agent._prompt_manager.read_section("library") or "")
+        assert "Pair" in (agent._prompt_manager.read_section("knowledge") or "")
+        assert not (agent._prompt_manager.read_section("library") or "")
     finally:
         agent.stop(timeout=1.0)
 
 
-def test_new_library_and_skills_config_registers_both(tmp_path):
+def test_new_knowledge_and_skills_config_registers_both(tmp_path):
     extra = tmp_path / "extra"
     _write_skill(extra / "new-shared", "new-shared")
+    workdir = tmp_path / "agent"
+
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=workdir,
+        capabilities={"knowledge": {}, "skills": {"paths": [str(extra)]}},
+    )
+    try:
+        assert set(["knowledge", "library", "codex", "skills"]).issubset(agent._tool_handlers)
+        assert "new-shared" in (agent._prompt_manager.read_section("skills") or "")
+        result = agent._tool_handlers["knowledge"]({
+            "action": "submit", "title": "New", "summary": "knowledge entry"
+        })
+        assert result["status"] == "ok"
+        assert "New" in (agent._prompt_manager.read_section("knowledge") or "")
+        assert not (agent._prompt_manager.read_section("library") or "")
+    finally:
+        agent.stop(timeout=1.0)
+
+
+def test_transitional_library_and_skills_config_registers_knowledge_and_skills(tmp_path):
+    extra = tmp_path / "extra"
+    _write_skill(extra / "transitional-shared", "transitional-shared")
     workdir = tmp_path / "agent"
 
     agent = Agent(
@@ -372,13 +397,14 @@ def test_new_library_and_skills_config_registers_both(tmp_path):
         capabilities={"library": {}, "skills": {"paths": [str(extra)]}},
     )
     try:
-        assert set(["library", "codex", "skills"]).issubset(agent._tool_handlers)
-        assert "new-shared" in (agent._prompt_manager.read_section("skills") or "")
+        assert set(["knowledge", "library", "codex", "skills"]).issubset(agent._tool_handlers)
+        assert "transitional-shared" in (agent._prompt_manager.read_section("skills") or "")
         result = agent._tool_handlers["library"]({
-            "action": "submit", "title": "New", "summary": "knowledge entry"
+            "action": "submit", "title": "Transitional", "summary": "knowledge entry"
         })
         assert result["status"] == "ok"
-        assert "New" in (agent._prompt_manager.read_section("library") or "")
+        assert "Transitional" in (agent._prompt_manager.read_section("knowledge") or "")
+        assert not (agent._prompt_manager.read_section("library") or "")
     finally:
         agent.stop(timeout=1.0)
 

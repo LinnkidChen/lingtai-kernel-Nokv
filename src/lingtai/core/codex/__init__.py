@@ -1,8 +1,8 @@
-"""Deprecated compatibility wrapper for the renamed library capability.
+"""Deprecated compatibility wrapper for the renamed knowledge capability.
 
-The durable knowledge capability formerly lived at ``lingtai.core.codex`` and
-registered the ``codex`` tool. It is now ``lingtai.core.library`` and registers
-``library`` plus a temporary ``codex`` tool alias. Keep this module so imports
+The private durable knowledge capability formerly lived at ``lingtai.core.codex`` and
+registered the ``codex`` tool. It now lives in ``lingtai.core.library`` and registers canonical
+``knowledge`` plus temporary ``library``/``codex`` tool aliases. Keep this module so imports
 and direct capability setup through the old module path continue to work during
 migration.
 """

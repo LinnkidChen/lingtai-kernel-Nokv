@@ -805,11 +805,15 @@ class Agent(BaseAgent):
 
     def has_capability(self, name: str) -> bool:
         """Check if a capability is registered."""
-        return name in self._capability_managers
+        from .capabilities import canonical_capability_name
+
+        return canonical_capability_name(name) in self._capability_managers
 
     def get_capability(self, name: str) -> Any:
         """Return the manager instance for a registered capability, or None."""
-        return self._capability_managers.get(name)
+        from .capabilities import canonical_capability_name
+
+        return self._capability_managers.get(canonical_capability_name(name))
 
     # ------------------------------------------------------------------
     # Deep refresh — full reconstruct from init.json
