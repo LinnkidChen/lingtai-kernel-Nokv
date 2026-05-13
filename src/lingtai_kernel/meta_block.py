@@ -145,6 +145,36 @@ def build_meta(agent) -> dict:
     else:
         meta["stamina_left_seconds"] = -1
 
+    # Notifications — always surface the current notification-channel state
+    # in every tool-call result metadata block so the agent always knows what
+    # channels have pending signals.  The dict maps channel names to a
+    # compact summary (header, icon, priority); empty dict means no active
+    # notifications.  This is the "last tool-call result metadata always
+    # carries notification state" contract.
+    try:
+        from .notifications import collect_notifications
+        working_dir = getattr(agent, "_working_dir", None)
+        if working_dir is not None:
+            from pathlib import Path
+            notifs = collect_notifications(Path(working_dir))
+            if notifs:
+                compact = {}
+                for source, payload in notifs.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    entry = {}
+                    if header := payload.get("header"):
+                        entry["header"] = header
+                    if icon := payload.get("icon"):
+                        entry["icon"] = icon
+                    if priority := payload.get("priority"):
+                        entry["priority"] = priority
+                    compact[source] = entry
+                if compact:
+                    meta["_notifications"] = compact
+    except Exception:
+        pass
+
     return meta
 
 
