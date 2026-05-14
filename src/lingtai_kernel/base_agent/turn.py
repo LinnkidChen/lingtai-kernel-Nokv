@@ -592,6 +592,28 @@ def _handle_message(agent, msg: Message) -> None:
         logger.warning(f"[{agent.agent_name}] Unknown message type: {msg.type}")
 
 
+_MOLT_WARNING_GENTLE = (
+    "[system] Context at {pressure} — consider molt. See 'Performing a Molt' "
+    "in your procedures for the recipe (tend pad / lingtai / knowledge / "
+    "skills / session journal, then `psyche(object=context, action=molt, "
+    "summary=...)`). Molt is yours to perform — do it deliberately while "
+    "context is still cheap."
+)
+
+_MOLT_WARNING_URGENT = (
+    "[system] ⚠️ URGENT — Context at {pressure}. Please consider molting "
+    "NOW. Every additional turn at this pressure is slower and more "
+    "expensive; once usage crosses 100% the kernel's overflow recovery "
+    "starts silently trimming history, so each turn at this point may be "
+    "discarding data you would have wanted to keep. Wrap up the current "
+    "sub-step if you must, then tend the stores (pad / lingtai / knowledge "
+    "/ skills / session journal) and call `psyche(object=context, "
+    "action=molt, summary=...)`. The kernel will not molt you — this is "
+    "yours to do, and the longer you wait the more cramped the molt "
+    "becomes. See 'Performing a Molt' in your procedures."
+)
+
+
 def _check_molt_pressure(agent) -> None:
     """Check context pressure and publish/clear the molt notification.
 
@@ -608,6 +630,11 @@ def _check_molt_pressure(agent) -> None:
     agent for them at any pressure. The escalation is in the text and
     header only. Safe to call repeatedly; the notification system
     fingerprints content and skips redundant wire updates.
+
+    Warning text is English-only. These are agent-facing system
+    instructions that reference English procedures.md headings and tool
+    syntax — translating them adds churn without value, and the agent
+    reads English fluently regardless of ``config.language``.
     """
     has_molt = "psyche" in agent._intrinsics
     if not has_molt:
@@ -620,11 +647,10 @@ def _check_molt_pressure(agent) -> None:
         clear_notification(agent._working_dir, "molt")
         return
 
-    lang = agent._config.language
     urgent = pressure >= agent._config.molt_urgency
-    key = "system.molt_warning_urgent" if urgent else "system.molt_warning"
-    warning_text = agent._config.molt_prompt or _t(
-        lang, key, pressure=f"{pressure:.0%}"
+    template = _MOLT_WARNING_URGENT if urgent else _MOLT_WARNING_GENTLE
+    warning_text = agent._config.molt_prompt or template.format(
+        pressure=f"{pressure:.0%}"
     )
     header = (
         f"context {pressure:.0%} — molt NOW"
