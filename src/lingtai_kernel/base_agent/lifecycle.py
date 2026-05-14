@@ -316,6 +316,22 @@ def _heartbeat_loop(agent) -> None:
         # .rules = network rules signal
         _check_rules_file(agent)
 
+        # --- Nudges ---
+        # Per-agent periodic checks that publish to `.notification/nudge.json`
+        # when something needs the agent's attention (e.g. a newer lingtai
+        # wheel is installed on disk than the version this process imported).
+        # Each check throttles itself; the dispatcher wraps individual calls
+        # so a misbehaving check cannot block the heartbeat loop. See
+        # `nudge/ANATOMY.md`.
+        try:
+            from ..nudge import run_checks as _run_nudge_checks
+            _run_nudge_checks(agent)
+        except Exception as nudge_err:
+            from ..logging import get_logger
+            get_logger().warning(
+                f"[{agent.agent_name}] nudge dispatch failed: {nudge_err}"
+            )
+
         # --- Notification sync ---
         # Poll the `.notification/` directory for changes.  The sync
         # method is a no-op when the fingerprint is unchanged, so this
