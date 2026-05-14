@@ -116,7 +116,7 @@ Four pieces of state on `BaseAgent` (`base_agent/__init__.py:415-439`):
 
 The sync loop runs from **two trigger points**:
 1. **Heartbeat tick** (`base_agent/lifecycle.py:328`) — `agent._sync_notifications()` after `_check_rules_file`. Default cadence is the heartbeat interval (~1s); the producer's `_wake_nap` calls also nudge the heartbeat for sub-second latency.
-2. **Voluntary calls** — `system(action="notification")` (`intrinsics/system/__init__.py:92-94`) returns `collect_notifications(workdir)` directly. Reading is always free; the agent can poll its own notification state any time without touching the wire.
+2. **Voluntary calls** — `system(action="notification")` (`intrinsics/system/__init__.py:92-115`) returns a placeholder dict (`_notification_placeholder: True` + explanatory message); the canonical `notifications` + `_notification_guidance` keys are stamped onto that same result by the ACTIVE-path `attach_active_notifications` post-hook, just like any other dict-shaped tool result. There is no separate "voluntary returns bare channel keys" code path — notifications surface only via the meta-block path so at most one live notification payload exists in history at any moment.
 
 `_sync_notifications` (`base_agent/__init__.py:817`):
 1. Compute fingerprint. If unchanged, return (cheap path — the common case).
@@ -141,7 +141,7 @@ The filesystem-as-protocol redesign collapses all four into "write a file, read 
 
 ### Voluntary `system(action="notification")` — read-your-mailbox path
 
-Beyond kernel-driven sync, agents can call `system(action="notification")` themselves. The handler (`intrinsics/system/__init__.py:92-94`) returns the bare `collect_notifications(workdir)` dict — no `_synthesized` envelope, since the call wasn't synthesized. Useful when the agent wants to recheck producers without waiting for the next sync tick.
+Beyond kernel-driven sync, agents can call `system(action="notification")` themselves. The handler (`intrinsics/system/__init__.py:92-115`) returns a placeholder dict — `{"_notification_placeholder": True, "message": "…"}` — and never builds the bare channel collection itself. The turn-loop post-hook `attach_active_notifications` then stamps the canonical `notifications` + `_notification_guidance` payload onto that same result, exactly as it would for any other dict-shaped tool result. From the agent's perspective this is indistinguishable in shape from a kernel-synthesized pair (which additionally carries `_synthesized: True`). Useful when the agent wants to recheck producers without waiting for the next sync tick — and because the read path is unified with the meta-block stamp, there is never a duplicate representation of the same channels in one result.
 
 ### Migration window — `tc_inbox` is dormant, not deleted
 

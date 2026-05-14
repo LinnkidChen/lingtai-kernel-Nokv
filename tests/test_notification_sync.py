@@ -173,10 +173,18 @@ def test_notification_action_returns_empty_when_nothing_published(
             self._logs.append((evt, fields))
 
     res = handle(_Stub(), {"action": "notification"})
-    assert res == {}
+    # Voluntary call returns a placeholder dict — the live notification
+    # payload (if any) is stamped on by the turn loop's meta-block hook,
+    # never built by the handler itself. So even with nothing published,
+    # the bare channel keys are absent here.
+    assert res == {
+        "_notification_placeholder": True,
+        "message": res["message"],
+    }
+    assert "notification" in res["message"].lower()
 
 
-def test_notification_action_returns_collect(tmp_path: Path) -> None:
+def test_notification_action_returns_placeholder(tmp_path: Path) -> None:
     from lingtai_kernel.intrinsics.system import handle
 
     publish(tmp_path, "email", {"count": 5, "newest_received_at": "2026-05-05T00:00:00Z"})
@@ -191,9 +199,15 @@ def test_notification_action_returns_collect(tmp_path: Path) -> None:
             self._logs.append((evt, fields))
 
     res = handle(_Stub(), {"action": "notification"})
-    assert "email" in res
-    assert "soul" in res
-    assert res["email"]["count"] == 5
+    # Handler returns a placeholder only — channel keys MUST NOT appear
+    # here. The canonical `notifications` payload is attached later by
+    # `attach_active_notifications`, not by this handler. This guarantees
+    # there is only one live notification payload in conversation history.
+    assert res.get("_notification_placeholder") is True
+    assert "email" not in res
+    assert "soul" not in res
+    assert "notifications" not in res
+    assert "_notification_guidance" not in res
 
 
 # ---------------------------------------------------------------------------

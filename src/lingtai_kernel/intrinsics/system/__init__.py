@@ -13,10 +13,14 @@ Actions (voluntary, agent-callable):
     dismiss   — clear one `.notification/<channel>.json` surface (guarded by producer policy)
 
 Action (kernel-synthesized by default — also callable voluntarily by the agent):
-    notification — returns the current state of all notification channels
-                   by reading ``.notification/*.json``. The kernel also
-                   synthesizes this call on the agent's behalf when changes
-                   arrive during IDLE/ASLEEP states.
+    notification — voluntary call returns a placeholder dict; the canonical
+                   live notification payload (``notifications`` +
+                   ``_notification_guidance``) is then stamped onto that same
+                   result by the turn loop's meta-block post-hook. The kernel
+                   also synthesizes this call on the agent's behalf when
+                   changes arrive during IDLE/ASLEEP states — in that case
+                   the synthesized pair carries ``_synthesized: True`` plus
+                   the same canonical payload.
 
 Identity, runtime, and stamina state surface via other channels:
     - identity prompt section — every turn, cached prefix
@@ -82,16 +86,28 @@ from .karma import (  # noqa: F401
 def handle(agent, args: dict) -> dict:
     """Handle system tool — runtime, lifecycle, synchronization."""
     action = args.get("action")
-    # Voluntary `notification` query: returns the current state of all
-    # notification channels by reading `.notification/*.json`.  The
-    # kernel may also synthesize this call on the agent's behalf when a
-    # change arrives during IDLE/ASLEEP — in either case the agent sees
-    # the same shape: ``{"_synthesized": <bool>, "notifications": {...}}``
-    # for kernel-injected calls, or the bare collection dict for
-    # voluntary calls.  See discussions/notification-filesystem-redesign.md.
+    # Voluntary `notification` query: returns a *placeholder* dict.  The
+    # actual live notification payload is stamped onto this same result
+    # by the turn loop's ``attach_active_notifications`` post-hook — the
+    # canonical ``notifications`` + ``_notification_guidance`` keys land
+    # here alongside the placeholder marker, giving the agent exactly the
+    # same wire shape as a kernel-synthesized IDLE/ASLEEP pair (minus the
+    # ``_synthesized: True`` flag, since this call really did originate
+    # from the agent).  The handler never returns bare channel keys
+    # itself: notifications surface only via the meta-block path so there
+    # is one and only one live notification payload in history at a time.
+    # See discussions/notification-filesystem-redesign.md.
     if action == "notification":
-        from ...notifications import collect_notifications
-        return collect_notifications(agent._working_dir)
+        return {
+            "_notification_placeholder": True,
+            "message": (
+                "Voluntary system(action=notification) read. The live "
+                "notification payload is delivered via the kernel "
+                "meta-block under the `notifications` and "
+                "`_notification_guidance` keys on this same result. "
+                "If those keys are absent, no notifications are active."
+            ),
+        }
     handler = {
         "refresh": _refresh,
         "sleep": _sleep,
