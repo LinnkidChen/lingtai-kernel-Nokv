@@ -318,81 +318,69 @@ class AvatarManager:
         # Prepare the avatar's working directory
         parent_name = parent.agent_name or parent._working_dir.name
 
-        if backend == "claude-code":
-            # Claude Code backend: provision a lingtai-node structure
-            self._prepare_claude_code_node(
-                avatar_working_dir, peer_name,
-                mission=reasoning or "",
-                parent_name=parent_name,
-            )
-            # Launch Claude Code
-            proc, stderr_path = self._launch_claude_code(
-                avatar_working_dir, reasoning or "",
-            )
+        # Copy init.json and launch lingtai
+        if avatar_type == "deep":
+            self._prepare_deep(parent._working_dir, avatar_working_dir)
         else:
-            # Lingtai backend (default): copy init.json and launch lingtai
-            if avatar_type == "deep":
-                self._prepare_deep(parent._working_dir, avatar_working_dir)
-            else:
-                avatar_working_dir.mkdir(parents=True, exist_ok=True)
+            avatar_working_dir.mkdir(parents=True, exist_ok=True)
 
-            # Resolve relative file paths to absolute so avatar can find them
-            for key in ("env_file", "covenant_file", "principle_file",
-                        "substrate_file", "procedures_file", "comment_file"):
-                val = parent_init.get(key)
-                if val and not os.path.isabs(val):
-                    resolved = parent._working_dir / val
-                    if resolved.is_file():
-                        parent_init[key] = str(resolved)
+        # Resolve relative file paths to absolute so avatar can find them
+        for key in ("env_file", "covenant_file", "principle_file",
+                    "substrate_file", "procedures_file", "comment_file"):
+            val = parent_init.get(key)
+            if val and not os.path.isabs(val):
+                resolved = parent._working_dir / val
+                if resolved.is_file():
+                    parent_init[key] = str(resolved)
 
-            # Inherit parent's venv_path so avatar can find the runtime
-            if hasattr(parent, "_venv_path") and parent._venv_path:
-                parent_init["venv_path"] = parent._venv_path
+        # Inherit parent's venv_path so avatar can find the runtime
+        if hasattr(parent, "_venv_path") and parent._venv_path:
+            parent_init["venv_path"] = parent._venv_path
 
-            # Clean stale signal files before launch
-            for sig in (".suspend", ".sleep", ".interrupt"):
-                sig_file = avatar_working_dir / sig
-                if sig_file.is_file():
-                    sig_file.unlink(missing_ok=True)
+        # Clean stale signal files before launch
+        for sig in (".suspend", ".sleep", ".interrupt"):
+            sig_file = avatar_working_dir / sig
+            if sig_file.is_file():
+                sig_file.unlink(missing_ok=True)
 
-            # Seed the avatar's first turn with a parent-identity prompt + the
-            # caller's reasoning (task brief). Written to the avatar's `.prompt`
-            # file — picked up by the kernel's signal-file watcher on first poll
-            # and delivered as a one-shot system message (consumed-once via unlink).
-            parent_address = parent._working_dir.name
-            avatar_lang = parent_init.get("manifest", {}).get("language", "en")
-            parent_prompt = t(
-                avatar_lang, "avatar.parent_prompt",
-                parent_name=parent_name,
-                parent_address=parent_address,
-            )
-            first_prompt = parent_prompt
-            if reasoning and reasoning.strip():
-                first_prompt = f"{parent_prompt}\n\n{reasoning.strip()}"
+        # Seed the avatar's first turn with a parent-identity prompt + the
+        # caller's reasoning (task brief). Written to the avatar's `.prompt`
+        # file — picked up by the kernel's signal-file watcher on first poll
+        # and delivered as a one-shot system message (consumed-once via unlink).
+        parent_address = parent._working_dir.name
+        avatar_lang = parent_init.get("manifest", {}).get("language", "en")
+        parent_prompt = t(
+            avatar_lang, "avatar.parent_prompt",
+            parent_name=parent_name,
+            parent_address=parent_address,
+        )
+        first_prompt = parent_prompt
+        if reasoning and reasoning.strip():
+            first_prompt = f"{parent_prompt}\n\n{reasoning.strip()}"
 
-            # Write avatar's init.json (modified copy of parent's).
-            avatar_comment = args.get("comment", "")
-            avatar_init = self._make_avatar_init(
-                parent_init, peer_name, comment=avatar_comment,
-                parent_working_dir=parent._working_dir,
-            )
-            (avatar_working_dir / "init.json").write_text(
-                json.dumps(avatar_init, indent=2, ensure_ascii=False),
-                encoding="utf-8"
-            )
+        # Write avatar's init.json (modified copy of parent's).
+        avatar_comment = args.get("comment", "")
+        avatar_init = self._make_avatar_init(
+            parent_init, peer_name, comment=avatar_comment,
+            parent_working_dir=parent._working_dir,
+        )
+        (avatar_working_dir / "init.json").write_text(
+            json.dumps(avatar_init, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
 
-            # Drop the spawn prompt as a `.prompt` signal file — the avatar's
-            # kernel watcher consumes it on first poll and delivers it once.
-            (avatar_working_dir / ".prompt").write_text(first_prompt, encoding="utf-8")
+        # Drop the spawn prompt as a `.prompt` signal file — the avatar's
+        # kernel watcher consumes it on first poll and delivers it once.
+        (avatar_working_dir / ".prompt").write_text(first_prompt, encoding="utf-8")
 
-            # Launch as detached process and wait briefly for the child to either
-            # write its handshake (.agent.heartbeat) or exit. If the child exits
-            # before handshaking, the spawn failed — capture stderr, ledger the
-            # failure, and return an error to the caller. Without this check the
-            # avatar capability returns "ok" the instant Popen forks, even if the
-            # child crashes 50ms later (e.g. invalid init.json), and the parent's
-            # LLM has no idea anything went wrong.
-            proc, stderr_path = self._launch(avatar_working_dir)
+        # Launch as detached process and wait briefly for the child to either
+        # write its handshake (.agent.heartbeat) or exit. If the child exits
+        # before handshaking, the spawn failed — capture stderr, ledger the
+        # failure, and return an error to the caller. Without this check the
+        # avatar capability returns "ok" the instant Popen forks, even if the
+        # child crashes 50ms later (e.g. invalid init.json), and the parent's
+        # LLM has no idea anything went wrong.
+        proc, stderr_path = self._launch(avatar_working_dir)
         pid = proc.pid
 
         boot_status, boot_error = self._wait_for_boot(
@@ -409,7 +397,6 @@ class AvatarManager:
             working_dir=avatar_working_dir.name,
             mission=reasoning or "",
             type=avatar_type,
-            backend=backend,
             pid=pid,
             **ledger_extra,
         )
