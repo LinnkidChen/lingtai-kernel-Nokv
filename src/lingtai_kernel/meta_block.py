@@ -162,13 +162,38 @@ def build_meta(agent) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_NOTIFICATION_PREVIEW_MAX = 500
+
+
+def _notification_preview(payload: dict) -> str | None:
+    """Return a bounded human-readable preview for compact notification meta."""
+    candidates: list[object] = [payload.get("preview")]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        candidates.extend([
+            data.get("digest"),
+            data.get("preview"),
+            data.get("message"),
+        ])
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        if len(candidate) <= _NOTIFICATION_PREVIEW_MAX:
+            return candidate
+        suffix = f"... ({len(candidate) - _NOTIFICATION_PREVIEW_MAX} more chars)"
+        return candidate[:_NOTIFICATION_PREVIEW_MAX] + suffix
+    return None
+
+
 def _collect_active_notifications_compact(agent) -> dict | None:
     """Return the compact notification snapshot for the latest tool result.
 
     Reads ``.notification/*.json`` via :func:`collect_notifications` and
-    produces a ``{channel: {header, icon, priority}}`` mapping. Returns
-    ``None`` when there are no active channels (or anything goes wrong);
-    callers treat ``None`` as "do not stamp."
+    produces a ``{channel: {header, icon, priority, preview?}}`` mapping.
+    ``preview`` is a bounded human-readable snippet when the producer supplied
+    one (for email this comes from the unread digest). Returns ``None`` when
+    there are no active channels (or anything goes wrong); callers treat
+    ``None`` as "do not stamp."
     """
     try:
         from .notifications import collect_notifications
@@ -191,6 +216,8 @@ def _collect_active_notifications_compact(agent) -> dict | None:
                 entry["icon"] = icon
             if priority := payload.get("priority"):
                 entry["priority"] = priority
+            if preview := _notification_preview(payload):
+                entry["preview"] = preview
             compact[source] = entry
         return compact or None
     except Exception:

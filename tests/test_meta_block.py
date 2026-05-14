@@ -400,7 +400,8 @@ def _write_email_notif(tmp_path):
     notif_dir = tmp_path / ".notification"
     notif_dir.mkdir(parents=True, exist_ok=True)
     (notif_dir / "email.json").write_text(
-        '{"header": "1 unread", "icon": "📬", "priority": "normal"}'
+        '{"header": "1 unread", "icon": "📬", "priority": "normal", '
+        '"data": {"digest": "Email preview line"}}'
     )
 
 
@@ -417,7 +418,12 @@ def test_attach_active_notifications_moves_to_latest_and_clears_prior(tmp_path):
     assert holder is first.content
     assert "_notifications" in first.content
     assert first.content["_notifications"] == {
-        "email": {"header": "1 unread", "icon": "📬", "priority": "normal"}
+        "email": {
+            "header": "1 unread",
+            "icon": "📬",
+            "priority": "normal",
+            "preview": "Email preview line",
+        }
     }
     # Successful stamping must commit the fingerprint, so the IDLE-path
     # synthesized pair will treat this same state as already delivered.
