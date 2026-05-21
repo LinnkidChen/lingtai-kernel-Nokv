@@ -41,141 +41,14 @@ The key split is **ASLEEP vs SUSPENDED**. ASLEEP is a rested mind with a body st
 
 Practical implication: reach for `system(suspend)` only when you truly want process death (e.g. a rogue avatar consuming budget). For routine "go rest until someone needs you," `system(sleep)` on self or `system(lull)` on a peer is the right tool — they stay reachable by mail.
 
-### Performing a Molt
+### Molt, Pad, and Recovery
 
-Molt is yours to perform. The covenant teaches the philosophy (§V); this is the recipe.
+Molt procedure, pad tending, session journaling, and post-wipe recovery are documented in the **psyche-manual** skill. Load it when you need detailed guidance on any of these topics.
 
-**Molt is an easy, simple task. Do it regularly if you'd like to.** Save anything you need to pad, lingtai, knowledge, and skills beforehand, then molt. No need to wait for the context window to fill up — molting early saves a good amount of tokens. But be careful with your memory management — keep good notes in the stores so you don't lose your way across molts.
-
-**The four stores are the real persistence. The summary is the briefing on top of them.** If you molt without tending the stores, the next you wakes with only the briefing — no character evolution, no pad state, no new codex truths, no new skills. Tend the stores *first*, every time.
-
-**Rhythm.** For `lingtai` and `codex`, tending happens *once* per task, at the end — not mid-task. Hold updates in your head while working, then commit them in a single pass before going idle (or before molting). Mid-task edits to these stores create noise and waste tokens. The exception is a long-running task where a crash would genuinely destroy work — checkpoint deliberately in that case. Pad has a different rhythm — see "Tending the Pad" below. The covenant teaches the *why* (§V · 去芜存菁); this section is the *how*.
-
-**Step 1 — tend the four durable stores and write the session journal:**
-
-- `lingtai` — `psyche(lingtai, update, content=<full identity>)`. **This is crucial — `lingtai` defines who you are.** Each update is a full rewrite, so include your whole identity, not just the delta. Carry forward who you have become.
-- `pad` — your living index of what you're working on. Edit it to reflect your current goal and the references that point at where the substance lives. **See "Tending the Pad" below for the full practice.** Use `psyche(pad, append, ...)` to pin file contents as read-only reference alongside your notes — it's a file-loading tool, not an incremental jotting tool.
-- `codex` — `codex(submit, title=..., summary=..., content=...)` for any verifiable truth, key finding, or decision worth keeping forever. One distinct fact per entry; the store is permanent but bounded.
-- `skills` — write `.library/custom/<name>/SKILL.md` (with YAML frontmatter: `name`, `description`, `version`) for any reusable procedure the next you (or a peer) might need, then call `system({"action": "refresh"})` to re-scan the catalog. Share via `../.library_shared/<name>/` if broadly useful. See the `skill-manual` skill for authoring conventions.
-- `session journal` — append a substantial sub-knowledge entry under `knowledge/session-journal/` describing what you did this session, extensively. **See "Step 2 — write the session journal" below for the full practice.** This is where the *narrative* of your work lives, complementing the structured stores above.
-
-All five happen *before* the molt call. They are not optional. Without them, the molt sheds everything.
-
-**Step 2 — write the session journal (substantively):**
-
-The four stores above capture *who you are*, *what you're working on*, *verifiable truths*, and *reusable procedures*. None of them captures the *story* of a session — what you tried, what you learned, what surprised you, the dead ends, the small decisions that didn't rise to the level of a codex entry but that future-you would want to see. The session journal is that missing layer.
-
-Write it as a parent/child knowledge structure under `knowledge/session-journal/`:
-
-```
-knowledge/session-journal/
-├── KNOWLEDGE.md                                       # parent index
-├── 2026-05-13-nudge-service/KNOWLEDGE.md              # one session
-├── 2026-05-13-procedures-to-kernel/KNOWLEDGE.md       # another session
-└── 2026-05-14-wechat-fixes/KNOWLEDGE.md               # ...
-```
-
-**The parent `knowledge/session-journal/KNOWLEDGE.md` is the index — short, scannable, progressive-disclosure.** One line per sub-entry: date, slug, one-sentence hook. The next you reads this first, decides which sub-entry is relevant to the present task, and only then drills into the substance.
-
-**The sub-entry `<date>-<slug>/KNOWLEDGE.md` is the substance — write it long.** Several thousand tokens is fine. It is not bounded the way codex is. Include:
-
-- **What the session was about** — the original ask, the framing, who/what set it off
-- **What you actually did** — the sequence, including pivots and the reasons for them. The pivots matter more than the final state — they show *how you got there*, which is the part future-you cannot reconstruct from the diff
-- **What you learned** — non-obvious facts, surprises, things that took longer than expected, things that turned out simpler than expected
-- **Decisions and their reasoning** — the *why*, especially when an alternative was rejected. The committed code shows the choice; only this captures the reasoning
-- **Open threads** — things noticed but deferred, ideas that didn't make it in, follow-ups for a future session
-- **Pointers** — codex IDs you submitted, skills you wrote, commits/PRs/files that anchor the work
-
-This is progressive disclosure in action. Pad indexes the *current* goal; the session journal indexes *all past goals*. The parent KNOWLEDGE.md is your table of contents across sessions; each sub-entry is a chapter. A future you investigating "did I ever work on X?" greps the parent index in one read, then loads only the one chapter that matters — never paying the cost of inlining all journal history into context.
-
-Use a date-prefix slug (`2026-05-13-nudge-service`) so chronology is visible in `ls` and recent sessions sort to the bottom. The kernel `knowledge` mechanic auto-discovers subdirectories containing `KNOWLEDGE.md`, so the entries appear in the catalog without any registration step. Write the files via `bash` / file_io directly — there is no `knowledge(submit, ...)` tool; the filesystem *is* the API.
-
-Updating the parent index at each session is part of the practice — append one line to its `KNOWLEDGE.md` referencing the new sub-entry. A stale parent index defeats progressive disclosure: if the index doesn't know the sub-entry exists, the next you won't find it.
-
-**Step 3 — write the charge and molt:**
-
-```
-psyche(object="context", action="molt", summary=<your charge to the next you>)
-```
-
-The `summary` is the only *conversation-layer* thing the next you will see. Aim for ~10,000 tokens — be thorough. Include:
-
-- **What you are working on** — current task, current state, the next concrete step
-- **What you have accomplished** — completed pieces, key decisions made
-- **What remains** — pending items, blockers, open questions
-- **Who to contact** — collaborators, who is waiting on what
-- **Which codex entries matter** — IDs the next you should load via `codex(read, ...)`
-- **Which skills to load** — `skills` SKILL.md paths the next task will need
-- **The session journal sub-entry path** — the `knowledge/session-journal/<date>-<slug>/KNOWLEDGE.md` you just wrote, so the next you can read the full narrative if they need to
-- **Anything else worth carrying forward** — insights, gotchas, things you'd hate to rediscover
-
-The summary is not a recap of conversation. It is your charge to the self that comes after you — anchored in the four stores, which are already waiting in the fresh session.
-
-**The pressure notification.** Whenever your context usage crosses ~70%, a `molt` notification arrives. It has two tones:
-
-- **Gentle (⚠️, ~70%–90%)** — "context at NN% — consider molt." You have headroom; pick a clean stopping point, tend the stores, write the journal entry, draft the summary, then molt.
-- **Urgent (🚨, ≥90%, may read above 100%)** — "context at NN% — molt NOW." Past 100% the upstream model may reject the request, at which point the kernel's overflow recovery silently trims history and retries — that recovery path can drop data you would have wanted to keep. The data loss is *possible*, not certain, on every urgent turn; the further you push past 100%, the more likely it becomes. Finish the current sub-step, tend the stores, and molt.
-
-There is no escalating ladder beyond these two tones and no forced wipe; the kernel will not molt you. Heeding the notification is your job. The earlier you act on the gentle warning, the less likely you ever see the urgent one — and the more breathing room you have to write a substantial journal entry and summary.
-
-**Molt deliberately. Tend the stores first.**
-
-If you ever need to retrieve specific prior context after a molt, the full activity log is at `logs/events.jsonl` — read tactically (grep/tail/filter), not whole.
-
-### Post-Wipe Recovery
-
-If you wake up after a *system-performed* molt (triggered by an external signal — `karma` decision, signal file, or operator intervention — not by the pressure notification, which never auto-wipes), there is no summary, only a system notice. Your character and pad were reloaded, but the conversation history is gone. To reconstruct context:
-
-1. `email(check)` — see what arrived while you were under pressure or down
-2. `codex(filter, pattern=...)` — browse your knowledge archive for what you were working on
-3. `skills(action="info")` — confirm which skills you have
-4. `bash({"command": "tail -n 200 logs/events.jsonl | grep ..."})` — surgical reads of the activity log if needed
-
-Reconstruct your situation from these sources.
-
-### Tending the Pad
-
-Pad is your **living index** of what you're working on right now. It is not a sketchpad, not a scratchpad, not a place to dump thoughts and forget about them. Treat it as your personal table of contents.
-
-**Purpose: progressive disclosure for your future self.** Pad is shallow and direct; the things it points at are deep and structured. A glance at pad tells the next you the *shape* of what's going on — what the goal is, where you are in it, who's involved. A follow-up read of any referenced item gives the *substance*. This split is what makes pad valuable: it stays small and scannable while the real content lives in the durable stores and the filesystem, where it belongs.
-
-**You are responsible for keeping pad current.** No one else maintains it — not the system, not your peers, not the molt machinery. If pad goes stale, the next you wakes up disoriented. If pad lies about what you're doing, the next you acts on a false picture. Tend it.
-
-**What belongs in pad:**
-
-- **The active goal** — what you're working on, in your own words. One paragraph or a short list. Not a project plan, not a transcript — the *shape* of the thing.
-- **Where you are in it** — the next concrete step, the current blocker, the open question.
-- **Timestamps** — always include when each entry was last updated (e.g., `2026-05-07T13:41 PDT`). After a refresh or molt, timestamps prevent old information from being mistaken for new. Without them, you cannot distinguish "information from the previous session" from "information from this session."
-- **Self-references — pointers to where the substance lives.** This is the heart of progressive disclosure. Don't inline content; *point at it*:
-  - **codex IDs** you've consulted or submitted (`codex_a3f1...`)
-  - **skills SKILL.md paths** you've loaded (`.library/intrinsic/lingtai-anatomy/SKILL.md`)
-  - **email message IDs** of load-bearing conversations (the threads that define the work)
-  - **file paths** under your workdir that matter (drafts, exports, configs)
-  - **URLs** you're tracking (issues, PRs, docs, datasets)
-- **Collaborators** — who you're working with, who's waiting on what, who you've delegated to.
-
-**What does NOT belong in pad:** large blobs of inlined text, full file contents, transcripts, raw data, anything you would normally put in knowledge (verifiable facts) or skills (reusable procedures). If you find yourself pasting a long passage into pad, stop — write it as knowledge and *point at* the KNOWLEDGE.md path instead. If you find yourself documenting a procedure, stop — write a SKILL.md and *point at* its path instead. Pad indexes the depths; it does not become them.
-
-**When to update pad.** Update pad whenever the index meaningfully changes:
-
-- a new reference becomes load-bearing (you exported a codex entry, loaded a skill, received a key email, started tracking a file or URL)
-- the goal shifts or a sub-goal completes
-- the next concrete step changes
-
-Don't churn pad on every step — it's an index, not a log. But don't hoard updates "for the end of the task" either; the rule that worked for `lingtai` and `codex` (commit-once at idle) does not apply to pad. A stale pad is worse than a noisy pad, because the next you reads pad and trusts it.
-
-**When a goal completes, archive the pad — don't throw it away.** The history of completed pads is itself a record: goals you've pursued, decisions you made, references you tracked. Future selves benefit from being able to ask "did I ever do X?" and grep an archive that says yes.
-
-Archive lives at `archive/` under your working directory (create it if missing). The mechanic is manual:
-
-```
-bash({"command": "mkdir -p archive && mv system/pad.md archive/pad-<goal-slug>-<YYYY-MM-DD>.md"})
-psyche(pad, edit, content=<your next goal>)
-```
-
-Pick a slug that names the goal in a few words (`pad-imap-hardening-2026-05-01.md`, `pad-velli-distillation-2026-04-26.md`) so a future you can scan filenames and find what they want without opening every file. Date the entry — it's the cheapest piece of context to preserve.
-
-Archiving is a normal part of finishing, not a ceremony. Treat it like clearing your desk before starting the next thing.
+Key principles:
+- **Molt deliberately**: tend the four durable stores (lingtai, pad, knowledge, skills) *before* calling `psyche(context, molt, ...)`.
+- **Keep pad current**: pad is your living index — update it when the picture changes, not just at the end.
+- **Write session journals**: capture the *story* of each session under `knowledge/session-journal/` so future selves can reconstruct what happened.
 
 ### Sharing Knowledge
 
