@@ -40,6 +40,24 @@ from ..token_ledger import append_token_entry
 logger = get_logger()
 
 
+# Issue #164 — event types that count as "the agent made forward
+# progress." Bumping ``_last_progress_at`` on these gives the ACTIVE-
+# without-progress watchdog a single, robust signal that survives
+# refactors of individual call sites: every progress event already calls
+# ``_log()``. Each entry's value is the active-turn ``kind`` to record
+# (``None`` means "leave kind alone").
+_PROGRESS_EVENTS: dict[str, str | None] = {
+    "wake": "wake",
+    "tc_wake_continue": "wake",
+    "llm_call": "llm_call",
+    "llm_response": None,  # progress, but turn kind stays "llm_call"
+    "tool_call": "tool_call",
+    "tool_result": None,
+    "notification_pair_injected": "notification_injection",
+    "turn_cancelled_post_tool": None,
+}
+
+
 # ---------------------------------------------------------------------------
 # Identity prompt section (curated prose)
 # ---------------------------------------------------------------------------
@@ -462,6 +480,42 @@ class BaseAgent:
         self._heartbeat_thread: threading.Thread | None = None
         self._aed_start: float | None = None
 
+        # Issue #164 — ACTIVE-without-progress watchdog.
+        #
+        # ``_state_changed_at`` records when the agent last transitioned
+        # state (wall-clock seconds, ``time.time()``). ``_last_progress_at``
+        # is bumped by any of the kernel's progress events — ``wake``,
+        # ``tc_wake_continue``, ``llm_call``, ``llm_response``, ``tool_call``,
+        # ``tool_result``, ``notification_pair_injected``, and state
+        # transitions themselves. The heartbeat tick reads both: when
+        # ``state == ACTIVE`` and no progress event has fired for longer
+        # than ``LINGTAI_ACTIVE_STUCK_THRESHOLD_S`` (default 600s, ~10min),
+        # we log ``active_without_progress`` once per condition so the
+        # symptom Jason reported (ACTIVE wedged + notification_deferred
+        # storm with no turn ever starting) is diagnosable from the event
+        # log instead of requiring forensic cross-referencing.
+        #
+        # The watchdog deliberately does NOT auto-restart the agent — the
+        # safest action across the failure modes we've seen is "make it
+        # visible and let admin or .clear handle recovery." Auto-restart
+        # without understanding the underlying race could mask real bugs
+        # behind retries.
+        now_wall = time.time()
+        self._state_changed_at: float = now_wall
+        self._last_progress_at: float = now_wall
+        self._active_turn_kind: str | None = None
+        self._active_turn_started_at: float | None = None
+        self._active_turn_id: str | None = None
+        #: Counts repeated ``notification_deferred_active`` events since
+        #: the last successful injection. Reset on
+        #: ``notification_pair_injected``. Surfaced in ``.status.json`` so
+        #: the deferral storm in #164 shows up before the user notices.
+        self._deferred_notifications_count: int = 0
+        self._deferred_notifications_oldest_at: float | None = None
+        #: One-shot latch so the watchdog logs exactly once per stuck
+        #: episode. Cleared on any state transition out of ACTIVE.
+        self._active_stuck_logged: bool = False
+
         # Snapshot — periodic git commits (Time Machine)
         self._last_snapshot: float = 0.0
         self._last_gc: float = 0.0
@@ -627,6 +681,28 @@ class BaseAgent:
         elif old == AgentState.IDLE:
             _cancel_soul_timer(self)
 
+        # Issue #164 — watchdog bookkeeping. A state transition is itself
+        # forward progress, so reset the no-progress clock. The
+        # one-shot stuck-logged latch is cleared whenever we leave ACTIVE
+        # so the next stuck episode can be reported.
+        now_wall = time.time()
+        self._state_changed_at = now_wall
+        self._last_progress_at = now_wall
+        if new_state == AgentState.ACTIVE:
+            # The kernel doesn't know yet what kind of turn this will be —
+            # the next progress event (``wake``, ``tc_wake_continue``,
+            # ``llm_call``, ``tool_call``) refines this. We seed with a
+            # "pending" marker so .status.json never claims a turn is
+            # already in flight when only the state flipped.
+            self._active_turn_kind = "pending"
+            self._active_turn_started_at = now_wall
+            self._active_turn_id = None
+        else:
+            self._active_turn_kind = None
+            self._active_turn_started_at = None
+            self._active_turn_id = None
+            self._active_stuck_logged = False
+
         self._log("agent_state", old=old.value, new=new_state.value, reason=reason)
         self._workdir.write_manifest(self._build_manifest())
 
@@ -636,7 +712,39 @@ class BaseAgent:
         self._nap_wake.set()
 
     def _log(self, event_type: str, **fields) -> None:
-        """Write a structured event to the logging service, if configured."""
+        """Write a structured event to the logging service, if configured.
+
+        Also updates issue #164 watchdog bookkeeping: known progress
+        events bump ``_last_progress_at`` and may refine the active-turn
+        kind/id, and ``notification_deferred_active`` events update the
+        deferred-notification counters.
+        """
+        # Watchdog bookkeeping — done before the actual log write so the
+        # bookkeeping is in place even if the log service raises.
+        if event_type in _PROGRESS_EVENTS:
+            self._last_progress_at = time.time()
+            kind = _PROGRESS_EVENTS[event_type]
+            if kind is not None:
+                self._active_turn_kind = kind
+                self._active_turn_started_at = self._last_progress_at
+            # call_id is the canonical tool-call identifier across the
+            # kernel; carry it through to the active-turn block so the
+            # status snapshot can tie back to events.jsonl.
+            call_id = fields.get("call_id")
+            if isinstance(call_id, str):
+                self._active_turn_id = call_id
+        elif event_type == "notification_deferred_active":
+            self._deferred_notifications_count += 1
+            if self._deferred_notifications_oldest_at is None:
+                self._deferred_notifications_oldest_at = time.time()
+        elif event_type == "agent_state":
+            # Successful injection / state transitions reset the deferral
+            # storm counter — the very next state change after a deferral
+            # storm is exactly the recovery signal we want to note.
+            if self._deferred_notifications_count:
+                self._deferred_notifications_count = 0
+                self._deferred_notifications_oldest_at = None
+
         if self._log_service:
             self._log_service.log({
                 "type": event_type,

@@ -42,7 +42,20 @@ def setup(agent: "BaseAgent") -> None:
             search_dir = str(agent._working_dir / search_dir)
         try:
             matches = agent._file_io.glob(pattern, root=search_dir)
-            return {"matches": matches, "count": len(matches)}
+            result: dict = {"matches": matches, "count": len(matches)}
+            # Issue #164: surface traversal budget / exclusion info so the
+            # LLM can react to partial results instead of treating them
+            # as definitive ("no files found anywhere").
+            stats = getattr(agent._file_io, "last_traversal", None)
+            if stats is not None and stats.truncated_reason is not None:
+                result["truncated"] = True
+                result["truncated_reason"] = stats.truncated_reason
+                result["traversal"] = {
+                    "visited": stats.visited,
+                    "elapsed_ms": stats.elapsed_ms,
+                    "dirs_pruned": stats.dirs_pruned,
+                }
+            return result
         except Exception as e:
             return {"status": "error", "message": f"Glob failed: {e}"}
 
