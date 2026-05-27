@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import lingtai.services.file_io as file_io
 from lingtai.services.file_io import LocalFileIOService, GrepMatch
 
 
@@ -92,3 +93,115 @@ class TestLocalFileIOService:
         path = str(tmp_dir / "abs.txt")
         svc.write(path, "absolute")
         assert svc.read(path) == "absolute"
+
+
+class TestTraversalBudgets:
+    """Issue #164 — recursive glob/grep must default-prune large
+    cache/history dirs and bail out within a wall-clock / visited budget
+    instead of wedging the agent on a broad root."""
+
+    def test_glob_skips_default_excluded_dirs(self, svc, tmp_dir):
+        # Files that should be visible
+        svc.write("src/main.py", "# main")
+        svc.write("tests/test_main.py", "# test")
+        # Files inside default-excluded dirs that must be pruned
+        svc.write(".git/HEAD", "ref: refs/heads/main")
+        svc.write("node_modules/foo/index.js", "module.exports = {}")
+        svc.write(".venv/lib/python3.11/site-packages/bar.py", "")
+        svc.write("__pycache__/x.pyc", "")
+        svc.write(".lingtai/agent1/history/chat.jsonl", "{}")
+        svc.write("history/old.jsonl", "{}")  # bare `history/` (LingTai workdir layout)
+        svc.write("tmp/scratch.txt", "x")
+        svc.write("dist/bundle.js", "x")
+
+        results = svc.glob("**/*")
+        for r in results:
+            assert ".git" not in r
+            assert "node_modules" not in r
+            assert ".venv" not in r
+            assert "__pycache__" not in r
+            assert "/history/" not in r and not r.endswith("/history")
+            assert "/tmp/" not in r and not r.endswith("/tmp")
+            assert "/dist/" not in r and not r.endswith("/dist")
+        # Real source files survive
+        assert any(r.endswith("/src/main.py") for r in results)
+        assert any(r.endswith("/tests/test_main.py") for r in results)
+
+    def test_grep_skips_default_excluded_dirs(self, svc, tmp_dir):
+        svc.write("src/main.py", "needle\n")
+        svc.write(".git/objects/needle.txt", "needle\n")
+        svc.write("node_modules/pkg/index.js", "needle\n")
+        svc.write("history/chat.jsonl", "needle\n")
+
+        results = svc.grep("needle")
+        files_found = {r.path for r in results}
+        assert any(p.endswith("/src/main.py") for p in files_found)
+        assert not any(".git" in p for p in files_found)
+        assert not any("node_modules" in p for p in files_found)
+        assert not any("/history/" in p for p in files_found)
+
+    def test_glob_walltime_budget_returns_partial(self, svc, tmp_dir):
+        # Seed many files so the traversal has work to do.
+        for i in range(20):
+            svc.write(f"sub_{i:03d}/file_{i:03d}.txt", "x")
+        # walltime_s=0 forces the budget check to fire on the first
+        # directory tick — we should still get back the partial result
+        # plus a structured ``truncated_reason``.
+        results = svc.glob("**/*", walltime_s=0.0)
+        assert isinstance(results, list)
+        assert svc.last_traversal.truncated_reason == "walltime"
+
+    def test_glob_walltime_budget_checked_inside_large_file_loop(self, svc, tmp_dir, monkeypatch):
+        for i in range(20):
+            svc.write(f"file_{i:03d}.txt", "x")
+
+        times = iter([100.0, 100.0, 101.0, 101.0])
+        monkeypatch.setattr(file_io.time, "monotonic", lambda: next(times))
+
+        results = svc.glob("**/*", walltime_s=0.5)
+
+        assert results == []
+        assert svc.last_traversal.truncated_reason == "walltime"
+
+    def test_grep_visited_budget_returns_partial(self, svc, tmp_dir):
+        for i in range(50):
+            svc.write(f"f_{i:03d}.txt", "needle\n")
+        results = svc.grep("needle", max_results=999, max_visited=5)
+        # Either we tripped visited budget or capped on max_results;
+        # the contract is "structured partial, agent not wedged".
+        assert svc.last_traversal.truncated_reason in {"visited", "max_results"}
+        assert svc.last_traversal.elapsed_ms >= 0
+
+    def test_visited_budget_counts_directories(self, svc, tmp_dir):
+        for i in range(20):
+            svc.write(f"dir_{i:03d}/file.txt", "x")
+
+        results = svc.glob("**/*", max_visited=5)
+
+        assert isinstance(results, list)
+        assert svc.last_traversal.truncated_reason == "visited"
+
+    def test_grep_skips_oversized_files(self, svc, tmp_dir):
+        svc.write("big.txt", "x" * 50)
+        svc.write("small.txt", "needle\n")
+        results = svc.grep("needle", max_file_bytes=10)
+        # big.txt is skipped; small.txt is read normally.
+        files_found = {r.path for r in results}
+        assert any(p.endswith("/small.txt") for p in files_found)
+        assert not any(p.endswith("/big.txt") for p in files_found)
+        assert svc.last_traversal.files_skipped_size >= 1
+
+    def test_last_traversal_resets_per_call(self, svc, tmp_dir):
+        svc.write("a.txt", "x")
+        svc.glob("**/*", walltime_s=0.0)
+        first_reason = svc.last_traversal.truncated_reason
+        svc.glob("**/*")  # ample budget
+        # second call must reset the stats to a clean state
+        assert svc.last_traversal.truncated_reason is None
+        assert first_reason == "walltime"
+
+    def test_exclude_dirs_override(self, svc, tmp_dir):
+        # Allow the caller to opt back in by passing an empty exclude set.
+        svc.write(".git/HEAD", "ref")
+        results = svc.glob("**/*", exclude_dirs=set())
+        assert any(".git" in r for r in results)

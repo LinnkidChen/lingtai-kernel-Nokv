@@ -205,24 +205,66 @@ def _status(agent) -> dict:
         except Exception:
             pass
 
-    return {
+    # Issue #164 — expose enough runtime state for an external observer
+    # (TUI, watchdog process, ops grep on .status.json) to tell apart
+    # "actually computing" from "wedged ACTIVE with no turn." The
+    # heartbeat-only signal is not enough; see
+    # reports/dual-agent-stuck-forensics-2026-05-26.md.
+    state_changed_at = getattr(agent, "_state_changed_at", None)
+    last_progress_at = getattr(agent, "_last_progress_at", None)
+    no_progress_seconds = None
+    if last_progress_at is not None:
+        no_progress_seconds = round(max(0.0, time.time() - last_progress_at), 1)
+
+    active_turn_block: dict | None = None
+    active_kind = getattr(agent, "_active_turn_kind", None)
+    if active_kind is not None:
+        started_at = getattr(agent, "_active_turn_started_at", None)
+        elapsed = None
+        if started_at is not None:
+            elapsed = round(max(0.0, time.time() - started_at), 1)
+        active_turn_block = {
+            "kind": active_kind,
+            "id": getattr(agent, "_active_turn_id", None),
+            "started_at": started_at,
+            "elapsed_seconds": elapsed,
+        }
+
+    deferred_block: dict | None = None
+    deferred_count = getattr(agent, "_deferred_notifications_count", 0)
+    if deferred_count:
+        deferred_block = {
+            "count": deferred_count,
+            "oldest_at": getattr(agent, "_deferred_notifications_oldest_at", None),
+            "reason": "active",
+        }
+
+    runtime_block = scrub_time_fields(
+        agent,
+        {
+            "current_time": now_iso(agent),
+            "started_at": agent._started_at,
+            "uptime_seconds": round(uptime, 1),
+            "stamina": agent._config.stamina,
+            "stamina_left": round(stamina_left, 1) if stamina_left is not None else None,
+            "state": agent._state.value,
+            "state_changed_at": state_changed_at,
+            "last_progress_at": last_progress_at,
+            "no_progress_seconds": no_progress_seconds,
+        },
+        keys=(
+            "current_time", "started_at", "uptime_seconds", "stamina", "stamina_left",
+            "state_changed_at", "last_progress_at", "no_progress_seconds",
+        ),
+    )
+
+    result = {
         "identity": {
             "address": str(agent._working_dir),
             "agent_name": agent.agent_name,
             "mail_address": mail_addr,
         },
-        "runtime": scrub_time_fields(
-            agent,
-            {
-                "current_time": now_iso(agent),
-                "started_at": agent._started_at,
-                "uptime_seconds": round(uptime, 1),
-                "stamina": agent._config.stamina,
-                "stamina_left": round(stamina_left, 1) if stamina_left is not None else None,
-                "state": agent._state.value,
-            },
-            keys=("current_time", "started_at", "uptime_seconds", "stamina", "stamina_left"),
-        ),
+        "runtime": runtime_block,
         "tokens": {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"],
@@ -244,3 +286,8 @@ def _status(agent) -> dict:
             },
         },
     }
+    if active_turn_block is not None:
+        result["active_turn"] = active_turn_block
+    if deferred_block is not None:
+        result["deferred_notifications"] = deferred_block
+    return result

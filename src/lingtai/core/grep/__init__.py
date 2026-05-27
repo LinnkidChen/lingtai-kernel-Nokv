@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import fnmatch
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ...i18n import t
 
@@ -62,7 +62,26 @@ def setup(agent: "BaseAgent") -> None:
             # (meaning the glob may have discarded results that masked
             # additional matches).
             truncated = raw_truncated
-            return {"matches": matches, "count": len(matches), "truncated": truncated}
+            result: dict[str, Any] = {
+                "matches": matches,
+                "count": len(matches),
+                "truncated": truncated,
+            }
+            # Issue #164: surface traversal budget / exclusion info so the
+            # LLM can react to partial results instead of treating them
+            # as definitive ("no matches found anywhere").
+            stats = getattr(agent._file_io, "last_traversal", None)
+            if stats is not None and stats.truncated_reason is not None:
+                result["truncated"] = True
+                result["truncated_reason"] = stats.truncated_reason
+                result["traversal"] = {
+                    "visited": stats.visited,
+                    "elapsed_ms": stats.elapsed_ms,
+                    "dirs_pruned": stats.dirs_pruned,
+                    "files_skipped_size": stats.files_skipped_size,
+                    "files_skipped_binary": stats.files_skipped_binary,
+                }
+            return result
         except Exception as e:
             return {"status": "error", "message": f"Grep failed: {e}"}
 

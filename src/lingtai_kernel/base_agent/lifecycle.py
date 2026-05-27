@@ -8,8 +8,22 @@ snapshots.
 from __future__ import annotations
 
 import json
+import os
 import time
 import threading
+
+
+def _active_stuck_threshold_s() -> float:
+    """Issue #164 — seconds of no-progress ACTIVE before the watchdog fires.
+
+    Defaults to 600s (~10 min). Overridable via
+    ``LINGTAI_ACTIVE_STUCK_THRESHOLD_S`` so operators can tune for noisy
+    LLM providers without changing kernel code.
+    """
+    try:
+        return max(30.0, float(os.environ.get("LINGTAI_ACTIVE_STUCK_THRESHOLD_S", "600")))
+    except (TypeError, ValueError):
+        return 600.0
 
 
 def _start(agent) -> None:
@@ -367,6 +381,37 @@ def _heartbeat_loop(agent) -> None:
                 agent._asleep.set()
         else:
             agent._aed_start = None
+
+        # Issue #164 — ACTIVE-without-progress watchdog.
+        #
+        # Fires once per stuck episode (latched by ``_active_stuck_logged``)
+        # when the agent has been ACTIVE for longer than the configured
+        # threshold without any progress event (wake, llm_call, llm_response,
+        # tool_call, tool_result, notification_pair_injected, agent_state).
+        # The companion symptom — a ``notification_deferred_active`` storm —
+        # is included in the log fields so a single grep on
+        # ``active_without_progress`` exposes both halves of the failure.
+        #
+        # We deliberately do NOT auto-recover here: the failure modes seen
+        # in dev-2/dev-1/spiritualblisslingtaibot all benefited from human
+        # inspection before .clear/refresh. Auto-restart could mask a
+        # repeatable bug behind silent retries.
+        if agent._state == AgentState.ACTIVE and not agent._active_stuck_logged:
+            threshold = _active_stuck_threshold_s()
+            no_progress_for = time.time() - agent._last_progress_at
+            if no_progress_for > threshold:
+                agent._log(
+                    "active_without_progress",
+                    no_progress_seconds=round(no_progress_for, 1),
+                    threshold_seconds=threshold,
+                    state_since=agent._state_changed_at,
+                    active_turn_kind=agent._active_turn_kind,
+                    active_turn_id=agent._active_turn_id,
+                    deferred_notifications=agent._deferred_notifications_count,
+                    deferred_oldest_at=agent._deferred_notifications_oldest_at,
+                )
+                agent._write_status_snapshot()
+                agent._active_stuck_logged = True
 
         # Periodic snapshot (Time Machine) — off by default
         if agent._config.snapshot_interval is not None:
