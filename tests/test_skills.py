@@ -87,6 +87,19 @@ def test_skills_setup_hard_copies_standalone_intrinsic_skills(tmp_path):
         assert "name: file-manual" in body
         assert "encoding='gbk'" in body
         assert "iconv -f gbk -t utf-8" in body
+
+        doctor_md = (
+            workdir
+            / ".library"
+            / "intrinsic"
+            / "capabilities"
+            / "lingtai-doctor"
+            / "SKILL.md"
+        )
+        doctor_script = doctor_md.parent / "scripts" / "doctor.py"
+        assert doctor_md.is_file()
+        assert doctor_script.is_file()
+        assert "name: lingtai-doctor" in doctor_md.read_text(encoding="utf-8")
     finally:
         agent.stop(timeout=1.0)
 
