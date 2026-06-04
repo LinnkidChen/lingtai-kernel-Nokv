@@ -19,7 +19,7 @@ import signal
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -3166,9 +3166,32 @@ class DaemonManager:
             "events_returned": len(events),
         }
 
-    def _handle_reclaim(self) -> dict:
-        cancelled = sum(1 for e in self._emanations.values()
-                        if not e["future"].done())
+    def shutdown_for_agent_stop(
+        self, reason: str = "agent_stop", wait_timeout: float = 5.0
+    ) -> dict:
+        """Shut down daemon-owned runtime resources during agent teardown.
+
+        Refresh/suspend/stop must not release the parent agent heartbeat/lock
+        while daemon executor workers or external CLI subprocess groups can
+        still keep the old Python interpreter alive.  This lifecycle hook is
+        intentionally best-effort and non-raising: callers in the agent stop
+        path must continue toward teardown even if one child process is already
+        gone or a pool has raced to completion.
+        """
+        return self._shutdown_runtime_resources(
+            reason=reason, wait_timeout=wait_timeout
+        )
+
+    def _shutdown_runtime_resources(
+        self, *, reason: str, wait_timeout: float = 0.0
+    ) -> dict:
+        futures = [
+            future for e in self._emanations.values()
+            if (future := e.get("future")) is not None
+        ]
+        cancelled = sum(1 for future in futures if not future.done())
+        errors: list[str] = []
+
         # Kill all tracked CLI process groups first — this terminates child
         # shells/tools that cancel_event alone cannot reach (GH #122).
         # Snapshot under lock, kill outside to avoid holding lock during wait.
@@ -3176,21 +3199,66 @@ class DaemonManager:
             procs_to_kill = list(self._cli_procs)
             self._cli_procs.clear()
         for proc in procs_to_kill:
-            _kill_process_group(proc)
-        for pool, cancel in self._pools:
-            cancel.set()
-            pool.shutdown(wait=False, cancel_futures=True)
+            try:
+                _kill_process_group(proc)
+            except Exception as e:  # pragma: no cover - defensive teardown
+                errors.append(f"kill pid {getattr(proc, 'pid', '?')}: {e}")
+
+        pools = list(self._pools)
         self._pools.clear()
+        for pool, cancel in pools:
+            try:
+                cancel.set()
+            except Exception as e:  # pragma: no cover - defensive teardown
+                errors.append(f"cancel pool: {e}")
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception as e:  # pragma: no cover - defensive teardown
+                errors.append(f"shutdown pool: {e}")
+
         # Tear down the dedicated CLI-ask pool too — its workers are already
         # losing their subprocesses to the kill above, but futures may still
-        # be sitting in the queue. Rebuild a fresh pool for subsequent asks.
-        self._ask_pool.shutdown(wait=False, cancel_futures=True)
+        # be sitting in the queue. Rebuild a fresh pool so explicit reclaim
+        # and stop/start reuse leave the manager in a valid state.
+        try:
+            self._ask_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:  # pragma: no cover - defensive teardown
+            errors.append(f"shutdown ask pool: {e}")
         self._ask_pool = ThreadPoolExecutor(
             max_workers=max(1, self._max_emanations),
             thread_name_prefix="daemon-cli-ask",
         )
+
+        # During parent stop/refresh, keep heartbeat/lock alive for a bounded
+        # grace period while killed CLI workers and cooperative daemon loops
+        # unwind. Explicit daemon(action="reclaim") keeps the old non-blocking
+        # behavior by passing wait_timeout=0.
+        futures_remaining = sum(1 for future in futures if not future.done())
+        if wait_timeout > 0 and futures_remaining:
+            try:
+                wait(futures, timeout=wait_timeout)
+            except Exception as e:  # pragma: no cover - defensive teardown
+                errors.append(f"wait futures: {e}")
+            futures_remaining = sum(1 for future in futures if not future.done())
+
         self._emanations.clear()
         self._next_id = 1  # handles can be re-used; folder names disambiguate
+
+        report = {
+            "status": "shutdown",
+            "reason": reason,
+            "cancelled": cancelled,
+            "cli_processes_killed": len(procs_to_kill),
+            "pools_shutdown": len(pools),
+            "futures_remaining": futures_remaining,
+            "errors": errors,
+        }
+        self._log("daemon_lifecycle_shutdown", **report)
+        return report
+
+    def _handle_reclaim(self) -> dict:
+        report = self.shutdown_for_agent_stop(reason="reclaim", wait_timeout=0.0)
+        cancelled = report.get("cancelled", 0)
         self._log("daemon_reclaim", cancelled_count=cancelled)
         return {"status": "reclaimed", "cancelled": cancelled}
 

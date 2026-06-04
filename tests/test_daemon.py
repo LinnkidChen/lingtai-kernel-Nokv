@@ -532,27 +532,36 @@ def test_emanate_creates_folder_on_disk(tmp_path):
     mock_resp.tool_calls = []
     mock_resp.usage = MagicMock(input_tokens=0, output_tokens=0,
                                  thinking_tokens=0, cached_tokens=0)
-    mock_session.send = MagicMock(return_value=mock_resp)
+    release_send = threading.Event()
+
+    def _blocking_send(*args, **kwargs):
+        release_send.wait(timeout=5.0)
+        return mock_resp
+
+    mock_session.send = MagicMock(side_effect=_blocking_send)
     agent.service.create_session = MagicMock(return_value=mock_session)
 
-    result = mgr.handle({"action": "emanate", "tasks": [
-        {"task": "find todos", "tools": ["file"]},
-    ]})
-    assert result["status"] == "dispatched"
+    try:
+        result = mgr.handle({"action": "emanate", "tasks": [
+            {"task": "find todos", "tools": ["file"]},
+        ]})
+        assert result["status"] == "dispatched"
 
-    daemons_dir = agent._working_dir / "daemons"
-    assert daemons_dir.is_dir()
-    children = list(daemons_dir.iterdir())
-    assert len(children) == 1
-    folder = children[0]
-    # Folder name matches em-1-<YYYYMMDD-HHMMSS>-<6 hex>
-    assert re.fullmatch(r"em-1-\d{8}-\d{6}-[0-9a-f]{6}", folder.name)
-    # daemon.json exists with state=running and identity fields
-    data = json.loads((folder / "daemon.json").read_text())
-    assert data["handle"] == "em-1"
-    assert data["task"] == "find todos"
-    assert data["tools"] == ["file"]
-    assert data["state"] == "running"
+        daemons_dir = agent._working_dir / "daemons"
+        assert daemons_dir.is_dir()
+        children = list(daemons_dir.iterdir())
+        assert len(children) == 1
+        folder = children[0]
+        # Folder name matches em-1-<YYYYMMDD-HHMMSS>-<6 hex>
+        assert re.fullmatch(r"em-1-\d{8}-\d{6}-[0-9a-f]{6}", folder.name)
+        # daemon.json exists with state=running and identity fields
+        data = json.loads((folder / "daemon.json").read_text())
+        assert data["handle"] == "em-1"
+        assert data["task"] == "find todos"
+        assert data["tools"] == ["file"]
+        assert data["state"] == "running"
+    finally:
+        release_send.set()
 
 
 def test_reclaim_resets_next_id_to_1(tmp_path):

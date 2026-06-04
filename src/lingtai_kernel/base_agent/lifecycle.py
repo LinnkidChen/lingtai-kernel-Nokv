@@ -104,6 +104,11 @@ def _stop(agent, timeout: float = 5.0) -> None:
     Otherwise the file vanishes seconds before the Python process actually
     exits, and a quick relaunch races a still-living interpreter into the
     same workdir. See workdir-race investigation 2026-05-09.
+
+    Daemon resources are also reclaimed before liveness is withdrawn: daemon
+    ThreadPoolExecutor workers and external CLI process groups can otherwise
+    keep this interpreter visible in `ps` after heartbeat/lock are gone, which
+    makes refresh watchers race the duplicate-process guard.
     """
     from ..intrinsics.soul.flow import _cancel_soul_timer
 
@@ -112,6 +117,7 @@ def _stop(agent, timeout: float = 5.0) -> None:
     agent._shutdown.set()
     if agent._thread:
         agent._thread.join(timeout=timeout)
+    _shutdown_daemon_runtime(agent, reason="agent_stop")
     agent._session.close()
 
     # Stop MailService if configured
@@ -133,6 +139,37 @@ def _stop(agent, timeout: float = 5.0) -> None:
     agent._workdir.write_manifest(agent._build_manifest())
     _stop_heartbeat(agent)
     agent._workdir.release_lock()
+
+
+def _shutdown_daemon_runtime(agent, *, reason: str) -> None:
+    """Best-effort daemon cleanup before parent liveness is released."""
+    mgr = None
+    try:
+        get_capability = getattr(agent, "get_capability", None)
+        if callable(get_capability):
+            mgr = get_capability("daemon")
+        if mgr is None:
+            mgr = getattr(agent, "_capability_managers", {}).get("daemon")
+    except Exception as e:
+        try:
+            agent._log("daemon_lifecycle_lookup_failed", reason=reason, error=str(e))
+        except Exception:
+            pass
+        return
+
+    shutdown = getattr(mgr, "shutdown_for_agent_stop", None)
+    if not callable(shutdown):
+        return
+    try:
+        shutdown(reason=reason)
+    except Exception as e:
+        # Stop/refresh teardown must continue even if daemon cleanup races with
+        # already-finished workers. Keep heartbeat/lock alive until this point,
+        # log the failure, then proceed to the rest of stop.
+        try:
+            agent._log("daemon_lifecycle_shutdown_failed", reason=reason, error=str(e))
+        except Exception:
+            pass
 
 
 def _start_heartbeat(agent) -> None:
