@@ -9,16 +9,16 @@ LLM adapter layer — multi-provider support with adapter registry, base classes
 | File | LOC | Role |
 |------|-----|------|
 | `__init__.py` | 20 | Re-exports kernel types (`ChatSession`, `LLMResponse`, `ToolCall`, `FunctionSchema`, `ChatInterface`) + `LLMAdapter` from `base.py`. Triggers `register_all_adapters()` on import. |
-| `_register.py` | 108 | Registers adapter factories for all providers with `LLMService.register_adapter()` |
+| `_register.py` | 117 | Registers adapter factories for all providers with `LLMService.register_adapter()` |
 | `api_gate.py` | 112 | `APICallGate` — RPM rate limiter with deque timestamps, `ThreadPoolExecutor`, daemon gate thread |
 | `base.py` | 150 | `LLMAdapter` ABC (4 abstract methods), `_GatedSession` proxy |
 | `interface_converters.py` | 335 | Bidirectional converters: `to_*` / `from_*` for Anthropic, OpenAI, OpenAI Responses API, Gemini |
-| `service.py` | 313 | `LLMService` concrete class — adapter registry, session management, one-shot generation |
+| `service.py` | 359 | `LLMService` concrete class — adapter registry, session management, one-shot generation |
 
 ## Connections
 
 - **Kernel types** — `__init__.py:3` imports `ChatSession`, `LLMResponse`, `ToolCall`, `FunctionSchema` from `lingtai_kernel.llm.base`; `ChatInterface` from `lingtai_kernel.llm.interface`.
-- **ABC chain** — `LLMAdapter` (`base.py:53`) → abstract `create_chat`, `generate`, `make_tool_result_message`, `is_quota_error`. `LLMService` (`service.py:51`) extends `lingtai_kernel.llm.service.LLMService` ABC.
+- **ABC chain** — `LLMAdapter` (`base.py:53`) → abstract `create_chat`, `generate`, `make_tool_result_message`, `is_quota_error`. `LLMService` (`service.py:97`) extends `lingtai_kernel.llm.service.LLMService` ABC.
 - **Adapter registration** — `_register.py` registers 7 dedicated factories + 6 generic-routed providers (`grok`, `qwen`, `glm`, `zhipu`, `kimi`, `mimo`) via dedicated or `_custom` factories (`_register.py:91-106`).
 - **Interface converters** — imported by adapter session modules (e.g. `openai.adapter` imports `to_openai`, `to_responses_input` from `interface_converters.py:120`).
 - **Rate gating** — `LLMAdapter._setup_gate(max_rpm)` creates `APICallGate`; `_wrap_with_gate()` returns `_GatedSession` proxy for sessions.
@@ -26,8 +26,8 @@ LLM adapter layer — multi-provider support with adapter registry, base classes
 ## Composition
 
 - **Factory pattern** — `LLMService._adapter_registry` (class-level dict) maps provider name → `Callable[..., LLMAdapter]`. Each factory receives `(model, defaults, **kw)` and lazy-imports the adapter module.
-- **Adapter caching** — `LLMService._adapters` keyed by `(provider, base_url)` tuple (`service.py:95`). Double-checked locking via `_adapter_lock` (`service.py:153`).
-- **Session tracking** — `LLMService._sessions` dict maps `st_<12-hex>` session IDs to `ChatSession` instances (`service.py:100`). Untracked sessions get `session_id=""`.
+- **Adapter caching** — `LLMService._adapters` keyed by `(provider, base_url)` tuple (`service.py:141`). Double-checked locking via `_adapter_lock` (`service.py:142`).
+- **Session tracking** — `LLMService._sessions` dict maps `st_<12-hex>` session IDs to `ChatSession` instances (`service.py:144`). Untracked sessions get `session_id=""`.
 - **Gated sessions** — `_GatedSession` (`base.py:19`) proxies `send()` and `send_stream()` through `APICallGate.submit()`. Attribute writes land on the proxy; reads fall through to inner session via `__getattr__`.
 - **Codex factory** — `_register.py:54` builds `CodexOpenAIAdapter`, monkey-patches `create_chat` and `generate` to refresh OAuth tokens before each call via `CodexTokenManager.get_access_token()`.
 
@@ -35,7 +35,7 @@ LLM adapter layer — multi-provider support with adapter registry, base classes
 
 - **Class-level** — `LLMService._adapter_registry` (shared across all instances); `LLMAdapter._gate` (per-adapter instance).
 - **Instance-level** — `LLMService._adapters` cache; `LLMService._sessions` registry; `APICallGate._timestamps` deque for RPM window.
-- **Provider defaults** — `LLMService._provider_defaults` dict injected at construction (`service.py:96`). Drives model, base_url, max_rpm, api_compat settings. Build it from `manifest.llm` via `build_provider_defaults_from_manifest_llm()` (`service.py:50`) — opt-in safelist (`_PROVIDER_DEFAULTS_PASS_THROUGH_KEYS`) ensures fields adapter factories consult (notably `api_compat` for the custom-provider dispatch) are propagated. Both `cli.py:_load_init` and `agent.py:_setup_from_init` use this helper to stay in sync.
+- **Provider defaults** — `LLMService._provider_defaults` dict injected at construction (`service.py:140`). Drives model, base_url, max_rpm, api_compat, and OpenAI Responses `compact_threshold` settings. Build it from `manifest.llm` via `build_provider_defaults_from_manifest_llm()` (`service.py:66`) — opt-in safelists ensure adapter-consulted fields propagate: `_PROVIDER_DEFAULTS_PASS_THROUGH_KEYS` skips `None` values such as `api_compat`, while `_PROVIDER_DEFAULTS_PRESERVE_NONE_KEYS` preserves explicit `None` for settings like `compact_threshold` where `null` means “disable”. Both `cli.py:_load_init` and `agent.py:_setup_from_init` use this helper to stay in sync.
 - **Key resolution** — `LLMService._key_resolver` callable (`service.py:94`); defaults to `os.environ.get(f"{PROVIDER}_API_KEY")`.
 
 ## Notes

@@ -26,7 +26,7 @@ PyPI wrapper package — `Agent(BaseAgent)` with composable capabilities, preset
 
 **`presets.py`**: compatibility re-export shim (`presets.py:1-21`); implementation lives in `lingtai_kernel.presets` (`load_preset` :175 · `materialize_active_preset` :290 · `expand_inherit` :503 · `discover_presets_in_dirs` :121).
 
-**`init_schema.py`**: `DEPRECATED_TOP_FIELDS` :28 (plain deprecated top-level fields stripped by `strip_deprecated`), `LEGACY_MIGRATED_TOP_FIELDS` :38 (legacy fields removed by version-controlled agent migrations and known only as inactive schema), `validate_init` :98, `TOP_OPTIONAL` :13, `MANIFEST_OPTIONAL` :59.
+**`init_schema.py`**: `DEPRECATED_TOP_FIELDS` :28 (plain deprecated top-level fields stripped by `strip_deprecated`), `LEGACY_MIGRATED_TOP_FIELDS` :38 (legacy fields removed by version-controlled agent migrations and known only as inactive schema), `validate_init` :94, `TOP_OPTIONAL` :13, `MANIFEST_OPTIONAL` :55; `manifest.llm.compact_threshold` is validated as positive int or null in the LLM block.
 
 **`network.py`**: `build_network` :306 · `_discover_agents` :143 · `_build_avatar_edges` :168
 

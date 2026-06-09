@@ -43,6 +43,22 @@ _CODEX_RESPONSES_TRACE_PATH_ENV = "LINGTAI_CODEX_RESPONSES_TRACE_PATH"
 _CODEX_RESPONSES_TRACE_FILE = "codex_responses_trace.jsonl"
 
 
+def _validate_compact_threshold(value: int | None) -> int | None:
+    """Normalize the OpenAI Responses auto-compaction threshold.
+
+    ``None`` intentionally disables Responses ``context_management``.  Any
+    concrete value must be a positive integer; reject bool explicitly because
+    it is an ``int`` subclass in Python but not a valid token threshold.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("compact_threshold must be a positive int or None")
+    if value <= 0:
+        raise ValueError("compact_threshold must be > 0 or None")
+    return value
+
+
 def _codex_responses_trace_path() -> Path | None:
     """Return the opt-in Codex Responses stream trace path, if enabled."""
     enabled = os.environ.get(_CODEX_RESPONSES_TRACE_ENV, "")
@@ -972,7 +988,7 @@ class OpenAIResponsesSession(ChatSession):
         self._tool_choice = tool_choice
         self._extra_kwargs = extra_kwargs
         self._response_id: str | None = previous_response_id
-        self._compact_threshold = compact_threshold
+        self._compact_threshold = _validate_compact_threshold(compact_threshold)
         self._interface = interface or ChatInterface()
 
     @property
@@ -1160,10 +1176,18 @@ class OpenAIAdapter(LLMAdapter):
         force_responses: bool = False,
         max_rpm: int = 0,
         default_headers: dict | None = None,
+        compact_threshold: int | None = 100_000,
     ):
         self.base_url = base_url
         self._use_responses = use_responses
         self._force_responses = force_responses
+        # Responses-API auto-compaction threshold (input tokens). The host
+        # injects its resolved config value via the adapter factory
+        # (lingtai/llm/_register.py:_openai reads provider defaults); when
+        # unset we fall back to the intended 100k default. ``None`` disables
+        # compaction entirely. Config is injected at construction here, never
+        # read from a global module — see lingtai_kernel.config's contract.
+        self._compact_threshold = _validate_compact_threshold(compact_threshold)
         kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
@@ -1255,15 +1279,6 @@ class OpenAIAdapter(LLMAdapter):
             # endpoint and 400s on Codex's `/backend-api/codex/responses`.
             extra_kwargs["reasoning"] = {"effort": "high" if thinking == "high" else "low"}
 
-        # Get compact threshold from config
-        compact_threshold = None
-        try:
-            from config import get as config_get
-
-            compact_threshold = config_get("providers.openai.compact_threshold", 100000)
-        except ImportError:
-            pass
-
         return OpenAIResponsesSession(
             client=self._client,
             model=model,
@@ -1272,7 +1287,7 @@ class OpenAIAdapter(LLMAdapter):
             tool_choice=tool_choice,
             extra_kwargs=extra_kwargs,
             previous_response_id=None,
-            compact_threshold=compact_threshold,
+            compact_threshold=self._compact_threshold,
             interface=interface,
         )
 

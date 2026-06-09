@@ -26,7 +26,14 @@ def register_all_adapters() -> None:
     def _openai(*, model=None, defaults=None, **kw):
         from .openai.adapter import OpenAIAdapter
         kw.pop("model", None)
-        return OpenAIAdapter(**{k: v for k, v in kw.items() if v is not None})
+        # Honor a host-configured Responses-API compaction threshold. Absent
+        # from defaults -> let OpenAIAdapter's 100k constructor default stand;
+        # explicit None -> disable Responses context_management.
+        adapter_kw = {k: v for k, v in kw.items() if v is not None}
+        if defaults and "compact_threshold" in defaults:
+            # Preserve explicit None after the general None-pruning pass above.
+            adapter_kw["compact_threshold"] = defaults["compact_threshold"]
+        return OpenAIAdapter(**adapter_kw)
 
     def _minimax(*, model=None, defaults=None, **kw):
         from .minimax.adapter import MiniMaxAdapter

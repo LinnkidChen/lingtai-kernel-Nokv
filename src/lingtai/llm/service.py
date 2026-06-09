@@ -60,6 +60,7 @@ def _generate_tool_call_id() -> str:
 # OpenAIAdapter, which then explodes on raw.choices access. See
 # Lingtai-AI/lingtai#112 for the full failure trace.
 _PROVIDER_DEFAULTS_PASS_THROUGH_KEYS = ("api_compat",)
+_PROVIDER_DEFAULTS_PRESERVE_NONE_KEYS = ("compact_threshold",)
 
 
 def build_provider_defaults_from_manifest_llm(
@@ -87,6 +88,9 @@ def build_provider_defaults_from_manifest_llm(
         value = llm.get(key)
         if value is not None:
             per_provider[key] = value
+    for key in _PROVIDER_DEFAULTS_PRESERVE_NONE_KEYS:
+        if key in llm:
+            per_provider[key] = llm[key]
     return {provider_key: per_provider} if per_provider else None
 
 

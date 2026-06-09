@@ -235,7 +235,16 @@ def validate_init(data: dict) -> list[str]:
         "api_key": (str, type(None)),
         "api_key_env": str,
         "base_url": (str, type(None)),
+        "compact_threshold": (int, type(None)),
     }, prefix="manifest.llm")
+    if "compact_threshold" in llm:
+        compact_threshold = llm["compact_threshold"]
+        if isinstance(compact_threshold, bool):
+            raise ValueError("manifest.llm.compact_threshold: expected int | null, got bool")
+        if isinstance(compact_threshold, int) and compact_threshold <= 0:
+            raise ValueError(
+                "manifest.llm.compact_threshold: expected positive int or null"
+            )
 
     # If api_key_env is set without api_key, env_file must be provided
     if llm.get("api_key_env") and not llm.get("api_key"):
