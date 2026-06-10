@@ -193,13 +193,17 @@ def test_scan_coalesces_multiple_events_into_one_notification(tmp_path):
     for p in previews:
         assert "preview" in p
         assert len(p["preview"]) <= _PREVIEW_FIELD_CAP
-    # Instructions should render senders, subjects, and snippets so the
-    # model sees them inline.
+    # Instructions render only lightweight routing context. The body previews
+    # live once in data.previews and must not be duplicated verbatim into the
+    # instructions string.
     for sender in ("alice", "bob", "carol"):
         assert sender in notif["instructions"]
     for subject in ("s1", "s2", "s3"):
         assert subject in notif["instructions"]
-    assert "second body content" in notif["instructions"]
+    assert "second body content" in previews[1]["preview"]
+    assert "second body content" not in notif["instructions"]
+    for p in previews:
+        assert p["preview"] not in notif["instructions"]
 
 
 def test_scan_summary_uses_singular_for_one_event(tmp_path):
@@ -292,7 +296,7 @@ def test_scan_preserves_conversation_metadata_in_preview(tmp_path):
     metadata.{conversation_ref, message_ref, platform}, those values
     surface in the per-event preview entry and in the notification
     instructions so the agent can route follow-up work to the right
-    thread without calling read()."""
+    thread without duplicating body preview text."""
     import json as _json
 
     agent, workdir = _mk_agent(tmp_path)
@@ -318,9 +322,11 @@ def test_scan_preserves_conversation_metadata_in_preview(tmp_path):
     assert p["conversation_ref"] == "tg:chat:42"
     assert p["message_ref"] == "tg:msg:9001"
     assert p["platform"] == "telegram"
-    # Instructions render them concisely so the model sees them inline.
+    # Instructions render routing metadata concisely, but not the body preview.
     assert "tg:chat:42" in notif["instructions"]
     assert "tg:msg:9001" in notif["instructions"]
+    assert "hello" in p["preview"]
+    assert "hello" not in notif["instructions"]
 
 
 def test_scan_ignores_non_string_or_empty_metadata_values(tmp_path):

@@ -249,8 +249,9 @@ def _dispatch_summary(
 
     instructions_lines = [
         f"Call the MCP '{mcp_name}' read/check action to fetch "
-        f"the {count} new event{plural}. Each preview shows sender, subject, "
-        f"and the first {_PREVIEW_FIELD_CAP} chars of the body — full content "
+        f"the {count} new event{plural}. Structured previews are available "
+        f"in data.previews with sender, subject, optional routing metadata, "
+        f"and up to {_PREVIEW_FIELD_CAP} chars of body text; the full content "
         f"stays behind the read action."
     ]
     if previews:
@@ -261,9 +262,6 @@ def _dispatch_summary(
             meta_bits = [f"{k}={p[k]}" for k in _PREVIEW_META_FIELDS if k in p]
             if meta_bits:
                 instructions_lines.append(f"     [{', '.join(meta_bits)}]")
-            snippet = p.get("preview", "")
-            if snippet:
-                instructions_lines.append(f"     {snippet}")
 
     publish_notification(
         agent._working_dir,
