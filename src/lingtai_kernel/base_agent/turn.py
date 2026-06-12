@@ -12,6 +12,9 @@ from ..message import Message, _make_message, MSG_REQUEST, MSG_USER_INPUT, MSG_T
 from ..i18n import t as _t
 from ..logging import get_logger
 from ..loop_guard import LoopGuard
+from ..safety_limits import (
+    ACTIVE_TURN_TOOL_CALL_EMERGENCY_LIMIT,
+)
 from ..tool_executor import ToolExecutor
 from ..tool_result_artifacts import CompactionStats, compact_oversized_history
 from ..meta_block import attach_active_notifications, build_meta, render_meta
@@ -992,7 +995,7 @@ def _handle_tc_wake(agent, msg: Message) -> None:
             name, result, provider=agent._config.provider, **kw
         ),
         guard=LoopGuard(
-            max_total_calls=agent._config.max_turns,
+            max_total_calls=_get_guard_limits(agent)[0],
             dup_free_passes=2,
             dup_hard_block=8,
         ),
@@ -1112,10 +1115,11 @@ def _handle_tc_wake(agent, msg: Message) -> None:
 def _get_guard_limits(agent) -> tuple[int, int, int]:
     """Return (max_total_calls, dup_free_passes, dup_hard_block).
 
-    Uses config.max_turns as the basis.
+    The total-call ceiling is a kernel-owned ACTIVE-turn emergency fuse. It is
+    intentionally not read from ``manifest.max_turns`` / ``AgentConfig.max_turns``
+    so stale init.json files cannot make the runtime harsher or looser.
     """
-    max_turns = agent._config.max_turns
-    return (max_turns, 2, 8)
+    return (ACTIVE_TURN_TOOL_CALL_EMERGENCY_LIMIT, 2, 8)
 
 
 def _check_external_send(agent, tool_calls, tool_results=None) -> None:
@@ -1342,14 +1346,23 @@ def _process_response(agent, response, *, ledger_source: str = "main") -> dict:
                 collected_text_parts=collected_text_parts,
             )
 
-        # Delegate to ToolExecutor
-        tool_results, intercepted, intercept_text = agent._executor.execute(
-            response.tool_calls,
-            api_call_id=getattr(response, "api_call_id", None),
-            on_result_hook=agent._on_tool_result_hook,
-            cancel_event=agent._cancel_event,
-            collected_errors=collected_errors,
-        )
+        # Count this batch before execution so every model-visible tool result
+        # can carry the post-batch ACTIVE-turn progress meter.
+        guard.record_calls(len(response.tool_calls))
+
+        # Delegate to ToolExecutor.  The progress notice is batch-scoped: it is
+        # visible on this batch's tool results, then cleared before the next LLM
+        # response is processed.
+        try:
+            tool_results, intercepted, intercept_text = agent._executor.execute(
+                response.tool_calls,
+                api_call_id=getattr(response, "api_call_id", None),
+                on_result_hook=agent._on_tool_result_hook,
+                cancel_event=agent._cancel_event,
+                collected_errors=collected_errors,
+            )
+        finally:
+            guard.clear_progress_notice()
 
         # Move the live notification payload from the previous holder (if
         # any) to the latest tool-result dict from this batch.  The prior
@@ -1425,8 +1438,6 @@ def _process_response(agent, response, *, ledger_source: str = "main") -> dict:
                 "failed": False,
                 "errors": [],
             }
-
-        guard.record_calls(len(response.tool_calls))
 
         # Break on repeated identical errors, but only after committing the
         # current tool results so the assistant tool_calls are not left pending.

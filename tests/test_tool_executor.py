@@ -684,3 +684,22 @@ def test_deprecated_secondary_arg_is_ignored_on_parallel_path():
     assert ("b", {"value": 2}) in seen
     assert all("_secondary" not in result["result"] for result in results)
     assert any(event == "deprecated_secondary_ignored" for event, _fields in logs)
+
+
+def test_tool_executor_attaches_active_turn_tool_call_progress_metadata():
+    """ToolExecutor exposes the guard's ACTIVE-turn progress meter on results."""
+    guard = LoopGuard(max_total_calls=10_000, notice_interval=500)
+    notice = guard.record_calls(500)
+    assert notice is not None
+
+    executor = make_executor(guard=guard)
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="read", args={"path": "/tmp"}, id="tc-progress"),
+    ])
+
+    assert not intercepted
+    payload = results[0]["result"]
+    assert payload["active_turn_tool_calls"] == 500
+    assert payload["active_turn_tool_call_notice"] == notice
+    assert "active_turn_tool_call_limit" not in payload
+    assert "active_turn_tool_call_notice_interval" not in payload

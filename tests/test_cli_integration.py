@@ -110,5 +110,7 @@ def test_load_init_and_build_agent(mock_llm_cls, tmp_path):
     agent = build_agent(data, tmp_path)
 
     assert agent.agent_name == "integration-test"
-    assert agent._config.max_turns == 5
+    # ``manifest.max_turns`` is a legacy field and no longer controls the
+    # kernel-owned ACTIVE-turn tool-call emergency fuse.
+    assert agent._config.max_turns == 50
     assert agent._config.language == "en"

@@ -1,16 +1,22 @@
 """
-Loop guard for agent tool-call loops.
+Active-turn tool-call progress meter and emergency fuse.
 
-Prevents runaway tool-call loops with:
-  - A hard total-call limit (safety ceiling).
-  - Per-(tool, args) duplicate tracking with escalating warnings
-    and eventual hard-block, to detect and stop polling loops.
+The total-call ceiling is deliberately large: it is an emergency fuse for a
+single ACTIVE turn, not a normal workflow boundary.  The model sees progress
+metadata on tool results and receives soft notices at regular intervals so it can
+self-check without treating the fuse as a normal target.  Duplicate-call and
+invalid-tool checks remain narrow loop detectors.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+
+from .safety_limits import (
+    ACTIVE_TURN_TOOL_CALL_EMERGENCY_LIMIT,
+    ACTIVE_TURN_TOOL_CALL_NOTICE_INTERVAL,
+)
 
 
 @dataclass(frozen=True)
@@ -36,7 +42,7 @@ class LoopGuard:
     """Prevents runaway tool-call loops in agent conversations.
 
     Usage:
-        guard = LoopGuard(max_total_calls=10)
+        guard = LoopGuard()
 
         while True:
             # ... extract tool_calls from response ...
@@ -44,6 +50,10 @@ class LoopGuard:
             reason = guard.check_limit(len(tool_calls))
             if reason:
                 break
+
+            # Count the batch before execution so tool results can expose the
+            # post-batch ACTIVE-turn count.
+            guard.record_calls(len(tool_calls))
 
             for tc in tool_calls:
                 verdict = guard.record_tool_call(tc.name, tc.args)
@@ -56,21 +66,29 @@ class LoopGuard:
                     if verdict.warning:
                         result["_duplicate_warning"] = verdict.warning
 
-            guard.record_calls(len(tool_calls))
-
             # ... send results back ...
+            guard.clear_progress_notice()
     """
 
     def __init__(
         self,
-        max_total_calls: int = 10,
+        max_total_calls: int = ACTIVE_TURN_TOOL_CALL_EMERGENCY_LIMIT,
         dup_free_passes: int = 2,
         dup_hard_block: int = 8,
         invalid_tool_limit: int = 2,
+        notice_interval: int | None = None,
         **_kwargs,
     ):
         self.max_total_calls = max_total_calls
         self.total_calls = 0
+        if notice_interval is None:
+            # Compatibility with the earlier progress-meter draft and any
+            # downstream tests that passed the cadence under its old name.
+            notice_interval = _kwargs.pop(
+                "warning_interval", ACTIVE_TURN_TOOL_CALL_NOTICE_INTERVAL
+            )
+        self.notice_interval = notice_interval
+        self._progress_notice: str | None = None
         self._dup_free_passes = dup_free_passes
         self._dup_hard_block = dup_hard_block
         self._dup_counts: dict[tuple[str, str], int] = {}
@@ -80,15 +98,17 @@ class LoopGuard:
         self._total_invalid_tools = 0
 
     def check_limit(self, n_calls: int) -> str | None:
-        """Check if executing n_calls would exceed the total limit.
+        """Check whether executing ``n_calls`` would exceed the emergency fuse.
 
-        Returns a stop reason string or None to continue.
+        Returns a stop reason string or None to continue.  The ceiling is a
+        kernel-owned ACTIVE-turn emergency limit, not an agent/user manifest
+        setting.
         """
         if n_calls <= 0:
             return None
         if self.total_calls + n_calls > self.max_total_calls:
             return (
-                f"total call limit ({self.max_total_calls}) reached "
+                "ACTIVE-turn tool-call safety fuse would be exceeded "
                 f"after {self.total_calls} calls"
             )
         return None
@@ -123,9 +143,46 @@ class LoopGuard:
             )
         return None
 
-    def record_calls(self, n_calls: int) -> None:
-        """Record that n_calls were executed."""
+    def record_calls(self, n_calls: int) -> str | None:
+        """Record ``n_calls`` in this ACTIVE turn and return any new soft notice."""
+        if n_calls <= 0:
+            self._progress_notice = None
+            return None
+        before = self.total_calls
         self.total_calls += n_calls
+        self._progress_notice = self._build_progress_notice(before, self.total_calls)
+        return self._progress_notice
+
+    def _build_progress_notice(self, before: int, after: int) -> str | None:
+        if self.notice_interval <= 0:
+            return None
+        crossed = after // self.notice_interval
+        if after % self.notice_interval:
+            crossed += 0
+        previous = before // self.notice_interval
+        if crossed <= previous:
+            return None
+        boundary = crossed * self.notice_interval
+        if boundary <= 0:
+            return None
+        return (
+            f"Soft self-check: this ACTIVE turn has made {after} tool calls "
+            f"so far. Take a moment to notice whether you may be repeating a "
+            f"loop; if the work is still progressing, continue normally."
+        )
+
+    def progress_metadata(self) -> dict:
+        """Return LLM-visible ACTIVE-turn tool-call progress metadata."""
+        meta = {
+            "active_turn_tool_calls": self.total_calls,
+        }
+        if self._progress_notice:
+            meta["active_turn_tool_call_notice"] = self._progress_notice
+        return meta
+
+    def clear_progress_notice(self) -> None:
+        """Clear the batch-scoped progress notice after result construction."""
+        self._progress_notice = None
 
     # ------------------------------------------------------------------
     # Duplicate call tracking

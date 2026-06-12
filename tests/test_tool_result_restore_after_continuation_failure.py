@@ -175,6 +175,9 @@ class _FakeGuard:
     def record_calls(self, count: int) -> None:
         pass
 
+    def clear_progress_notice(self) -> None:
+        pass
+
 
 class _ProcessExecutor:
     def __init__(

@@ -46,3 +46,34 @@ def test_loop_guard_invalid_tool():
     reason = guard.check_invalid_tool_limit()
     assert reason is not None
     assert "ghost_tool" in reason
+
+
+def test_loop_guard_progress_metadata_and_interval_notice():
+    """ACTIVE-turn progress metadata is always available and adds soft notices at intervals."""
+    guard = LoopGuard(max_total_calls=10_000, notice_interval=500)
+
+    assert guard.record_calls(499) is None
+    meta = guard.progress_metadata()
+    assert meta == {"active_turn_tool_calls": 499}
+
+    notice = guard.record_calls(1)
+    assert notice is not None
+    assert "Soft self-check" in notice
+    assert "500 tool calls" in notice
+    assert "may be repeating a loop" in notice
+    assert "10000" not in notice
+    assert "limit" not in notice.lower()
+    meta = guard.progress_metadata()
+    assert meta["active_turn_tool_calls"] == 500
+    assert meta["active_turn_tool_call_notice"] == notice
+    assert "active_turn_tool_call_limit" not in meta
+    assert "active_turn_tool_call_notice_interval" not in meta
+
+    guard.clear_progress_notice()
+    assert "active_turn_tool_call_notice" not in guard.progress_metadata()
+
+
+def test_loop_guard_default_emergency_limit_is_large():
+    """The default total limit is an emergency fuse, not a 100-call guard."""
+    guard = LoopGuard()
+    assert guard.max_total_calls == 10_000

@@ -1106,7 +1106,11 @@ class Agent(BaseAgent):
             consultation_past_count=soul.get("consultation_past_count", 0),
             soul_voice=soul.get("voice", "inner"),
             soul_voice_prompt=soul.get("voice_prompt", ""),
-            max_turns=m.get("max_turns", 50),
+            # ``manifest.max_turns`` is a legacy/resolved-manifest field and is
+            # no longer the authoritative tool-loop guard source.  ACTIVE-turn
+            # tool-call safety is kernel-owned in ``lingtai_kernel.safety_limits``.
+            # Keep AgentConfig.max_turns at its default for API compatibility,
+            # but deliberately ignore stale init.json values here.
             language=m.get("language", "en"),
             context_limit=m.get("context_limit"),
             molt_pressure=m.get("molt_pressure", 0.8),

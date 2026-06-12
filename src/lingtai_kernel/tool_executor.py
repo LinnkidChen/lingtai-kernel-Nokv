@@ -213,6 +213,17 @@ class ToolExecutor:
             return formatted
         return formatted[-max_chars:]
 
+    def _attach_tool_call_progress(self, result: Any) -> Any:
+        """Attach ACTIVE-turn tool-call progress metadata when possible.
+
+        Tool-result metadata is already dictionary-based in LingTai's main
+        result path.  Preserve non-dict payloads to avoid changing legacy
+        scalar tool semantics.
+        """
+        if isinstance(result, dict):
+            result.update(self._guard.progress_metadata())
+        return result
+
     def _build_result_message(
         self,
         tool_name: str,
@@ -224,14 +235,17 @@ class ToolExecutor:
     ) -> Any:
         """Final boundary before a result reaches the LLM wire.
 
-        Applies the unified character cap (``_DEFAULT_MAX_RESULT_CHARS``):
-        results that serialize beyond the cap are spilled to a sidecar
-        artifact under ``<workdir>/tmp/tool-results/`` and replaced with a
-        compact manifest pointing at the file.  The artifact stores the full
-        post-dispatch result.  Notification pairs do not pass through this
-        method — they are synthesized directly by
-        ``BaseAgent._inject_notifications`` and bypass ``ToolExecutor``.
+        Adds ACTIVE-turn tool-call progress metadata, then applies the unified
+        character cap (``_DEFAULT_MAX_RESULT_CHARS``): results that serialize
+        beyond the cap are spilled to a sidecar artifact under
+        ``<workdir>/tmp/tool-results/`` and replaced with a compact manifest
+        pointing at the file.  The compact manifest also receives progress
+        metadata so the model-visible result always carries the counter when the
+        payload is dict-shaped.  Notification pairs do not pass through this
+        method — they are synthesized directly by ``BaseAgent._inject_notifications``
+        and bypass ``ToolExecutor``.
         """
+        self._attach_tool_call_progress(result)
         capped = _spill_oversized_result(
             result,
             max_chars=self._max_result_chars,
@@ -240,6 +254,8 @@ class ToolExecutor:
             working_dir=self._working_dir,
         )
         spilled = capped is not result
+        if spilled:
+            self._attach_tool_call_progress(capped)
         if spilled and self._logger_fn is not None:
             try:
                 self._logger_fn(
