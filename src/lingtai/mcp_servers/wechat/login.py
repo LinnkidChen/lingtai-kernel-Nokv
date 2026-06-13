@@ -353,7 +353,7 @@ def cli_browser_login(addon_dir: str | None = None) -> None:
     base_url = cfg.get("base_url", api.DEFAULT_BASE_URL)
 
     # Use a private per-invocation temp dir so concurrent bootstrap runs on
-    # a shared machine cannot collide on /tmp/lingtai_wechat_login.html and
+    # a shared machine cannot collide on /tmp/lingtai-wechat-login-*/login.html and
     # so a symlink-attack vector on a predictable path is not exposed.
     tmp_dir = Path(tempfile.mkdtemp(prefix="lingtai-wechat-login-"))
     html_path = tmp_dir / "login.html"

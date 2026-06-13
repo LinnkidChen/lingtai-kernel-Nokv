@@ -113,7 +113,7 @@ class AccountLock:
                 )
             else:
                 remediation.append(
-                    "  Find pollers:   pgrep -af 'python.*lingtai_wechat'"
+                    "  Find pollers:   pgrep -af 'lingtai-wechat|lingtai.mcp_servers.wechat'"
                 )
                 remediation.append(
                     "  Lockfile is held but no PID recorded — most likely a "

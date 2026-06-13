@@ -190,7 +190,7 @@ def test_mcp_section_dict_valid():
         "imap": {
             "type": "stdio",
             "command": "/usr/bin/python",
-            "args": ["-m", "lingtai_imap"],
+            "args": ["-m", "lingtai.mcp_servers.imap"],
         },
     }
     validate_init(data)

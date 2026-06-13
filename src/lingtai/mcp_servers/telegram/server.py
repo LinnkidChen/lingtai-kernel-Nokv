@@ -46,7 +46,7 @@ from .licc import push_inbox_event
 from .manager import TelegramManager, SCHEMA, DESCRIPTION
 from .service import TelegramService
 
-log = logging.getLogger("lingtai_telegram")
+log = logging.getLogger("lingtai.mcp_servers.telegram")
 
 
 _SERVER_INSTRUCTIONS = (

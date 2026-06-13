@@ -50,7 +50,7 @@ from .licc import push_inbox_event
 from .manager import IMAPMailManager, SCHEMA, DESCRIPTION
 from .service import IMAPMailService
 
-log = logging.getLogger("lingtai_imap")
+log = logging.getLogger("lingtai.mcp_servers.imap")
 
 
 _SERVER_INSTRUCTIONS = (

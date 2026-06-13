@@ -50,7 +50,7 @@ from . import api
 from .licc import push_inbox_event
 from .manager import WechatManager, SCHEMA, DESCRIPTION
 
-log = logging.getLogger("lingtai_wechat")
+log = logging.getLogger("lingtai.mcp_servers.wechat")
 
 
 _SERVER_INSTRUCTIONS = (

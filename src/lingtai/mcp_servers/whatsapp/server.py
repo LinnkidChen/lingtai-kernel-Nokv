@@ -17,7 +17,7 @@ from .manager import WhatsAppManager, SCHEMA, DESCRIPTION
 from .resources import resource_text
 from .webhook_server import WhatsAppWebhookServer
 
-log = logging.getLogger("lingtai_whatsapp")
+log = logging.getLogger("lingtai.mcp_servers.whatsapp")
 
 _SERVER_INSTRUCTIONS = (
     "lingtai-whatsapp: official Meta WhatsApp Cloud API client. "

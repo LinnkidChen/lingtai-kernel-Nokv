@@ -52,7 +52,7 @@ def test_validator_accepts_valid_stdio_record():
         "summary": "test",
         "transport": "stdio",
         "command": "python",
-        "args": ["-m", "lingtai_imap"],
+        "args": ["-m", "lingtai.mcp_servers.imap"],
         "source": "lingtai-curated",
     })
     assert ok, err
@@ -445,7 +445,7 @@ def test_curated_catalog_includes_whatsapp(tmp_path: Path):
 
 
 def test_curated_mcp_modules_ship_inside_lingtai_distribution():
-    """Curated MCPs are importable from the kernel distribution."""
+    """Curated MCPs ship from the canonical kernel distribution package."""
     import importlib
     from importlib import resources
 
@@ -455,21 +455,11 @@ def test_curated_mcp_modules_ship_inside_lingtai_distribution():
         "feishu": "lingtai.mcp_servers.feishu",
         "wechat": "lingtai.mcp_servers.wechat",
         "whatsapp": "lingtai.mcp_servers.whatsapp",
+        "cloud_mail": "lingtai.mcp_servers.cloud_mail",
     }
-    legacy_modules = {
-        "imap": "lingtai_imap",
-        "telegram": "lingtai_telegram",
-        "feishu": "lingtai_feishu",
-        "wechat": "lingtai_wechat",
-        "whatsapp": "lingtai_whatsapp",
-    }
-    for name, module in modules.items():
+    for module in modules.values():
         imported = importlib.import_module(module)
         assert imported is not None
-        legacy = importlib.import_module(legacy_modules[name])
-        assert legacy is not None
-        compat = importlib.import_module(f"lingtai.addons.{name}")
-        assert compat is not None
 
     for module in (
         "lingtai.mcp_servers.telegram",

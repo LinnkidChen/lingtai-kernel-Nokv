@@ -1,9 +1,9 @@
-"""LICC v1 client compatibility wrapper.
+"""LICC v1 client helper for this curated MCP server.
 
 The canonical first-party LICC producer implementation lives in
-``lingtai.core.mcp.licc`` inside lingtai-kernel. This module keeps the
-addon's historical ``.lingtai_feishu.licc.push_inbox_event`` import path stable
-while preferring the kernel implementation whenever it is available.
+``lingtai.core.mcp.licc`` inside lingtai-kernel. Current curated MCP servers
+import this module from ``lingtai.mcp_servers.<name>.licc`` and delegate to the
+kernel helper whenever it is available.
 
 A small local fallback remains for standalone development or pre-upgrade
 runtime environments where the host kernel does not yet expose the canonical

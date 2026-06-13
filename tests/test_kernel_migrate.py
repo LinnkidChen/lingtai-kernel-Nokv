@@ -633,6 +633,49 @@ def test_m001_continues_past_unreadable_preset(tmp_path, caplog):
     assert any("unreadable" in r.message.lower() for r in caplog.records)
 
 
+
+def test_run_agent_migrations_rewrites_legacy_curated_mcp_launch_args(tmp_path):
+    """agent m002 rewrites old curated MCP module launch args to canonical modules."""
+    workdir = tmp_path / "agent"
+    workdir.mkdir()
+    (workdir / "init.json").write_text(json.dumps({
+        "manifest": {"agent_name": "agent"},
+        "mcp": {
+            "telegram": {"type": "stdio", "command": "python", "args": ["-m", "lingtai_telegram"]},
+            "remote": {"type": "http", "url": "http://example.test/mcp"},
+            "imap": {"type": "stdio", "command": "python", "args": ["-m", "lingtai.mcp_servers.imap"]},
+        },
+    }))
+    registry_records = [
+        {"name": "imap", "transport": "stdio", "command": "python", "args": ["-m", "lingtai_imap"]},
+        {"name": "telegram", "transport": "stdio", "command": "python", "args": ["-m", "lingtai.mcp_servers.telegram"]},
+        {"name": "other", "transport": "stdio", "command": "python", "args": ["-m", "other_module"]},
+        {"name": "remote", "transport": "http", "url": "http://example.test/mcp"},
+    ]
+    (workdir / "mcp_registry.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in registry_records),
+        encoding="utf-8",
+    )
+
+    run_agent_migrations(workdir)
+
+    init_after = _read(workdir / "init.json")
+    assert init_after["mcp"]["telegram"]["args"] == ["-m", "lingtai.mcp_servers.telegram"]
+    assert init_after["mcp"]["imap"]["args"] == ["-m", "lingtai.mcp_servers.imap"]
+    lines = (workdir / "mcp_registry.jsonl").read_text(encoding="utf-8").splitlines()
+    registry_after = [json.loads(line) for line in lines]
+    by_name = {r["name"]: r for r in registry_after}
+    assert by_name["imap"]["args"] == ["-m", "lingtai.mcp_servers.imap"]
+    assert by_name["telegram"]["args"] == ["-m", "lingtai.mcp_servers.telegram"]
+    assert by_name["other"]["args"] == ["-m", "other_module"]
+    assert by_name["remote"]["transport"] == "http"
+    assert _read(workdir / agent_meta_relative_path()) == {"version": AGENT_CURRENT_VERSION, "domain": "agent"}
+
+    before = (workdir / "mcp_registry.jsonl").read_text(encoding="utf-8")
+    run_agent_migrations(workdir)
+    assert (workdir / "mcp_registry.jsonl").read_text(encoding="utf-8") == before
+
+
 # ---------------------------------------------------------------------------
 # Integration with discover_presets
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ from .licc import push_inbox_event
 from .manager import FeishuManager, SCHEMA, DESCRIPTION
 from .service import FeishuService
 
-log = logging.getLogger("lingtai_feishu")
+log = logging.getLogger("lingtai.mcp_servers.feishu")
 
 
 _SERVER_INSTRUCTIONS = (
