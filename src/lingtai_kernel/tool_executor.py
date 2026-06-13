@@ -14,6 +14,7 @@ from .tool_result_artifacts import (
     PREVENTIVE_MAX_CHARS as _DEFAULT_MAX_RESULT_CHARS,
     spill_oversized_result as _spill_oversized_result,
 )
+from .tool_call_guard import GuardDecision, ToolCallGuard, ToolProposal
 from .tool_timing import ToolTimer
 from .types import UnknownToolError
 
@@ -39,6 +40,7 @@ class ToolExecutor:
         meta_fn: Callable[[], dict] | None = None,
         working_dir: Path | str | None = None,
         max_result_chars: int = _DEFAULT_MAX_RESULT_CHARS,
+        tool_call_guard: ToolCallGuard | None = None,
     ) -> None:
         self._dispatch_fn = dispatch_fn
         self._make_tool_result_fn = make_tool_result_fn
@@ -50,6 +52,7 @@ class ToolExecutor:
         self._meta_fn = meta_fn or (lambda: {})
         self._working_dir = Path(working_dir) if working_dir is not None else None
         self._max_result_chars = max_result_chars
+        self._tool_call_guard = tool_call_guard or ToolCallGuard()
         self._current_api_call_id: str | None = None
 
     def _tool_trace_id(self, tc: ToolCall) -> str:
@@ -224,6 +227,25 @@ class ToolExecutor:
             result.update(self._guard.progress_metadata())
         return result
 
+    @staticmethod
+    def _append_advisory(result: Any, advisory: dict[str, Any] | None) -> Any:
+        if not isinstance(result, dict) or not advisory:
+            return result
+        existing = result.get("_advisory")
+        if not existing:
+            result["_advisory"] = advisory
+            return result
+        if isinstance(existing, dict) and existing.get("type") == "multiple_tool_advisories":
+            existing.setdefault("items", []).append(advisory)
+            existing["message"] = "Multiple tool-call advisories are attached."
+            return result
+        result["_advisory"] = {
+            "type": "multiple_tool_advisories",
+            "message": "Multiple tool-call advisories are attached.",
+            "items": [existing, advisory],
+        }
+        return result
+
     def _attach_duplicate_advisory(self, result: Any, verdict: Any) -> Any:
         """Attach duplicate-call advisory metadata to dict results.
 
@@ -233,10 +255,119 @@ class ToolExecutor:
         dispatch-error results all expose the same ``_advisory`` payload.
         """
         if isinstance(result, dict) and getattr(verdict, "warning", None):
-            advisory = self._guard.advisory_metadata(verdict)
-            if advisory:
-                result["_advisory"] = advisory
+            self._append_advisory(result, self._guard.advisory_metadata(verdict))
         return result
+
+    def _proposal(self, tc: ToolCall, args: dict, trace_id: str) -> ToolProposal:
+        return ToolProposal(
+            tool_name=tc.name,
+            tool_args=dict(args),
+            tool_call_id=getattr(tc, "id", None),
+            tool_trace_id=trace_id,
+        )
+
+    def _log_guard_approval(
+        self,
+        *,
+        tc: ToolCall,
+        trace_id: str,
+        decision: GuardDecision,
+    ) -> None:
+        fields = {
+            "tool_name": tc.name,
+            "tool_call_id": getattr(tc, "id", None),
+            "tool_trace_id": trace_id,
+            "approval_mode": decision.approval_mode,
+            "policy": decision.check_name,
+        }
+        if decision.is_structured:
+            fields["guard_decision"] = decision.to_payload()
+        self._log_lifecycle("tool_call_approved", **fields)
+
+    def _attach_guard_advisory(
+        self,
+        result: Any,
+        *,
+        proposal: ToolProposal,
+        decision: GuardDecision,
+    ) -> Any:
+        if isinstance(result, dict):
+            self._append_advisory(result, decision.advisory_metadata(proposal))
+        return result
+
+    def _guard_rejection_result(
+        self,
+        *,
+        tc: ToolCall,
+        args: dict,
+        trace_id: str,
+        proposal: ToolProposal,
+        decision: GuardDecision,
+        elapsed_ms: int | float,
+    ) -> dict:
+        reason = decision.reason or f"Tool call {tc.name!r} denied by {decision.check_name}"
+        payload = self._error_payload(
+            tool_name=tc.name,
+            tool_call_id=getattr(tc, "id", None),
+            tool_trace_id=trace_id,
+            tool_args=args,
+            error_phase="guard",
+            error_type="ToolCallGuardDenied",
+            message=reason,
+            elapsed_ms=elapsed_ms,
+            guard_decision=decision.to_payload(proposal),
+            guard_check=decision.check_name,
+            guard_action=decision.action,
+            guard_severity=decision.severity,
+        )
+        payload["_advisory"] = decision.advisory_metadata(proposal)
+        return payload
+
+    def _deny_tool_call(
+        self,
+        *,
+        tc: ToolCall,
+        args: dict,
+        trace_id: str,
+        proposal: ToolProposal,
+        decision: GuardDecision,
+        timer: ToolTimer,
+        collected_errors: list[str],
+    ) -> Any:
+        elapsed = timer.elapsed_ms
+        result = self._guard_rejection_result(
+            tc=tc,
+            args=args,
+            trace_id=trace_id,
+            proposal=proposal,
+            decision=decision,
+            elapsed_ms=elapsed,
+        )
+        stamp_meta(result, self._meta_fn(), elapsed)
+        tc_id = getattr(tc, "id", None)
+        self._log_lifecycle(
+            "tool_call_denied",
+            tool_name=tc.name,
+            tool_call_id=tc_id,
+            tool_trace_id=trace_id,
+            guard_decision=decision.to_payload(proposal),
+            reason=result["message"],
+        )
+        self._log_tool_result(
+            tool_name=tc.name,
+            tool_call_id=tc_id,
+            tool_trace_id=trace_id,
+            tool_args=args,
+            status="error",
+            elapsed_ms=elapsed,
+            result=result,
+            exception="ToolCallGuardDenied",
+            exception_message=result["message"],
+        )
+        collected_errors.append(f"{tc.name}: {result['message']}")
+        return self._build_result_message(
+            tc.name, result, tool_call_id=tc_id, tool_trace_id=trace_id, status="error"
+        )
 
     def _build_result_message(
         self,
@@ -410,6 +541,8 @@ class ToolExecutor:
         args = self._prepare_args(tc, trace_id)
 
         verdict = self._guard.record_tool_call(tc.name, args)
+        proposal = None
+        decision = None
 
         timer = ToolTimer()
         try:
@@ -454,14 +587,21 @@ class ToolExecutor:
                 collected_errors.append(f"{tc.name}: {err_result['message']}")
                 return result_msg, False, ""
 
-            self._log_lifecycle(
-                "tool_call_approved",
-                tool_name=tc.name,
-                tool_call_id=tc_id,
-                tool_trace_id=trace_id,
-                approval_mode="pass_through",
-                policy="default_allow",
-            )
+            proposal = self._proposal(tc, args, trace_id)
+            decision = self._tool_call_guard.evaluate(proposal)
+            if not decision.allowed:
+                result_msg = self._deny_tool_call(
+                    tc=tc,
+                    args=args,
+                    trace_id=trace_id,
+                    proposal=proposal,
+                    decision=decision,
+                    timer=timer,
+                    collected_errors=collected_errors,
+                )
+                return result_msg, False, ""
+
+            self._log_guard_approval(tc=tc, trace_id=trace_id, decision=decision)
             self._log(
                 "tool_call",
                 tool_name=tc.name,
@@ -484,6 +624,7 @@ class ToolExecutor:
             if isinstance(result, dict):
                 stamp_meta(result, self._meta_fn(), timer.elapsed_ms)
                 self._attach_duplicate_advisory(result, verdict)
+                self._attach_guard_advisory(result, proposal=proposal, decision=decision)
 
             status = result.get("status", "success") if isinstance(result, dict) else "success"
             if status == "error" and isinstance(result, dict):
@@ -563,6 +704,8 @@ class ToolExecutor:
             )
             stamp_meta(err_result, self._meta_fn(), timer.elapsed_ms)
             self._attach_duplicate_advisory(err_result, verdict)
+            if proposal is not None and decision is not None:
+                self._attach_guard_advisory(err_result, proposal=proposal, decision=decision)
             self._log_tool_result(
                 tool_name=tc.name,
                 tool_call_id=tc_id,
@@ -611,7 +754,7 @@ class ToolExecutor:
         cancel_event: Any | None = None,
     ) -> tuple[list, bool, str]:
         # Phase 1: Pre-check duplicates (sequential — guard not thread-safe)
-        to_execute: list[tuple[int, ToolCall, dict, str, Any]] = []
+        to_execute: list[tuple[int, ToolCall, dict, str, Any, GuardDecision, ToolProposal]] = []
         tool_results: list[tuple[int, Any]] = []
 
         for i, tc in enumerate(tool_calls):
@@ -659,15 +802,23 @@ class ToolExecutor:
                 )))
                 collected_errors.append(f"{tc.name}: {result['message']}")
             else:
-                self._log_lifecycle(
-                    "tool_call_approved",
-                    tool_name=tc.name,
-                    tool_call_id=tc_id,
-                    tool_trace_id=trace_id,
-                    approval_mode="pass_through",
-                    policy="default_allow",
-                )
-                to_execute.append((i, tc, args, trace_id, verdict))
+                proposal = self._proposal(tc, args, trace_id)
+                decision = self._tool_call_guard.evaluate(proposal)
+                if not decision.allowed:
+                    result_msg = self._deny_tool_call(
+                        tc=tc,
+                        args=args,
+                        trace_id=trace_id,
+                        proposal=proposal,
+                        decision=decision,
+                        timer=ToolTimer(),
+                        collected_errors=collected_errors,
+                    )
+                    tool_results.append((i, result_msg))
+                    continue
+
+                self._log_guard_approval(tc=tc, trace_id=trace_id, decision=decision)
+                to_execute.append((i, tc, args, trace_id, verdict, decision, proposal))
 
         if not to_execute:
             tool_results.sort(key=lambda x: x[0])
@@ -677,7 +828,15 @@ class ToolExecutor:
         results_map: dict[int, Any] = {}
         errors_map: dict[int, dict] = {}
 
-        def _run_one(index: int, tc: ToolCall, args: dict, trace_id: str, verdict):
+        def _run_one(
+            index: int,
+            tc: ToolCall,
+            args: dict,
+            trace_id: str,
+            verdict,
+            decision: GuardDecision,
+            proposal: ToolProposal,
+        ):
             tc_id = getattr(tc, "id", None)
             self._log(
                 "tool_call",
@@ -723,6 +882,7 @@ class ToolExecutor:
                 )
                 stamp_meta(err_result, self._meta_fn(), timer.elapsed_ms)
                 self._attach_duplicate_advisory(err_result, verdict)
+                self._attach_guard_advisory(err_result, proposal=proposal, decision=decision)
                 self._log_tool_result(
                     tool_name=tc.name,
                     tool_call_id=tc_id,
@@ -738,6 +898,7 @@ class ToolExecutor:
             if isinstance(result, dict):
                 stamp_meta(result, self._meta_fn(), timer.elapsed_ms)
                 self._attach_duplicate_advisory(result, verdict)
+                self._attach_guard_advisory(result, proposal=proposal, decision=decision)
             status = result.get("status", "success") if isinstance(result, dict) else "success"
             if status == "error" and isinstance(result, dict):
                 self._enrich_error_payload(
@@ -772,8 +933,8 @@ class ToolExecutor:
         pool = ThreadPoolExecutor(max_workers=len(to_execute))
         try:
             futures = {
-                pool.submit(_run_one, i, tc, args, trace_id, verdict): i
-                for i, tc, args, trace_id, verdict in to_execute
+                pool.submit(_run_one, i, tc, args, trace_id, verdict, decision, proposal): i
+                for i, tc, args, trace_id, verdict, decision, proposal in to_execute
             }
             for future in as_completed(futures, timeout=300.0):
                 if cancel_event is not None and cancel_event.is_set():
@@ -786,8 +947,8 @@ class ToolExecutor:
                     idx = futures[future]
                     tc_entry = next(
                         (
-                            (tc, args, trace_id, _verdict)
-                            for i, tc, args, trace_id, _verdict in to_execute
+                            (tc, args, trace_id, _verdict, _decision, _proposal)
+                            for i, tc, args, trace_id, _verdict, _decision, _proposal in to_execute
                             if i == idx
                         ),
                         None,
@@ -797,6 +958,13 @@ class ToolExecutor:
                     tc_args = tc_entry[1] if tc_entry else {}
                     trace_id = tc_entry[2] if tc_entry else f"tool-{uuid.uuid4().hex}"
                     verdict = tc_entry[3] if tc_entry else None
+                    decision = tc_entry[4] if tc_entry else GuardDecision.allow()
+                    proposal = tc_entry[5] if tc_entry else ToolProposal(
+                        tool_name=tc_name,
+                        tool_args=tc_args,
+                        tool_call_id=tc_id,
+                        tool_trace_id=trace_id,
+                    )
                     err_result = self._error_payload(
                         tool_name=tc_name,
                         tool_call_id=tc_id,
@@ -811,6 +979,7 @@ class ToolExecutor:
                     )
                     stamp_meta(err_result, self._meta_fn(), 0)
                     self._attach_duplicate_advisory(err_result, verdict)
+                    self._attach_guard_advisory(err_result, proposal=proposal, decision=decision)
                     errors_map[idx] = err_result
                     self._log_lifecycle(
                         "tool_call_dispatch_failed",
@@ -837,8 +1006,8 @@ class ToolExecutor:
                 if idx not in results_map and idx not in errors_map:
                     tc_entry = next(
                         (
-                            (tc, args, trace_id, _verdict)
-                            for i, tc, args, trace_id, _verdict in to_execute
+                            (tc, args, trace_id, _verdict, _decision, _proposal)
+                            for i, tc, args, trace_id, _verdict, _decision, _proposal in to_execute
                             if i == idx
                         ),
                         None,
@@ -848,6 +1017,13 @@ class ToolExecutor:
                     tc_args_t = tc_entry[1] if tc_entry else {}
                     trace_id_t = tc_entry[2] if tc_entry else f"tool-{uuid.uuid4().hex}"
                     verdict_t = tc_entry[3] if tc_entry else None
+                    decision_t = tc_entry[4] if tc_entry else GuardDecision.allow()
+                    proposal_t = tc_entry[5] if tc_entry else ToolProposal(
+                        tool_name=tc_name,
+                        tool_args=tc_args_t,
+                        tool_call_id=tc_id_t,
+                        tool_trace_id=trace_id_t,
+                    )
                     err_result = self._error_payload(
                         tool_name=tc_name,
                         tool_call_id=tc_id_t,
@@ -862,6 +1038,7 @@ class ToolExecutor:
                     )
                     stamp_meta(err_result, self._meta_fn(), 0)
                     self._attach_duplicate_advisory(err_result, verdict_t)
+                    self._attach_guard_advisory(err_result, proposal=proposal_t, decision=decision_t)
                     errors_map[idx] = err_result
                     self._log_lifecycle(
                         "tool_call_dispatch_failed",
@@ -885,7 +1062,7 @@ class ToolExecutor:
             pool.shutdown(wait=False, cancel_futures=True)
 
         # Phase 3: Build result messages (sequential)
-        for i, tc, args, trace_id, verdict in to_execute:
+        for i, tc, args, trace_id, verdict, decision, proposal in to_execute:
             tc_id = getattr(tc, "id", None)
             if i in results_map:
                 result = results_map[i]

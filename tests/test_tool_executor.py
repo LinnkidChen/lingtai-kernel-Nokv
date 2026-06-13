@@ -11,6 +11,7 @@ import lingtai_kernel.tool_executor as tool_executor_module
 from lingtai_kernel.llm.base import ToolCall
 from lingtai_kernel.llm.interface import ToolResultBlock
 from lingtai_kernel.loop_guard import LoopGuard
+from lingtai_kernel.tool_call_guard import GuardDecision, ToolCallGuard
 from lingtai_kernel.tool_executor import ToolExecutor
 from lingtai_kernel.types import UnknownToolError
 
@@ -23,6 +24,7 @@ def make_executor(
     working_dir=None,
     max_result_chars=50_000,
     guard=None,
+    tool_call_guard=None,
 ):
     if dispatch_fn is None:
         dispatch_fn = lambda tc: {"status": "ok", "result": f"ran {tc.name}"}
@@ -37,6 +39,7 @@ def make_executor(
         logger_fn=logger_fn,
         working_dir=working_dir,
         max_result_chars=max_result_chars,
+        tool_call_guard=tool_call_guard,
     )
 
 
@@ -60,6 +63,264 @@ def test_execute_single_tool():
     results, intercepted, text = executor.execute(calls)
     assert len(results) == 1
     assert not intercepted
+
+
+
+def test_tool_call_guard_default_allow_preserves_pass_through_log():
+    logs = []
+    dispatch_calls = []
+
+    def dispatch(tc):
+        dispatch_calls.append((tc.name, tc.args, tc.id))
+        return {"status": "ok"}
+
+    executor = make_executor(
+        dispatch_fn=dispatch,
+        known_tools={"read"},
+        logger_fn=lambda event_type, **fields: logs.append((event_type, fields)),
+    )
+
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="read", args={"path": "/tmp"}, id="guard-pass"),
+    ])
+
+    assert not intercepted
+    assert results[0]["result"]["status"] == "ok"
+    assert dispatch_calls == [("read", {"path": "/tmp"}, "guard-pass")]
+    approved = logs[_log_index(logs, "tool_call_approved", trace_id="guard-pass")][1]
+    assert approved["approval_mode"] == "pass_through"
+    assert approved["policy"] == "default_allow"
+    assert "guard_decision" not in approved
+
+
+def test_tool_call_guard_denies_before_dispatch_with_structured_rejection_result():
+    logs = []
+    dispatch_calls = []
+    errors = []
+
+    def deny_send(proposal):
+        assert proposal.tool_name == "telegram"
+        assert proposal.tool_args == {"action": "send", "text": "hi"}
+        assert proposal.tool_call_id == "guard-deny"
+        assert proposal.tool_trace_id == "guard-deny"
+        return GuardDecision.deny(
+            check_name="no_external_send",
+            reason="external sends are disabled in this test",
+            metadata={"category": "external_message_send"},
+        )
+
+    executor = make_executor(
+        dispatch_fn=lambda tc: dispatch_calls.append(tc) or {"status": "ok"},
+        known_tools={"telegram"},
+        logger_fn=lambda event_type, **fields: logs.append((event_type, fields)),
+        tool_call_guard=ToolCallGuard([deny_send]),
+    )
+
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="telegram", args={"action": "send", "text": "hi"}, id="guard-deny"),
+    ], collected_errors=errors)
+
+    assert not intercepted
+    assert dispatch_calls == []
+    payload = results[0]["result"]
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ToolCallGuardDenied"
+    assert payload["error_phase"] == "guard"
+    assert payload["message"] == "external sends are disabled in this test"
+    decision = payload["guard_decision"]
+    assert decision["allowed"] is False
+    assert decision["check_name"] == "no_external_send"
+    assert decision["action"] == "deny"
+    assert decision["severity"] == "error"
+    assert decision["metadata"] == {"category": "external_message_send"}
+    assert decision["proposal"]["tool_name"] == "telegram"
+    advisory = payload["_advisory"]
+    assert advisory["type"] == "tool_call_guard"
+    assert advisory["allowed"] is False
+    assert advisory["message"] == "external sends are disabled in this test"
+    events = _trace_events(logs, "guard-deny")
+    assert "tool_call_denied" in events
+    assert "tool_call_approved" not in events
+    assert "tool_call_dispatch_start" not in events
+    denied = logs[_log_index(logs, "tool_call_denied", trace_id="guard-deny")][1]
+    assert denied["guard_decision"]["check_name"] == "no_external_send"
+    assert any("external sends are disabled" in error for error in errors)
+
+
+
+def test_tool_call_guard_denies_one_parallel_call_without_dispatching_it():
+    logs = []
+    dispatch_calls = []
+
+    def deny_write(proposal):
+        if proposal.tool_name == "write":
+            return GuardDecision.deny(
+                check_name="deny_write",
+                reason="write disabled",
+            )
+        return GuardDecision.allow(check_name="allow_read")
+
+    def dispatch(tc):
+        dispatch_calls.append(tc.name)
+        return {"status": "ok", "tool": tc.name}
+
+    executor = make_executor(
+        dispatch_fn=dispatch,
+        known_tools={"read", "write"},
+        parallel_safe={"read", "write"},
+        logger_fn=lambda event_type, **fields: logs.append((event_type, fields)),
+        tool_call_guard=ToolCallGuard([deny_write]),
+    )
+
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="read", args={"path": "/tmp"}, id="parallel-read"),
+        ToolCall(name="write", args={"file_path": "x", "content": "y"}, id="parallel-write"),
+    ])
+
+    assert not intercepted
+    assert dispatch_calls == ["read"]
+    assert results[0]["result"]["tool"] == "read"
+    denied = results[1]["result"]
+    assert denied["status"] == "error"
+    assert denied["error_type"] == "ToolCallGuardDenied"
+    assert denied["guard_decision"]["check_name"] == "deny_write"
+    assert "tool_call_denied" in _trace_events(logs, "parallel-write")
+    assert "tool_call_dispatch_start" not in _trace_events(logs, "parallel-write")
+    assert "tool_call_dispatch_start" in _trace_events(logs, "parallel-read")
+
+def test_tool_call_guard_warning_allows_dispatch_and_adds_advisory():
+    logs = []
+
+    def warn(proposal):
+        return GuardDecision.allow(
+            check_name="warn_large_side_effect",
+            reason="allowed with warning",
+            action="warn",
+            severity="warning",
+        )
+
+    executor = make_executor(
+        known_tools={"write"},
+        logger_fn=lambda event_type, **fields: logs.append((event_type, fields)),
+        tool_call_guard=ToolCallGuard([warn]),
+    )
+
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="write", args={"file_path": "x", "content": "y"}, id="guard-warn"),
+    ])
+
+    assert not intercepted
+    payload = results[0]["result"]
+    assert payload["status"] == "ok"
+    advisory = payload["_advisory"]
+    assert advisory["type"] == "tool_call_guard"
+    assert advisory["allowed"] is True
+    assert advisory["action"] == "warn"
+    assert advisory["severity"] == "warning"
+    approved = logs[_log_index(logs, "tool_call_approved", trace_id="guard-warn")][1]
+    assert approved["approval_mode"] == "guard"
+    assert approved["policy"] == "warn_large_side_effect"
+    assert approved["guard_decision"]["action"] == "warn"
+
+
+
+def test_tool_call_guard_warning_survives_sequential_dispatch_exception():
+    def warn(proposal):
+        return GuardDecision.allow(
+            check_name="warn_then_dispatch_fails",
+            reason="allowed with warning before dispatch failure",
+            action="warn",
+            severity="warning",
+        )
+
+    def dispatch(tc):
+        raise RuntimeError("boom")
+
+    executor = make_executor(
+        dispatch_fn=dispatch,
+        known_tools={"explode"},
+        tool_call_guard=ToolCallGuard([warn]),
+    )
+
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="explode", args={}, id="guard-warn-error"),
+    ])
+
+    assert not intercepted
+    payload = results[0]["result"]
+    assert payload["status"] == "error"
+    assert payload["error_phase"] == "dispatch"
+    assert payload["error_type"] == "RuntimeError"
+    advisory = payload["_advisory"]
+    assert advisory["type"] == "tool_call_guard"
+    assert advisory["action"] == "warn"
+    assert advisory["severity"] == "warning"
+    assert advisory["check_name"] == "warn_then_dispatch_fails"
+
+
+def test_tool_call_guard_check_exception_denies_without_crashing_parallel_batch():
+    dispatch_calls = []
+
+    def bad_guard(proposal):
+        if proposal.tool_name == "bad":
+            raise ValueError("bad guard")
+        return None
+
+    def dispatch(tc):
+        dispatch_calls.append(tc.name)
+        return {"status": "ok", "tool": tc.name}
+
+    executor = make_executor(
+        dispatch_fn=dispatch,
+        known_tools={"bad", "ok"},
+        parallel_safe={"bad", "ok"},
+        tool_call_guard=ToolCallGuard([bad_guard]),
+    )
+
+    results, intercepted, _ = executor.execute([
+        ToolCall(name="bad", args={}, id="guard-check-raises"),
+        ToolCall(name="ok", args={}, id="guard-check-ok"),
+    ])
+
+    assert not intercepted
+    assert dispatch_calls == ["ok"]
+    denied = results[0]["result"]
+    assert denied["status"] == "error"
+    assert denied["error_phase"] == "guard"
+    assert denied["error_type"] == "ToolCallGuardDenied"
+    assert denied["guard_check"] == "bad_guard"
+    assert "ValueError: bad guard" in denied["message"]
+    assert denied["guard_decision"]["metadata"] == {"exception_type": "ValueError"}
+    assert results[1]["result"]["tool"] == "ok"
+
+
+def test_duplicate_and_guard_advisories_are_preserved_together():
+    def warn(proposal):
+        return GuardDecision.allow(
+            check_name="warn_duplicate_context",
+            reason="guard also has advice",
+            action="warn",
+            severity="warning",
+        )
+
+    executor = make_executor(
+        guard=LoopGuard(max_total_calls=50, dup_free_passes=2, dup_hard_block=3),
+        tool_call_guard=ToolCallGuard([warn]),
+    )
+
+    executor.execute([ToolCall(name="poll", args={}, id="multi-adv-1")])
+    executor.execute([ToolCall(name="poll", args={}, id="multi-adv-2")])
+    results, intercepted, _ = executor.execute([ToolCall(name="poll", args={}, id="multi-adv-3")])
+
+    assert not intercepted
+    advisory = results[0]["result"]["_advisory"]
+    assert advisory["type"] == "multiple_tool_advisories"
+    assert [item["type"] for item in advisory["items"]] == [
+        "duplicate_tool_call",
+        "tool_call_guard",
+    ]
+    assert advisory["items"][0]["repeat_count"] == 3
+    assert advisory["items"][1]["check_name"] == "warn_duplicate_context"
 
 
 def test_lifecycle_trace_events_for_sequential_success():
