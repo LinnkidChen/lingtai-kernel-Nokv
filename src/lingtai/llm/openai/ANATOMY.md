@@ -9,7 +9,7 @@ OpenAI adapter — wraps the `openai` SDK for Chat Completions and Responses API
 | File | LOC | Role |
 |------|-----|------|
 | `__init__.py` | 3 | Re-exports `OpenAIAdapter`, `OpenAIChatSession` |
-| `adapter.py` | 1666 | 5 classes + helpers: `OpenAIChatSession`, `OpenAIResponsesSession`, `OpenAIAdapter`, `CodexResponsesSession`, `CodexOpenAIAdapter` |
+| `adapter.py` | 1688 | 5 classes + helpers: `OpenAIChatSession`, `OpenAIResponsesSession`, `OpenAIAdapter`, `CodexResponsesSession`, `CodexOpenAIAdapter` |
 | `defaults.py` | 7 | `DEFAULTS` dict: `api_compat="openai"`, `use_responses_api=True` |
 
 ### adapter.py class map
@@ -17,10 +17,10 @@ OpenAI adapter — wraps the `openai` SDK for Chat Completions and Responses API
 | Class | Lines | Role |
 |-------|-------|------|
 | `OpenAIChatSession` | 469–961 | Chat Completions session with context overflow auto-recovery |
-| `OpenAIResponsesSession` | 969–1151 | Responses API session with server-side `previous_response_id` chaining and optional `context_management` compaction |
-| `OpenAIAdapter` | 1159–1421 | `LLMAdapter` implementation; dispatches to Completions or Responses path; receives injected `compact_threshold` for Responses sessions |
-| `CodexResponsesSession` | 1429–1608 | Stateless Responses variant for ChatGPT-OAuth `/backend-api/codex` |
-| `CodexOpenAIAdapter` | 1612–1666 | Adapter variant that builds `CodexResponsesSession` |
+| `OpenAIResponsesSession` | 969–1169 | Responses API session with server-side `previous_response_id` chaining and optional `context_management` compaction |
+| `OpenAIAdapter` | 1170–1439 | `LLMAdapter` implementation; dispatches to Completions or Responses path; receives injected `compact_threshold` for Responses sessions |
+| `CodexResponsesSession` | 1440–1627 | Stateless Responses variant for ChatGPT-OAuth `/backend-api/codex` |
+| `CodexOpenAIAdapter` | 1628–1688 | Adapter variant that builds `CodexResponsesSession` |
 
 ### adapter.py helpers
 
