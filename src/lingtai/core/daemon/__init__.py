@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 from lingtai_kernel.llm.base import FunctionSchema
 from .run_dir import DaemonRunDir
+from .claude_interactive import ClaudeInteractiveError, run_claude_interactive
 
 PROVIDERS = {"providers": [], "default": "builtin"}
 
@@ -150,8 +151,10 @@ EMANATION_BLACKLIST = {
 # ``ANTHROPIC_*`` keys force API billing (GH #107); a stale
 # ``CLAUDE_CODE_OAUTH_TOKEN`` can also beat a refreshed
 # ``~/.claude/.credentials.json`` and surface as a false weekly-limit error
-# (GH Lingtai-AI/lingtai#189). Strip these for claude-code spawns only; other
-# backends (codex, lingtai, opencode, cursor) are unaffected.
+# (GH Lingtai-AI/lingtai#189). Strip these for Claude Code subprocesses
+# only: print-mode Claude (claude-p/claude-code) and interactive Claude
+# (claude/claude-interactive). Other backends (codex, lingtai, opencode,
+# cursor) are unaffected.
 _CLAUDE_CODE_STRIP_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -230,6 +233,37 @@ def _backend_options_to_argv(options: dict | None) -> list[str]:
             f"{type(value).__name__}; expected bool/str/int/float/list of scalars/null"
         )
     return argv
+
+
+_CLAUDE_COMMON_RESERVED_BACKEND_FLAGS = {
+    "--settings",
+    "--print",
+    "--output-format",
+}
+_CLAUDE_INTERACTIVE_RESERVED_BACKEND_FLAGS = {
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+}
+
+
+def _validate_claude_backend_argv(backend: str, argv: list[str]) -> None:
+    """Refuse user flags that would override LingTai's Claude harness.
+
+    ``backend_options`` is a pass-through for CLI-specific flags, but Claude
+    daemon backends own their execution mode: print-mode owns ``--print`` /
+    ``--output-format stream-json`` and interactive mode owns ``--settings``
+    hooks plus its managed-workspace system prompt. Allowing callers to
+    override those would silently break daemon progress/result extraction.
+    """
+    if backend not in ("claude", "claude-interactive", "claude-p", "claude-code"):
+        return
+    reserved = set(_CLAUDE_COMMON_RESERVED_BACKEND_FLAGS)
+    if backend in ("claude", "claude-interactive"):
+        reserved.update(_CLAUDE_INTERACTIVE_RESERVED_BACKEND_FLAGS)
+    for token in argv:
+        if token in reserved:
+            raise ValueError(f"{token} is reserved by the {backend} daemon backend")
+
 
 
 class _ToolCollector:
@@ -327,10 +361,20 @@ def get_schema(lang: str = "en") -> dict:
             },
             "backend": {
                 "type": "string",
-                "enum": ["lingtai", "claude-code", "codex", "opencode", "cursor"],
+                "enum": [
+                    "lingtai",
+                    "claude",
+                    "claude-interactive",
+                    "claude-p",
+                    "claude-code",
+                    "codex",
+                    "opencode",
+                    "cursor",
+                ],
                 "description": (
                     "Execution backend: 'lingtai' (default — parallel LLM reasoning, uses your current model), "
-                    "'claude-code' (coding tasks, code review, file manipulation via Claude Code CLI), "
+                    "'claude' / 'claude-interactive' (experimental interactive Claude Code PTY backend), "
+                    "'claude-p' (Claude Code print-mode backend; 'claude-code' is a compatibility alias), "
                     "'codex' (coding tasks via OpenAI Codex CLI), "
                     "'opencode' (multi-provider open-source agent via the opencode-ai CLI), 'cursor' (coding tasks via Cursor Agent CLI). "
                     "CLI backends use external tools with no LLM overhead from the parent."
@@ -1098,6 +1142,59 @@ class DaemonManager:
         run_dir.mark_done(text)
         return text
 
+    def _run_claude_interactive_emanation(
+        self,
+        em_id: str,
+        run_dir: DaemonRunDir,
+        task: str,
+        cancel_event: threading.Event,
+        timeout_event: threading.Event | None = None,
+        backend_argv: list[str] | None = None,
+    ) -> str:
+        """Run an interactive Claude Code session through a PTY.
+
+        This is the experimental ``backend="claude"`` route inspired by
+        third-party ``claude -p`` replacements: run the normal interactive
+        ``claude`` TUI, use SessionStart/Stop hooks as synchronization points,
+        and read Claude's transcript JSONL for the daemon result.  It does not
+        mutate Claude's global config and refuses credential/trust automation.
+        """
+        def _exit_cancelled() -> str:
+            if timeout_event is not None and timeout_event.is_set():
+                run_dir.mark_timeout()
+            else:
+                run_dir.mark_cancelled()
+            return "[cancelled]"
+
+        if cancel_event.is_set():
+            return _exit_cancelled()
+
+        try:
+            result = run_claude_interactive(
+                em_id=em_id,
+                run_dir=run_dir,
+                working_dir=self._agent._working_dir,
+                task=task,
+                cancel_event=cancel_event,
+                timeout_event=timeout_event,
+                backend_argv=backend_argv,
+                env=_claude_code_env(),
+                log_callback=self._log,
+            )
+        except ClaudeInteractiveError as e:
+            run_dir.mark_failed(e)
+            raise
+        except Exception as e:
+            run_dir.mark_failed(e)
+            raise
+
+        if cancel_event.is_set():
+            return _exit_cancelled()
+
+        text = (result.final_text or "").strip() or "[no output]"
+        run_dir.mark_done(text)
+        return text
+
     def _run_codex_emanation(
         self,
         em_id: str,
@@ -1464,8 +1561,11 @@ class DaemonManager:
         }
         self._pools = [(p, c) for p, c in self._pools if not c.is_set()]
 
-        # --- Claude Code / Codex / OpenCode / Cursor backend: skip preset resolution entirely ---
-        if backend in ("claude-code", "codex", "opencode", "cursor"):
+        # --- External CLI backends: skip preset resolution entirely ---
+        if backend in (
+            "claude", "claude-interactive", "claude-p", "claude-code",
+            "codex", "opencode", "cursor",
+        ):
             return self._handle_emanate_cli(
                 tasks, backend=backend,
                 effective_max_turns=effective_max_turns,
@@ -1630,7 +1730,7 @@ class DaemonManager:
         effective_max_turns: int,
         effective_timeout: float,
     ) -> dict:
-        """Dispatch emanations via an external CLI backend (claude-code, codex, opencode, cursor).
+        """Dispatch emanations via an external CLI backend.
 
         Skips preset resolution — the CLI manages its own tools/model/provider.
         Creates a DaemonRunDir for tracking. CLI output is persisted in the
@@ -1647,7 +1747,9 @@ class DaemonManager:
                 resolved_backend_argv.append([])
                 continue
             try:
-                resolved_backend_argv.append(_backend_options_to_argv(raw_opts))
+                argv = _backend_options_to_argv(raw_opts)
+                _validate_claude_backend_argv(backend, argv)
+                resolved_backend_argv.append(argv)
             except ValueError as e:
                 return {"status": "error",
                         "message": f"tasks[{i}].backend_options: {e}"}
@@ -1706,7 +1808,12 @@ class DaemonManager:
                 run_fn = self._run_opencode_emanation
             elif backend == "cursor":
                 run_fn = self._run_cursor_emanation
+            elif backend in ("claude", "claude-interactive"):
+                run_fn = self._run_claude_interactive_emanation
             else:
+                # ``claude-p`` is the new explicit name for the existing
+                # print-mode backend; ``claude-code`` remains a compatibility
+                # alias for older callers and stored daemon entries.
                 run_fn = self._run_claude_code_emanation
             future = pool.submit(
                 run_fn,
@@ -1791,14 +1898,17 @@ class DaemonManager:
             return {"status": "error", "message": f"Unknown emanation: {em_id}"}
 
         # CLI backends with resumable sessions:
-        #   - claude-code: `claude --resume <claude_session_id>`
-        #   - codex:       `codex exec resume <codex_session_id>`
-        #   - opencode:    `opencode run --session <opencode_session_id> ...`
-        #   - cursor:      `agent -p --resume <cursor_session_id> ...`
-        # All stream JSON events through the resumed turn so
+        #   - claude / claude-interactive: interactive `claude --resume ...`
+        #   - claude-p / claude-code:      `claude --resume ... --print`
+        #   - codex:                       `codex exec resume <codex_session_id>`
+        #   - opencode:                    `opencode run --session <opencode_session_id> ...`
+        #   - cursor:                      `agent -p --resume <cursor_session_id> ...`
+        # All stream progress into the daemon run directory so
         # `daemon(check)` shows live progress.
         backend = entry.get("backend")
-        if backend == "claude-code":
+        if backend in ("claude", "claude-interactive"):
+            return self._handle_ask_claude_interactive(em_id, entry, message)
+        if backend in ("claude-p", "claude-code"):
             return self._handle_ask_cli(em_id, entry, message)
         if backend == "codex":
             return self._handle_ask_codex(em_id, entry, message)
@@ -1816,6 +1926,120 @@ class DaemonManager:
                 entry["followup_buffer"] = message
         self._log("daemon_ask", em_id=em_id, message_length=len(message))
         return {"status": "sent", "id": em_id}
+
+    def _handle_ask_claude_interactive(self, em_id: str, entry: dict, message: str) -> dict:
+        """Dispatch an interactive Claude ``--resume`` follow-up asynchronously."""
+        run_dir = entry.get("run_dir")
+        if run_dir is None:
+            return {"status": "error", "message": f"emanation {em_id} has no run_dir"}
+
+        session_id = run_dir._state.get("claude_session_id")
+        if not session_id:
+            return {"status": "error",
+                    "message": f"No claude session ID found for {em_id}. "
+                               "The emanation may still be initializing — "
+                               "wait a moment and retry."}
+
+        with entry["followup_lock"]:
+            if entry.get("ask_in_flight"):
+                return {"status": "busy", "id": em_id,
+                        "message": f"a previous ask on {em_id} is still "
+                                   "running; wait for it or use "
+                                   f"daemon(action='check', id='{em_id}')"}
+            entry["ask_in_flight"] = True
+
+        try:
+            run_dir.record_cli_output(
+                f"[interactive ask dispatched] {message[:200]}", stream="stdout",
+            )
+        except OSError:
+            pass
+
+        ask_future = self._ask_pool.submit(
+            self._run_ask_claude_interactive_stream,
+            em_id, entry, message, session_id, run_dir,
+        )
+        ask_future.add_done_callback(
+            lambda f, eid=em_id: self._on_ask_done(eid, f)
+        )
+        entry["ask_future"] = ask_future
+        return {"status": "sent", "id": em_id, "async": True,
+                "message": "interactive ask dispatched; check daemon(action='check', "
+                           f"id='{em_id}') for progress and final reply"}
+
+    def _run_ask_claude_interactive_stream(
+        self,
+        em_id: str,
+        entry: dict,
+        message: str,
+        session_id: str,
+        run_dir: DaemonRunDir,
+    ) -> dict:
+        """Background worker for interactive Claude ``--resume`` follow-ups."""
+        ask_cancel = threading.Event()
+        ask_timeout = threading.Event()
+        parent_cancel = entry.get("cancel_event")
+        monitor_done = threading.Event()
+
+        def _timeout() -> None:
+            ask_timeout.set()
+            ask_cancel.set()
+
+        def _mirror_parent_cancel() -> None:
+            if parent_cancel is None:
+                return
+            while not monitor_done.is_set():
+                if parent_cancel.is_set():
+                    ask_cancel.set()
+                    return
+                monitor_done.wait(0.05)
+
+        timer = threading.Timer(self._timeout, _timeout)
+        timer.daemon = True
+        timer.start()
+        monitor = threading.Thread(
+            target=_mirror_parent_cancel,
+            daemon=True,
+            name=f"daemon-claude-interactive-ask-cancel-{em_id}",
+        )
+        monitor.start()
+        try:
+            try:
+                result = run_claude_interactive(
+                    em_id=em_id,
+                    run_dir=run_dir,
+                    working_dir=self._agent._working_dir,
+                    task=message,
+                    cancel_event=ask_cancel,
+                    timeout_event=ask_timeout,
+                    resume_session_id=session_id,
+                    env=_claude_code_env(),
+                    log_callback=self._log,
+                )
+            except Exception as e:
+                err = f"interactive claude ask failed: {e}"
+                self._publish_followup_if_live(
+                    em_id, status="follow-up failed", text=err, run_dir=run_dir,
+                )
+                return {"status": "error", "id": em_id, "message": err}
+            if ask_timeout.is_set():
+                err = f"interactive claude ask timed out after {self._timeout}s"
+                self._publish_followup_if_live(
+                    em_id, status="follow-up failed", text=err, run_dir=run_dir,
+                )
+                return {"status": "error", "id": em_id, "message": err}
+            output = (result.final_text or "").strip()
+            if output:
+                self._publish_followup_if_live(
+                    em_id, status="follow-up completed", text=output, run_dir=run_dir,
+                )
+            return {"status": "sent", "id": em_id, "output": output}
+        finally:
+            timer.cancel()
+            monitor_done.set()
+            monitor.join(timeout=0.2)
+            with entry["followup_lock"]:
+                entry["ask_in_flight"] = False
 
     def _handle_ask_cli(self, em_id: str, entry: dict, message: str) -> dict:
         """Dispatch a Claude Code `--resume` follow-up off the caller's turn.
