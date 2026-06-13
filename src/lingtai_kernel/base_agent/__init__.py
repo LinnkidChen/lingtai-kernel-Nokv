@@ -1618,7 +1618,9 @@ class BaseAgent:
         """Write chat history and token usage to disk (no git commit).
 
         Called after every completed interaction for crash resilience.
-        Git commits are handled by the periodic snapshot system.
+        Git commits are handled by the periodic snapshot system. The persisted
+        chat history is intentionally redacted; after process restart, restored
+        history likewise contains redacted placeholders rather than raw secrets.
 
         ``ledger_source`` tags any token-ledger entry written for the
         most recent LLM round-trip. Default ``"main"`` covers the bulk
