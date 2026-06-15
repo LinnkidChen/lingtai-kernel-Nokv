@@ -9,7 +9,7 @@ import time
 from unittest.mock import MagicMock
 
 from lingtai_kernel.config import AgentConfig
-from lingtai_kernel.llm.base import ToolCall
+from lingtai_kernel.llm.base import FunctionSchema, ToolCall
 from lingtai_kernel.tool_call_guard import GuardDecision, ToolCallGuard
 
 
@@ -30,20 +30,30 @@ def _make_agent(tmp_path, capabilities=None):
     return agent
 
 
-def _make_run_dir(agent, em_id="em-test"):
+def _make_run_dir(
+    agent,
+    em_id="em-test",
+    *,
+    task="test task",
+    tools=None,
+    system_prompt="You are a daemon.",
+    call_parameters=None,
+):
     """Helper: build a DaemonRunDir matching the new _run_emanation signature."""
     from lingtai.core.daemon.run_dir import DaemonRunDir
+    tools = ["file"] if tools is None else tools
     return DaemonRunDir(
         parent_working_dir=agent._working_dir,
         handle=em_id,
-        task="test task",
-        tools=["file"],
+        task=task,
+        tools=tools,
         model="mock-model",
         max_turns=30,
         timeout_s=300.0,
         parent_addr=agent._working_dir.name,
         parent_pid=12345,
-        system_prompt="You are a daemon.",
+        system_prompt=system_prompt,
+        call_parameters=call_parameters,
     )
 
 
@@ -214,22 +224,157 @@ def test_build_tool_surface_unknown_tool(tmp_path):
         assert "nonexistent" in str(e)
 
 
-def test_build_tool_surface_inherits_mcp_tools(tmp_path):
-    """MCP tools are automatically inherited without being requested."""
+def test_build_tool_surface_requires_task_mcp_surface(tmp_path):
+    """MCP tools are present only when supplied by task-scoped registration."""
     agent = _make_agent(tmp_path, ["daemon"])
-    # Simulate an MCP tool registered via connect_mcp
+    # Simulate a parent MCP tool registered on the parent. It must not leak into
+    # daemon surface unless this task's own mcp registration produced it.
     agent._sealed = False
-    agent.add_tool("my_mcp_tool", schema={"type": "object", "properties": {}},
-                   handler=lambda args: {}, description="MCP tool")
+    agent.add_tool("parent_mcp_tool", schema={"type": "object", "properties": {}},
+                   handler=lambda args: {"ok": True}, description="Parent MCP tool")
     agent._sealed = True
     mgr = agent.get_capability("daemon")
-    schemas, dispatch = mgr._build_tool_surface([])  # no explicit tools
+
+    agent._mcp_tool_names = {"parent_mcp_tool"}
+    schemas, dispatch = mgr._build_tool_surface([])
     names = {s.name for s in schemas}
-    assert "my_mcp_tool" in names
+    assert "parent_mcp_tool" not in names
+    assert "parent_mcp_tool" not in dispatch
+
+    try:
+        mgr._build_tool_surface(["parent_mcp_tool"])
+        assert False, "parent MCP tool name should not be accepted via tools"
+    except ValueError as e:
+        assert "task mcp registrations" in str(e)
+
+    mcp_schema = FunctionSchema(
+        name="task_mcp_tool",
+        description="Task MCP tool",
+        parameters={"type": "object", "properties": {}},
+    )
+    schemas, dispatch = mgr._build_tool_surface(
+        [],
+        mcp_surface=({"task_mcp_tool": mcp_schema}, {"task_mcp_tool": lambda args: {"ok": True}}),
+    )
+    names = {s.name for s in schemas}
+    assert "task_mcp_tool" in names
+    assert "task_mcp_tool" in dispatch
+    assert "parent_mcp_tool" not in names
+
+    # A task-scoped MCP registration may expose the same tool name as a parent
+    # MCP. The task-scoped handler should be used; parent MCP still is not
+    # inherited through tools.
+    replacement_schema = FunctionSchema(
+        name="parent_mcp_tool",
+        description="Replacement task MCP tool",
+        parameters={"type": "object", "properties": {}},
+    )
+    schemas, dispatch = mgr._build_tool_surface(
+        [],
+        mcp_surface=({"parent_mcp_tool": replacement_schema}, {"parent_mcp_tool": lambda args: {"task": True}}),
+    )
+    names = {s.name for s in schemas}
+    assert "parent_mcp_tool" in names
+    assert dispatch["parent_mcp_tool"]({}) == {"task": True}
+
+
+def test_build_tool_surface_rejects_task_mcp_name_collision(tmp_path):
+    """Task-scoped MCP tools must not shadow parent or daemon tool names."""
+    agent = _make_agent(tmp_path, ["daemon", "file"])
+    mgr = agent.get_capability("daemon")
+    read_schema = FunctionSchema(
+        name="read",
+        description="Conflicting MCP read",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    try:
+        mgr._build_tool_surface([], mcp_surface=({"read": read_schema}, {"read": lambda args: {}}))
+        assert False, "Should reject MCP tool collision with parent read tool"
+    except ValueError as e:
+        assert "collide" in str(e)
+
+
+def test_task_mcp_registrations_accept_full_objects_and_redact_secrets(tmp_path):
+    """Task mcp is full registration YAML context, not name-based selection."""
+    agent = _make_agent(tmp_path, ["daemon"])
+    mgr = agent.get_capability("daemon")
+
+    registrations, catalog = mgr._task_mcp_registrations({
+        "task": "x",
+        "tools": [],
+        "mcp": [{
+            "name": "demo-mcp",
+            "type": "stdio",
+            "command": "python",
+            "args": ["-m", "demo"],
+            "env": {"TOKEN": "secret"},
+        }],
+    })
+
+    assert registrations == [{
+        "name": "demo-mcp",
+        "transport": "stdio",
+        "command": "python",
+        "args": ["-m", "demo"],
+        "env": {"TOKEN": "secret"},
+    }]
+    assert catalog is not None
+    assert "## Parent-provided MCP registrations" not in catalog
+    assert "demo-mcp" in catalog
+    assert "command: python" in catalog
+    assert "TOKEN: <redacted>" in catalog
+    assert "secret" not in catalog
+
+
+def test_connect_task_mcp_registrations_builds_surface_and_closes(tmp_path, monkeypatch):
+    """LingTai backend starts task-scoped MCP clients from full registrations."""
+    agent = _make_agent(tmp_path, ["daemon"])
+    mgr = agent.get_capability("daemon")
+    created = []
+
+    class FakeMCPClient:
+        def __init__(self, command, args=None, env=None):
+            self.command = command
+            self.args = args
+            self.env = env
+            self.closed = False
+            created.append(self)
+        def start(self):
+            pass
+        def list_tools(self):
+            return [{
+                "name": "demo_tool",
+                "description": "Demo tool",
+                "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            }]
+        def call_tool(self, name, args):
+            return {"called": name, "args": args}
+        def close(self):
+            self.closed = True
+
+    import lingtai.services.mcp as mcp_mod
+    monkeypatch.setattr(mcp_mod, "MCPClient", FakeMCPClient)
+
+    schemas, handlers, clients = mgr._connect_task_mcp_registrations([{
+        "name": "demo-mcp",
+        "transport": "stdio",
+        "command": "python",
+        "args": ["-m", "demo"],
+        "env": {"TOKEN": "secret"},
+    }])
+
+    assert set(schemas) == {"demo_tool"}
+    assert handlers["demo_tool"]({"q": "x"}) == {"called": "demo_tool", "args": {"q": "x"}}
+    assert created[0].env["LINGTAI_AGENT_DIR"] == str(agent._working_dir)
+    assert created[0].env["LINGTAI_MCP_NAME"] == "demo-mcp"
+    assert created[0].env["TOKEN"] == "secret"
+    mgr._close_task_mcp_clients(clients)
+    assert created[0].closed
 
 
 def test_daemon_schema_accepts_task_system_prompt_and_skills():
-    """Task items expose current oneshot system_prompt plus selected skills."""
+    """Task items expose current oneshot system_prompt, skills, and MCP registrations."""
     from lingtai.core.daemon import get_schema
 
     task_props = get_schema("en")["properties"]["tasks"]["items"]["properties"]
@@ -238,7 +383,49 @@ def test_daemon_schema_accepts_task_system_prompt_and_skills():
     assert "skills" in task_props
     assert task_props["skills"]["type"] == "array"
     assert task_props["skills"]["items"]["type"] == "string"
+    assert "mcp" in task_props
+    assert task_props["mcp"]["type"] == "array"
+    assert task_props["mcp"]["items"]["type"] == "object"
     assert "custom_system_prompt" not in task_props
+
+
+def test_cli_backend_serializes_task_mcp_context(tmp_path, monkeypatch):
+    """CLI backends receive serialized MCP registrations instead of rejecting mcp."""
+    agent = _make_agent(tmp_path, ["daemon"])
+    mgr = agent.get_capability("daemon")
+    captured = {}
+
+    def fake_run(em_id, run_dir, task, cancel_event, timeout_event=None, backend_argv=None):
+        captured["task"] = task
+        captured["prompt"] = run_dir.prompt_path.read_text(encoding="utf-8")
+        run_dir.mark_done("ok")
+        return "ok"
+
+    monkeypatch.setattr(mgr, "_run_codex_emanation", fake_run)
+    result = mgr.handle({
+        "action": "emanate",
+        "backend": "codex",
+        "tasks": [{
+            "task": "x",
+            "tools": [],
+            "mcp": [{
+                "name": "demo-mcp",
+                "transport": "stdio",
+                "command": "python",
+                "args": ["-m", "demo"],
+                "env": {"TOKEN": "secret"},
+            }],
+        }],
+    })
+
+    assert result["status"] == "dispatched"
+    future = mgr._emanations[result["ids"][0]]["future"]
+    future.result(timeout=5)
+    assert "## Parent-provided MCP registrations" in captured["task"]
+    assert "demo-mcp" in captured["task"]
+    assert "TOKEN: <redacted>" in captured["task"]
+    assert "secret" not in captured["task"]
+    assert "## Parent-provided MCP registrations" in captured["prompt"]
 
 
 def test_build_tool_surface_includes_email_intrinsic_by_default(tmp_path):
@@ -395,6 +582,26 @@ def test_build_emanation_prompt_includes_selected_skills(tmp_path):
     assert "## Parent-selected skills" in prompt
     assert "- name: review-skill" in prompt
     assert prompt.index("- name: review-skill") < prompt.index("Your task:")
+
+
+def test_build_emanation_prompt_includes_selected_mcp_context(tmp_path):
+    """Selected MCP registrations are rendered into the daemon prompt before the task."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    schemas, _ = mgr._build_tool_surface(["file"])
+    context = mgr._combine_oneshot_context(
+        "Use the selected external tools only if needed.",
+        None,
+        "The parent provided these MCP registrations for this daemon run.\nmcp:\n  - name: demo-mcp\n    transport: stdio\n    command: python",
+    )
+
+    prompt = mgr._build_emanation_prompt("Review the report", schemas, system_prompt=context)
+
+    assert "Use the selected external tools only if needed." in prompt
+    assert "## Parent-provided MCP registrations" in prompt
+    assert "- name: demo-mcp" in prompt
+    assert "transport: stdio" in prompt
+    assert prompt.index("## Parent-provided MCP registrations") < prompt.index("Your task:")
 
 
 def test_build_emanation_prompt_includes_task(tmp_path):
@@ -637,6 +844,214 @@ def test_handle_list_shows_status(tmp_path):
     statuses = {e["id"]: e["status"] for e in result["emanations"]}
     assert statuses["em-1"] == "done"
     assert statuses["em-2"] == "running"
+
+
+def test_handle_list_includes_historical_done_run_dirs(tmp_path):
+    """list scans daemon run dirs so completed daemons remain discoverable."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    rd = _make_run_dir(
+        agent,
+        em_id="em-history",
+        task="summarize alpha history",
+        tools=["file", "bash"],
+        system_prompt="custom system prompt alpha",
+        call_parameters={
+            "task": "summarize alpha history",
+            "tools": ["file", "bash"],
+            "skills": ["daemon-manual"],
+            "mcp": [{"name": "docs", "transport": "stdio", "env": {"TOKEN": "<redacted>"}}],
+            "system_prompt": "custom system prompt alpha",
+        },
+    )
+    rd.mark_done("needle result with artifact path reports/alpha.md")
+
+    # Simulate a later manager/session: no live _emanations, only run-dir files.
+    listing = mgr._handle_list()
+    matches = [e for e in listing["emanations"] if e.get("run_id") == rd.run_id]
+    assert len(matches) == 1
+    em = matches[0]
+    assert listing["history_included"] is True
+    assert listing["index"] == "daemon_run_dirs"
+    assert em["id"] == "em-history"
+    assert em["status"] == "done"
+    assert em["path"].endswith(rd.run_id)
+    assert em["result_path"].endswith("result.txt")
+    assert "needle result" in em["result_preview"]
+    assert em["system_prompt_path"].endswith(".prompt")
+    assert "custom system prompt alpha" in em["system_prompt_preview"]
+    assert em["call_parameters"]["skills"] == ["daemon-manual"]
+    assert em["call_parameters"]["mcp"][0]["env"] == {"TOKEN": "<redacted>"}
+
+
+def test_handle_list_filters_history_by_contains_status_and_last(tmp_path):
+    """list supports lightweight progressive-disclosure search over run metadata."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    alpha = _make_run_dir(agent, em_id="em-alpha", task="alpha task")
+    alpha.mark_done("alpha result contains unique-needle")
+    beta = _make_run_dir(agent, em_id="em-beta", task="beta task")
+    beta.mark_failed(RuntimeError("beta failed unique-needle"))
+
+    done_listing = mgr._handle_list(contains="unique-needle", status_filter="done")
+    assert done_listing["total_matches"] == 1
+    assert done_listing["emanations"][0]["run_id"] == alpha.run_id
+
+    failed_listing = mgr._handle_list(contains="unique-needle", status_filter="failed", limit=1)
+    assert failed_listing["total_matches"] == 1
+    assert failed_listing["showing"] == 1
+    assert failed_listing["emanations"][0]["run_id"] == beta.run_id
+    assert "beta failed" in str(failed_listing["emanations"][0]["error"])
+
+    hidden_history = mgr._handle_list(include_done=False)
+    assert all(e.get("run_id") not in {alpha.run_id, beta.run_id} for e in hidden_history["emanations"])
+    assert hidden_history["history_included"] is False
+
+
+def test_daemon_run_dir_writes_current_data_version(tmp_path):
+    """New daemon.json records carry a version for future lazy migration."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    rd = _make_run_dir(agent, em_id="em-version")
+    state = json.loads(rd.daemon_json_path.read_text(encoding="utf-8"))
+    from lingtai.core.daemon.run_dir import DaemonRunDir
+    assert state["data_version"] == DaemonRunDir.DATA_VERSION
+
+
+def test_handle_list_rebuilds_missing_daemon_json_best_effort(tmp_path):
+    """list lazily rebuilds a minimal daemon.json when a run folder lost it."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    run_path = agent._working_dir / "daemons" / "em-7-20260102-030405-abcdef"
+    (run_path / "logs").mkdir(parents=True)
+    (run_path / "history").mkdir()
+    (run_path / ".prompt").write_text(
+        "daemon prompt\n\nYour task:\nrecover missing daemon json task",
+        encoding="utf-8",
+    )
+    (run_path / "result.txt").write_text("recovered result body", encoding="utf-8")
+    (run_path / "logs" / "events.jsonl").write_text(
+        json.dumps({"event": "daemon_done", "ts": "2026-01-02T03:05:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+
+    listing = mgr._handle_list(contains="recover missing")
+    assert listing["total_matches"] == 1
+    em = listing["emanations"][0]
+    assert em["run_id"] == "em-7-20260102-030405-abcdef"
+    assert em["id"] == "em-7"
+    assert em["status"] == "done"
+    assert em["task"] == "recover missing daemon json task"
+    assert em["data_version"] == 1
+    assert em["migration"]["reason"] == "daemon_json_missing"
+    assert "recovered result" in em["result_preview"]
+
+    rebuilt = json.loads((run_path / "daemon.json").read_text(encoding="utf-8"))
+    from lingtai.core.daemon.run_dir import DaemonRunDir
+    assert rebuilt["data_version"] == DaemonRunDir.DATA_VERSION
+    assert rebuilt["migration"]["reason"] == "daemon_json_missing"
+    assert rebuilt["task"] == "recover missing daemon json task"
+    assert rebuilt["result_path"].endswith("result.txt")
+
+
+def test_handle_list_rebuilds_invalid_daemon_json_best_effort(tmp_path):
+    """list also rebuilds corrupt daemon.json files instead of dropping the run."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    run_path = agent._working_dir / "daemons" / "em-8-20260102-030405-fedcba"
+    (run_path / "logs").mkdir(parents=True)
+    (run_path / "history").mkdir()
+    (run_path / ".prompt").write_text("daemon prompt\n\nYour task:\nrecover corrupt json task", encoding="utf-8")
+    (run_path / "daemon.json").write_text("{not-json", encoding="utf-8")
+
+    listing = mgr._handle_list(contains="corrupt json")
+    assert listing["total_matches"] == 1
+    em = listing["emanations"][0]
+    assert em["run_id"] == "em-8-20260102-030405-fedcba"
+    assert em["migration"]["reason"] == "daemon_json_invalid"
+
+    rebuilt = json.loads((run_path / "daemon.json").read_text(encoding="utf-8"))
+    assert rebuilt["task"] == "recover corrupt json task"
+    assert rebuilt["migration"]["reason"] == "daemon_json_invalid"
+
+
+def test_handle_list_rebuilds_non_utf8_daemon_json(tmp_path):
+    """A non-UTF-8 daemon.json is treated as invalid and rebuilt best-effort."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    run_path = agent._working_dir / "daemons" / "em-9-20260102-030405-a1b2c3"
+    (run_path / "logs").mkdir(parents=True)
+    (run_path / "history").mkdir()
+    (run_path / ".prompt").write_text("daemon prompt\n\nYour task:\nrecover non utf daemon json", encoding="utf-8")
+    (run_path / "result.txt").write_text("non utf rebuilt result", encoding="utf-8")
+    (run_path / "daemon.json").write_bytes(b"\xff\xfe\x00bad-json")
+
+    listing = mgr._handle_list(contains="non utf")
+    assert listing["total_matches"] == 1
+    em = listing["emanations"][0]
+    assert em["status"] == "done"
+    assert em["migration"]["reason"] == "daemon_json_invalid"
+
+    rebuilt = json.loads((run_path / "daemon.json").read_text(encoding="utf-8"))
+    assert rebuilt["task"] == "recover non utf daemon json"
+    assert rebuilt["migration"]["reason"] == "daemon_json_invalid"
+
+
+def test_handle_list_rebuild_reads_only_events_tail(tmp_path):
+    """Best-effort rebuild can infer terminal state from the tail of a large event log."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    run_path = agent._working_dir / "daemons" / "em-10-20260102-030405-1a2b3c"
+    (run_path / "logs").mkdir(parents=True)
+    (run_path / "history").mkdir()
+    (run_path / ".prompt").write_text("daemon prompt\n\nYour task:\nlarge events tail task", encoding="utf-8")
+    events_path = run_path / "logs" / "events.jsonl"
+    padding = json.dumps({"event": "cli_output", "text": "x" * 2000}) + "\n"
+    events_path.write_text(padding * 40 + json.dumps({"event": "daemon_timeout", "ts": "2026-01-02T03:06:00Z"}) + "\n", encoding="utf-8")
+
+    listing = mgr._handle_list(contains="large events tail")
+    assert listing["total_matches"] == 1
+    em = listing["emanations"][0]
+    assert em["status"] == "timeout"
+    assert em["migration"]["reason"] == "daemon_json_missing"
+
+    rebuilt = json.loads((run_path / "daemon.json").read_text(encoding="utf-8"))
+    assert rebuilt["state"] == "timeout"
+    assert rebuilt["finished_at"] == "2026-01-02T03:06:00Z"
+
+
+def test_handle_list_rebuilds_stale_daemon_json_version(tmp_path):
+    """list upgrades stale daemon.json records and preserves backend extras."""
+    agent = _make_agent(tmp_path, ["file", "daemon"])
+    mgr = agent.get_capability("daemon")
+    rd = _make_run_dir(agent, em_id="em-stale", task="stale version task")
+    rd.mark_done("stale version result")
+    state = json.loads(rd.daemon_json_path.read_text(encoding="utf-8"))
+    state["data_version"] = -1
+    state["backend_options"] = {"search": True}
+    state["future_backend_field"] = {"preserve": True}
+    rd.daemon_json_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    listing = mgr._handle_list(contains="stale version", status_filter="done")
+    assert listing["total_matches"] == 1
+    em = listing["emanations"][0]
+    assert em["run_id"] == rd.run_id
+    assert em["status"] == "done"
+
+    rebuilt = json.loads(rd.daemon_json_path.read_text(encoding="utf-8"))
+    from lingtai.core.daemon.run_dir import DaemonRunDir
+    assert rebuilt["data_version"] == DaemonRunDir.DATA_VERSION
+    assert rebuilt["migration"]["reason"] == "daemon_json_data_version_mismatch"
+    assert rebuilt["backend_options"] == {"search": True}
+    assert rebuilt["future_backend_field"] == {"preserve": True}
+
+
+def test_handle_list_rejects_non_positive_last(tmp_path):
+    """list reuses last as a positive limit, not a zero/negative slice."""
+    agent = _make_agent(tmp_path, ["daemon"])
+    mgr = agent.get_capability("daemon")
+    result = mgr._handle_list(limit=0)
+    assert result["status"] == "error"
+    assert "last must be" in result["message"]
 
 
 def test_handle_ask_sends_followup(tmp_path):

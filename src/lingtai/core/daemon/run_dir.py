@@ -32,6 +32,8 @@ class DaemonRunDir:
             result.txt                   # full terminal result when available
     """
 
+    DATA_VERSION = 1
+
     def __init__(
         self,
         *,
@@ -51,6 +53,7 @@ class DaemonRunDir:
         preset_model: str | None = None,
         backend: str = "lingtai",
         group_id: str | None = None,
+        call_parameters: dict | None = None,
     ):
         self._handle = handle
         self._parent_token_ledger = parent_working_dir / "logs" / "token_ledger.jsonl"
@@ -75,6 +78,7 @@ class DaemonRunDir:
         (self._path / "logs").mkdir()
 
         self._state = {
+            "data_version": self.DATA_VERSION,
             "handle": handle,
             "run_id": self._run_id,
             "group_id": group_id,
@@ -82,6 +86,7 @@ class DaemonRunDir:
             "parent_pid": parent_pid,
             "task": task,
             "tools": list(tools),
+            "call_parameters": dict(call_parameters or {}),
             "model": model,
             "max_turns": max_turns,
             "timeout_s": timeout_s,

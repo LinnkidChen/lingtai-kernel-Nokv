@@ -92,6 +92,10 @@ class Agent(BaseAgent):
         # Track for avatar replay
         self._capabilities: list[tuple[str, dict]] = []
         self._capability_managers: dict[str, Any] = {}
+        # Names registered by parent MCP clients. Daemon uses this only to avoid
+        # leaking parent MCP tools through tasks[].tools; task MCP access must
+        # come from complete per-task registrations.
+        self._mcp_tool_names: set[str] = set()
 
         # Decompress addons BEFORE capability setup so the `mcp` capability
         # sees the populated registry on its first reconcile.
@@ -415,6 +419,10 @@ class Agent(BaseAgent):
         # consulted by `_retry_failed_mcps`. Reset on every load so that
         # entries removed from init.json drop out of the retry pool.
         self._mcp_init_specs: dict[str, dict] = {}
+        # Parent MCP tool names are tracked only so daemon can prevent
+        # tasks[].tools from leaking parent MCP tools. Task-level daemon MCP
+        # access must come from complete registrations in tasks[].mcp.
+        self._mcp_tool_names: set[str] = set()
 
         # LICC env injection — every spawned MCP gets these so it can
         # locate the agent's working dir + know its own registry name and
@@ -794,6 +802,9 @@ class Agent(BaseAgent):
             )
             registered.append(name)
 
+        if not hasattr(self, "_mcp_tool_names"):
+            self._mcp_tool_names = set()
+        self._mcp_tool_names.update(registered)
         return registered
 
     def connect_mcp_http(
@@ -840,6 +851,9 @@ class Agent(BaseAgent):
             )
             registered.append(name)
 
+        if not hasattr(self, "_mcp_tool_names"):
+            self._mcp_tool_names = set()
+        self._mcp_tool_names.update(registered)
         return registered
 
     def stop(self, timeout: float = 5.0) -> None:

@@ -15,10 +15,20 @@ inspecting `daemon(action="list")`, or passing CLI flags through `backend_option
 
 ## API note: `daemon(action="list")`
 
-`list` reports only currently-active emanations (in-memory registry). It includes
-`run_id` and `path` so you know where to read on disk. Historical
-(completed/failed/cancelled) emanations don't appear in `list` — find them by
-inspecting the agent's `daemons/` folder.
+`list` is a compact index over both currently tracked runs and historical run
+folders. By default it scans `daemons/*/daemon.json` and returns completed,
+failed, cancelled, timed-out, and running entries with `run_id`, `group_id`,
+`status`, `backend`, task preview, visible call parameters (`task`, `tools`,
+`skills`, redacted `mcp`, system-prompt preview when recorded), result preview,
+and filesystem paths. If a historical run folder has no `daemon.json`, has
+invalid JSON, or has a mismatched `data_version`, `list` lazily writes a
+best-effort replacement using the folder name, `.prompt`, `result.txt`,
+`.heartbeat`/mtimes, and recent `events.jsonl`. Use `contains` for
+case-insensitive substring search over that visible index, `status` for status
+filtering, `last` as a positive result limit, and `include_done=false` when
+you only want currently tracked in-memory runs. This is the first layer of progressive disclosure; read the returned
+`.prompt`/`result.txt` paths for detail, and grep `events.jsonl` /
+`chat_history.jsonl` / `token_ledger.jsonl` only for forensic depth.
 
 
 ## Bash harness subskills
@@ -82,14 +92,21 @@ also embedded at the top of the task prompt and persisted in the daemon `.prompt
 file for forensics.
 
 **LingTai backend tool surface.** The built-in `lingtai` backend uses preset
-resolution plus daemon tool curation. MCP tools still auto-inherit from the
-parent. The daemon-eligible `email` intrinsic is available by default so an
-emanation can communicate in the local agent network when the task requires it;
-other intrinsics remain unavailable to keep daemon lightweight and non-recursive.
-As with file/bash/web/MCP tools, technical availability is not a policy by
-itself: the parent should use `system_prompt` to say when and how the daemon may
-use any available tool, including who it may contact and what context it may
-share if email is involved.
+resolution plus daemon tool curation. Parent MCP tools are not auto-inherited:
+provide full one-run MCP registrations per task with `mcp: [{name, transport,
+...}]`. The runtime serializes those registrations into the oneshot prompt as
+YAML for every backend. For the built-in LingTai backend, it also starts the
+registered MCP clients for this run and exposes their tools in the daemon tool
+surface; clients are closed when the run finishes. CLI backends do not receive
+native config injection in this PR, but they do receive the same YAML context and
+may load it if their runtime supports MCP. Secret `env`/`headers` values are
+redacted in prompts. The daemon-eligible `email` intrinsic is available by
+default so an emanation can communicate in the local agent network when the task
+requires it; other intrinsics remain unavailable to keep daemon lightweight and
+non-recursive. As with file/bash/web/MCP tools, technical availability is not a
+policy by itself: the parent should use `system_prompt` to say when and how the
+daemon may use any available tool, including who it may contact and what context
+it may share if email is involved.
 
 **When to use CLI backends:** Use them when the task benefits from a different
 agent runtime's tool surface (for example Claude Code's built-in file editing or

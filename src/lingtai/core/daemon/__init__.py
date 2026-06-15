@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 import yaml
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -390,6 +391,11 @@ def get_schema(lang: str = "en") -> dict:
                             "items": {"type": "string"},
                             "description": t(lang, "daemon.tasks.skills"),
                         },
+                        "mcp": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": t(lang, "daemon.tasks.mcp"),
+                        },
                         "preset": {
                             "type": "string",
                             "description": t(lang, "daemon.tasks.preset"),
@@ -425,6 +431,18 @@ def get_schema(lang: str = "en") -> dict:
                 "type": "integer",
                 "minimum": 0,
                 "description": t(lang, "daemon.truncate"),
+            },
+            "contains": {
+                "type": "string",
+                "description": t(lang, "daemon.contains"),
+            },
+            "status": {
+                "type": "string",
+                "description": t(lang, "daemon.status"),
+            },
+            "include_done": {
+                "type": "boolean",
+                "description": t(lang, "daemon.include_done"),
             },
             "max_turns": {
                 "type": "integer",
@@ -581,7 +599,12 @@ class DaemonManager:
                 backend=backend,
             )
         elif action == "list":
-            return self._handle_list()
+            return self._handle_list(
+                contains=args.get("contains", ""),
+                status_filter=args.get("status", "all"),
+                include_done=args.get("include_done", True),
+                limit=args.get("last"),
+            )
         elif action == "ask":
             return self._handle_ask(args.get("id", ""), args.get("message", ""))
         elif action == "check":
@@ -686,6 +709,161 @@ class DaemonManager:
                 lines.append(f"      {dl}" if dl else "      ")
         return "\n".join(lines)
 
+    @staticmethod
+    def _task_mcp_registrations(spec: dict) -> tuple[list[dict], str | None]:
+        """Return normalized full MCP registrations and rendered YAML context."""
+        raw = spec.get("mcp")
+        if raw is None:
+            return [], None
+        if not isinstance(raw, list):
+            raise ValueError("mcp must be an array of MCP registration objects")
+        rows: list[dict] = []
+        seen: set[str] = set()
+        for idx, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(f"mcp[{idx}] must be an MCP registration object")
+            cfg = dict(item)
+            name = cfg.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"mcp[{idx}].name must be a non-empty string")
+            name = name.strip()
+            if name in seen:
+                raise ValueError(f"duplicate MCP registration name: {name}")
+            seen.add(name)
+            transport = cfg.get("transport", cfg.get("type", "stdio"))
+            if transport not in ("stdio", "http"):
+                raise ValueError(
+                    f"mcp[{idx}].transport/type must be 'stdio' or 'http'"
+                )
+            normalized = dict(cfg)
+            normalized["name"] = name
+            normalized["transport"] = transport
+            normalized.pop("type", None)
+            if transport == "stdio":
+                if not isinstance(normalized.get("command"), str) or not normalized["command"]:
+                    raise ValueError(f"mcp[{idx}] stdio registration requires command")
+                args = normalized.get("args", [])
+                if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+                    raise ValueError(f"mcp[{idx}].args must be an array of strings")
+                normalized["args"] = list(args)
+                env = normalized.get("env")
+                if env is not None and (
+                    not isinstance(env, dict)
+                    or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+                ):
+                    raise ValueError(f"mcp[{idx}].env must be an object of string values")
+            else:
+                if not isinstance(normalized.get("url"), str) or not normalized["url"]:
+                    raise ValueError(f"mcp[{idx}] http registration requires url")
+                headers = normalized.get("headers")
+                if headers is not None and (
+                    not isinstance(headers, dict)
+                    or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items())
+                ):
+                    raise ValueError(f"mcp[{idx}].headers must be an object of string values")
+            rows.append(normalized)
+        return rows, DaemonManager._render_task_mcp_catalog(rows)
+
+    @staticmethod
+    def _redact_mcp_registration_for_prompt(cfg: dict) -> dict:
+        """Return a prompt-safe MCP registration copy.
+
+        The daemon runtime uses the full object for LingTai-backend MCP startup,
+        but the serialized context should not leak secret env/header values into
+        model prompts. Keys remain visible so CLI backends know what must be
+        supplied by their own environment/config.
+        """
+        out = dict(cfg)
+        for field in ("env", "headers"):
+            value = out.get(field)
+            if isinstance(value, dict):
+                out[field] = {k: "<redacted>" for k in value}
+        return out
+
+    @staticmethod
+    def _render_task_mcp_catalog(registrations: list[dict]) -> str | None:
+        if not registrations:
+            return None
+        safe = [DaemonManager._redact_mcp_registration_for_prompt(r)
+                for r in registrations]
+        body = yaml.safe_dump(
+            {"mcp": safe},
+            sort_keys=False,
+            allow_unicode=True,
+        ).strip()
+        return (
+            "The parent provided these MCP registrations for this daemon run. "
+            "They are one-run context: LingTai backend may load them directly; "
+            "CLI backends should use them only if their runtime can load MCP "
+            "registrations. Secret env/header values are redacted in this prompt.\n"
+            f"{body}"
+        )
+
+    def _connect_task_mcp_registrations(
+        self,
+        registrations: list[dict],
+    ) -> tuple[dict[str, FunctionSchema], dict, list[object]]:
+        """Start task-scoped MCP clients and return schemas/handlers/clients."""
+        if not registrations:
+            return {}, {}, []
+        from ...services.mcp import HTTPMCPClient, MCPClient
+
+        schemas: dict[str, FunctionSchema] = {}
+        handlers: dict = {}
+        clients: list[object] = []
+        licc_env = {"LINGTAI_AGENT_DIR": str(self._agent._working_dir)}
+        try:
+            for cfg in registrations:
+                name = cfg["name"]
+                if cfg["transport"] == "http":
+                    client = HTTPMCPClient(
+                        url=cfg["url"],
+                        headers=cfg.get("headers"),
+                    )
+                else:
+                    merged_env = {
+                        **licc_env,
+                        "LINGTAI_MCP_NAME": name,
+                        **(cfg.get("env") or {}),
+                    }
+                    client = MCPClient(
+                        command=cfg["command"],
+                        args=cfg.get("args"),
+                        env=merged_env,
+                    )
+                client.start()
+                clients.append(client)
+                for tool in client.list_tools():
+                    tool_name = tool["name"]
+                    if tool_name in schemas:
+                        raise ValueError(f"duplicate MCP tool name: {tool_name}")
+                    schema = dict(tool.get("schema", {}) or {})
+                    schema.pop("additionalProperties", None)
+
+                    def _make_handler(c, tn: str):
+                        def handler(tool_args: dict) -> dict:
+                            return c.call_tool(tn, tool_args)
+                        return handler
+
+                    schemas[tool_name] = FunctionSchema(
+                        name=tool_name,
+                        description=tool.get("description", ""),
+                        parameters=schema,
+                    )
+                    handlers[tool_name] = _make_handler(client, tool_name)
+        except Exception:
+            self._close_task_mcp_clients(clients)
+            raise
+        return schemas, handlers, clients
+
+    @staticmethod
+    def _close_task_mcp_clients(clients: list[object] | None) -> None:
+        for client in clients or []:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def _task_skill_catalog(self, spec: dict) -> str | None:
         """Return rendered YAML skill context selected for one daemon task."""
         raw = spec.get("skills")
@@ -709,12 +887,15 @@ class DaemonManager:
     def _combine_oneshot_context(
         system_prompt: str | None,
         skill_catalog: str | None,
+        mcp_catalog: str | None = None,
     ) -> str | None:
         parts = []
         if system_prompt:
             parts.append(system_prompt)
         if skill_catalog:
             parts.append("## Parent-selected skills\n" + skill_catalog)
+        if mcp_catalog:
+            parts.append("## Parent-provided MCP registrations\n" + mcp_catalog)
         return "\n\n".join(parts) or None
 
     @staticmethod
@@ -751,15 +932,17 @@ class DaemonManager:
         self,
         requested: list[str],
         preset_surface: tuple[dict, dict] | None = None,
+        mcp_surface: tuple[dict[str, FunctionSchema], dict] | None = None,
     ) -> tuple[list[FunctionSchema], dict]:
         """Build filtered tool schemas and dispatch map for an emanation.
 
         When ``preset_surface`` is provided (preset-driven emanation), the
         capability tools come from the preset's pre-instantiated sandbox
-        (``preset_surface = (schemas_by_name, handlers_by_name)``), unioned
-        with the parent's MCP tools (those don't bind to an LLM, so they
-        carry over). When ``preset_surface`` is None, the parent's currently
-        registered tool surface is used (today's behavior).
+        (``preset_surface = (schemas_by_name, handlers_by_name)``). Parent MCP
+        tools do not auto-inherit; task ``mcp`` provides complete one-run MCP
+        registrations whose tools are added through ``mcp_surface``. When
+        ``preset_surface`` is None, the parent's currently registered regular
+        capability surface is used, again plus only task-scoped MCP tools.
         """
         from ...capabilities import _GROUPS
 
@@ -775,20 +958,30 @@ class DaemonManager:
 
         intrinsic_schemas, intrinsic_handlers = self._daemon_intrinsic_surface()
         tool_names |= set(intrinsic_schemas)
+        mcp_schemas, mcp_handlers = mcp_surface or ({}, {})
+        parent_mcp_names = self._parent_mcp_tool_names()
+        reserved_names = ({s.name for s in self._agent._tool_schemas} - parent_mcp_names) | set(intrinsic_schemas)
+        mcp_collisions = set(mcp_schemas) & reserved_names
+        if mcp_collisions:
+            raise ValueError(
+                "Task MCP tools collide with existing parent/daemon tools: "
+                f"{sorted(mcp_collisions)}"
+            )
+        parent_mcp_requested = (tool_names & self._parent_mcp_tool_names()) - set(mcp_schemas)
+        if parent_mcp_requested:
+            raise ValueError(
+                "Parent MCP tools must be provided as task mcp registrations, "
+                f"not requested via tools: {sorted(parent_mcp_requested)}"
+            )
 
         if preset_surface is not None:
             preset_schemas, preset_handlers = preset_surface
-            # Available surface = preset capabilities ∪ parent's MCP tools ∪
-            # daemon-eligible intrinsics (currently email).
-            capability_names = {cap_name for cap_name, _ in self._agent._capabilities}
-            all_registered = {s.name for s in self._agent._tool_schemas}
-            mcp_names = all_registered - capability_names - EMANATION_BLACKLIST
-            available = set(preset_schemas.keys()) | mcp_names | set(intrinsic_schemas)
-            # MCP tools are auto-included (parent-bound, LLM-agnostic). The
-            # narrow daemon intrinsic surface is auto-included too: daemon
-            # follow-up/collaboration workflows commonly need email, and the
-            # bridge is still bounded to explicitly daemon-eligible intrinsics.
-            tool_names |= mcp_names | set(intrinsic_schemas)
+            # Available surface = preset capabilities ∪ task-scoped MCP tools
+            # ∪ daemon-eligible intrinsics (currently email).
+            available = set(preset_schemas.keys()) | set(mcp_schemas) | set(intrinsic_schemas)
+            # The narrow daemon intrinsic surface and task MCP surface are
+            # auto-included for this one run.
+            tool_names |= set(mcp_schemas) | set(intrinsic_schemas)
 
             missing = tool_names - available
             if missing:
@@ -807,21 +1000,19 @@ class DaemonManager:
                     schemas.append(intrinsic_schemas[n])
                     if n in intrinsic_handlers:
                         dispatch[n] = intrinsic_handlers[n]
-                elif n in parent_schema_map:
-                    # MCP tool from parent
-                    schemas.append(parent_schema_map[n])
-                    if n in self._agent._tool_handlers:
-                        dispatch[n] = self._agent._tool_handlers[n]
+                elif n in mcp_schemas:
+                    schemas.append(mcp_schemas[n])
+                    if n in mcp_handlers:
+                        dispatch[n] = mcp_handlers[n]
             return schemas, dispatch
 
-        # Default path: emanation runs on parent's tool surface
-        capability_names = {cap_name for cap_name, _ in self._agent._capabilities}
-        all_registered = {s.name for s in self._agent._tool_schemas}
-        mcp_names = all_registered - capability_names - EMANATION_BLACKLIST
-        tool_names |= mcp_names
+        # Default path: emanation runs on the parent's capability surface plus
+        # task-scoped MCP tools from full registrations.
+        tool_names |= set(mcp_schemas)
 
         # Validate requested tools exist
-        available = {s.name for s in self._agent._tool_schemas} | set(intrinsic_schemas)
+        available = ({s.name for s in self._agent._tool_schemas}
+                     | set(intrinsic_schemas) | set(mcp_schemas))
         missing = tool_names - available
         if missing:
             raise ValueError(f"Unknown tools for emanation: {missing}")
@@ -832,14 +1023,26 @@ class DaemonManager:
         for n in sorted(tool_names):
             if n in intrinsic_schemas:
                 schemas.append(intrinsic_schemas[n])
+            elif n in mcp_schemas:
+                schemas.append(mcp_schemas[n])
             elif n in schema_map:
                 schemas.append(schema_map[n])
         dispatch = {n: self._agent._tool_handlers[n]
                     for n in tool_names if n in self._agent._tool_handlers}
         for n in tool_names:
+            if n in mcp_handlers:
+                dispatch[n] = mcp_handlers[n]
             if n in intrinsic_handlers:
                 dispatch[n] = intrinsic_handlers[n]
         return schemas, dispatch
+
+
+    def _parent_mcp_tool_names(self) -> set[str]:
+        """Return parent MCP tool names tracked by the parent agent."""
+        names = getattr(self._agent, "_mcp_tool_names", set())
+        if not isinstance(names, set):
+            return set()
+        return {n for n in names if isinstance(n, str)}
 
     def _expand_requested_tools(self, requested: list[str]) -> set[str]:
         """Expand requested daemon tools after group aliases and blacklist."""
@@ -968,8 +1171,9 @@ class DaemonManager:
             lines.append("")
             lines.append("## Parent-provided daemon context (oneshot)")
             lines.append(
-                "These parent instructions and selected skills apply only to "
-                "this daemon run. They may narrow how you complete the task, "
+                "These parent instructions and selected skills/MCP context "
+                "apply only to this daemon run. They may narrow how you complete "
+                "the task, "
                 "but they do not override the daemon lifecycle, cancellation/"
                 "timeout limits, available tool schema, or tool execution/"
                 "approval guard."
@@ -987,7 +1191,8 @@ class DaemonManager:
                        cancel_event: threading.Event,
                        timeout_event: threading.Event | None = None,
                        preset_llm: dict | None = None,
-                       max_turns: int | None = None) -> str:
+                       max_turns: int | None = None,
+                       mcp_clients: list[object] | None = None) -> str:
         """Run a single emanation's tool loop. Called in a worker thread.
 
         run_dir is the DaemonRunDir constructed in _handle_emanate. All
@@ -1154,6 +1359,8 @@ class DaemonManager:
         except Exception as e:
             run_dir.mark_failed(e)
             raise
+        finally:
+            self._close_task_mcp_clients(mcp_clients)
 
     def _find_claude_session_id(self, em_id: str) -> str | None:
         """Search ~/.claude/projects/ for the session JSONL whose customTitle matches em_id.
@@ -1919,8 +2126,8 @@ class DaemonManager:
             # Instantiate preset capabilities into a sandbox up front so any
             # setup-time failure refuses the whole batch (consistent with
             # connectivity refusal). Empty caps dict → empty sandbox surface,
-            # which means the emanation only gets MCP tools — that's a valid
-            # if unusual configuration.
+            # which means the emanation only gets task-scoped MCP tools —
+            # that's a valid if unusual configuration.
             try:
                 preset_schemas, preset_handlers = self._instantiate_preset_capabilities(
                     preset_caps,
@@ -1967,16 +2174,24 @@ class DaemonManager:
                     resolved["preset_schemas"],
                     resolved["preset_handlers"],
                 )
+            task_mcp_clients: list[object] = []
             try:
+                task_mcp_regs, task_mcp_catalog = self._task_mcp_registrations(spec)
+                mcp_schemas, mcp_handlers, task_mcp_clients = (
+                    self._connect_task_mcp_registrations(task_mcp_regs)
+                )
                 schemas, dispatch = self._build_tool_surface(
-                    spec["tools"], preset_surface=preset_surface,
+                    spec["tools"],
+                    preset_surface=preset_surface,
+                    mcp_surface=(mcp_schemas, mcp_handlers),
                 )
                 task_system_prompt = self._task_system_prompt(spec)
                 task_skill_catalog = self._task_skill_catalog(spec)
-            except ValueError as e:
+            except Exception as e:
+                self._close_task_mcp_clients(task_mcp_clients)
                 return {"status": "error", "message": str(e)}
             task_context = self._combine_oneshot_context(
-                task_system_prompt, task_skill_catalog
+                task_system_prompt, task_skill_catalog, task_mcp_catalog
             )
             system_prompt = self._build_emanation_prompt(
                 spec["task"], schemas, system_prompt=task_context
@@ -2002,12 +2217,20 @@ class DaemonManager:
                     parent_pid=parent_pid,
                     system_prompt=system_prompt,
                     group_id=group_id,
+                    call_parameters={
+                        "task": spec["task"],
+                        "tools": spec.get("tools", []),
+                        "skills": spec.get("skills", []),
+                        "mcp": [self._redact_mcp_registration_for_prompt(r) for r in task_mcp_regs],
+                        "system_prompt": task_system_prompt,
+                    },
                     log_callback=self._log,
                     preset_name=resolved["name"] if resolved else None,
                     preset_provider=resolved["llm"].get("provider") if resolved else None,
                     preset_model=resolved["llm"].get("model") if resolved else None,
                 )
             except OSError as e:
+                self._close_task_mcp_clients(task_mcp_clients)
                 return {"status": "error",
                         "message": f"Failed to create daemon folder: {e}"}
 
@@ -2017,6 +2240,7 @@ class DaemonManager:
                 spec["task"], cancel_event, timeout_event,
                 resolved["llm"] if resolved else None,
                 effective_max_turns,
+                task_mcp_clients,
             )
             future.add_done_callback(
                 lambda f, eid=em_id, task=spec["task"]:
@@ -2067,10 +2291,15 @@ class DaemonManager:
         resolved_backend_argv: list[list[str]] = []
         task_system_prompts: list[str | None] = []
         task_skill_catalogs: list[str | None] = []
+        task_mcp_catalogs: list[str | None] = []
+        task_mcp_registrations: list[list[dict]] = []
         for i, spec in enumerate(tasks):
             try:
                 task_system_prompts.append(self._task_system_prompt(spec))
                 task_skill_catalogs.append(self._task_skill_catalog(spec))
+                task_mcp_regs, task_mcp_catalog = self._task_mcp_registrations(spec)
+                task_mcp_registrations.append(task_mcp_regs)
+                task_mcp_catalogs.append(task_mcp_catalog)
             except ValueError as e:
                 return {"status": "error",
                         "message": f"tasks[{i}]: {e}"}
@@ -2105,8 +2334,10 @@ class DaemonManager:
 
             task_system_prompt = task_system_prompts[i]
             task_skill_catalog = task_skill_catalogs[i]
+            task_mcp_catalog = task_mcp_catalogs[i]
+            task_mcp_regs = task_mcp_registrations[i]
             task_context = self._combine_oneshot_context(
-                task_system_prompt, task_skill_catalog
+                task_system_prompt, task_skill_catalog, task_mcp_catalog
             )
             system_prompt = f"[{backend} backend — task delegated to external CLI]"
             if task_context:
@@ -2128,6 +2359,14 @@ class DaemonManager:
                     parent_pid=parent_pid,
                     system_prompt=system_prompt,
                     group_id=group_id,
+                    call_parameters={
+                        "task": spec["task"],
+                        "tools": spec.get("tools", []),
+                        "skills": spec.get("skills", []),
+                        "mcp": [self._redact_mcp_registration_for_prompt(r) for r in task_mcp_regs],
+                        "system_prompt": task_system_prompt,
+                        "backend_options": backend_options,
+                    },
                     log_callback=self._log,
                     backend=backend,
                 )
@@ -2212,36 +2451,428 @@ class DaemonManager:
         return {"status": "dispatched", "count": len(tasks), "ids": ids,
                 "group_id": group_id, "backend": backend}
 
-    def _handle_list(self) -> dict:
-        emanations = []
+    @staticmethod
+    def _truncate_list_string(value: object, limit: int = 500) -> object:
+        if not isinstance(value, str):
+            return value
+        if len(value) <= limit:
+            return value
+        return value[:limit] + "…[truncated]"
+
+    @staticmethod
+    def _list_search_blob(info: dict) -> str:
+        try:
+            return json.dumps(info, ensure_ascii=False, sort_keys=True).lower()
+        except (TypeError, ValueError):
+            return str(info).lower()
+
+    def _daemon_prompt_preview(self, run_path: Path, limit: int = 500) -> tuple[str | None, int | None]:
+        prompt_path = run_path / ".prompt"
+        try:
+            size = prompt_path.stat().st_size
+            with open(prompt_path, encoding="utf-8") as f:
+                text = f.read(limit + 1)
+        except (OSError, UnicodeDecodeError):
+            return None, None
+        return self._truncate_list_string(text, limit), size
+
+    def _daemon_list_entry_from_state(
+        self,
+        state: dict,
+        run_path: Path,
+        *,
+        active_status: str | None = None,
+        active_elapsed: int | None = None,
+        active_error: BaseException | None = None,
+    ) -> dict:
+        status = active_status or state.get("state") or "unknown"
+        call_params = state.get("call_parameters")
+        if not isinstance(call_params, dict):
+            call_params = {}
+        prompt_preview, prompt_chars = self._daemon_prompt_preview(run_path)
+        visible_call_params = {
+            "task": self._truncate_list_string(call_params.get("task", state.get("task"))),
+            "tools": call_params.get("tools", state.get("tools", [])),
+            "skills": call_params.get("skills", []),
+            "mcp": call_params.get("mcp", []),
+            "system_prompt_preview": self._truncate_list_string(call_params.get("system_prompt")),
+        }
+        visible_call_params = {k: v for k, v in visible_call_params.items() if v not in (None, [], "")}
+        info = {
+            "id": state.get("handle"),
+            "task": self._truncate_list_string(state.get("task", ""), 120),
+            "status": status,
+            "data_version": state.get("data_version"),
+            "migration": state.get("migration"),
+            "elapsed_s": active_elapsed if active_elapsed is not None else state.get("elapsed_s"),
+            "run_id": state.get("run_id"),
+            "group_id": state.get("group_id"),
+            "backend": state.get("backend"),
+            "started_at": state.get("started_at"),
+            "finished_at": state.get("finished_at"),
+            "path": str(run_path),
+            "result_preview": state.get("result_preview"),
+            "result_path": state.get("result_path"),
+            "call_parameters": visible_call_params,
+        }
+        if prompt_preview is not None:
+            info["system_prompt_preview"] = prompt_preview
+            info["system_prompt_bytes"] = prompt_chars
+            info["system_prompt_path"] = str(run_path / ".prompt")
+        if active_error is not None:
+            info["error"] = str(active_error)
+        elif state.get("error"):
+            info["error"] = state.get("error")
+        return {k: v for k, v in info.items() if v is not None}
+
+    @staticmethod
+    def _utc_iso_from_timestamp(ts: float) -> str:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _started_at_from_run_id(run_id: str) -> str | None:
+        match = re.match(r"^em-\d+-(\d{8}-\d{6})-[0-9a-fA-F]+$", run_id)
+        if not match:
+            return None
+        try:
+            dt = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _handle_from_run_id(run_id: str) -> str | None:
+        match = re.match(r"^(em-\d+)-", run_id)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _atomic_write_daemon_json(path: Path, state: dict) -> None:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _looks_like_daemon_run_dir(run_path: Path) -> bool:
+        return (
+            run_path.is_dir()
+            and (
+                run_path.name.startswith("em-")
+                or (run_path / ".prompt").exists()
+                or (run_path / "result.txt").exists()
+                or (run_path / "logs" / "events.jsonl").exists()
+            )
+        )
+
+    def _read_daemon_events_tail(self, run_path: Path, max_lines: int = 80) -> list[dict]:
+        events_path = run_path / "logs" / "events.jsonl"
+        try:
+            size = events_path.stat().st_size
+            with open(events_path, "rb") as f:
+                f.seek(max(0, size - 65536))
+                raw = f.read()
+            text = raw.decode("utf-8", errors="replace")
+            lines = text.splitlines()[-max_lines:]
+        except OSError:
+            return []
+        events: list[dict] = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def _infer_task_from_prompt(self, run_path: Path) -> str | None:
+        prompt_path = run_path / ".prompt"
+        try:
+            with open(prompt_path, encoding="utf-8") as f:
+                text = f.read(20000)
+        except (OSError, UnicodeDecodeError):
+            return None
+        markers = ["\nYour task:\n", "\nTask:\n"]
+        best = None
+        best_idx = -1
+        for marker in markers:
+            idx = text.rfind(marker)
+            if idx > best_idx:
+                best = marker
+                best_idx = idx
+        if best is None or best_idx < 0:
+            return None
+        task = text[best_idx + len(best):].strip()
+        if not task:
+            return None
+        return str(self._truncate_list_string(task, 2000))
+
+    def _infer_terminal_state_from_events(self, events: list[dict]) -> tuple[str | None, str | None, object | None]:
+        for event in reversed(events):
+            name = event.get("event")
+            if name == "daemon_done":
+                return "done", event.get("ts"), None
+            if name == "daemon_error":
+                error = {
+                    "type": event.get("exception") or "DaemonError",
+                    "message": event.get("message") or "daemon failed",
+                }
+                return "failed", event.get("ts"), error
+            if name == "daemon_cancelled":
+                return "cancelled", event.get("ts"), None
+            if name == "daemon_timeout":
+                return "timeout", event.get("ts"), None
+        return None, None, None
+
+    def _result_preview_from_file(self, run_path: Path) -> tuple[str | None, str | None]:
+        result_path = run_path / "result.txt"
+        try:
+            with open(result_path, encoding="utf-8") as f:
+                text = f.read(201)
+        except (OSError, UnicodeDecodeError):
+            return None, None
+        preview = text[:200]
+        return preview, str(result_path)
+
+    def _build_reconstructed_daemon_state(
+        self,
+        run_path: Path,
+        existing_state: dict | None,
+        *,
+        reason: str,
+    ) -> dict:
+        old = dict(existing_state or {})
+        run_id = str(old.get("run_id") or run_path.name)
+        handle = str(old.get("handle") or self._handle_from_run_id(run_id) or run_id.split("-")[0] or run_id)
+        events = self._read_daemon_events_tail(run_path)
+        inferred_state, inferred_finished_at, inferred_error = self._infer_terminal_state_from_events(events)
+        result_preview, result_path = self._result_preview_from_file(run_path)
+        task = old.get("task")
+        call_params = old.get("call_parameters") if isinstance(old.get("call_parameters"), dict) else {}
+        if not isinstance(task, str) or not task:
+            task = call_params.get("task") if isinstance(call_params.get("task"), str) else None
+        if not task:
+            task = self._infer_task_from_prompt(run_path) or ""
+        tools = old.get("tools")
+        if not isinstance(tools, list):
+            tools = call_params.get("tools") if isinstance(call_params.get("tools"), list) else []
+        daemon_state = old.get("state") if isinstance(old.get("state"), str) else None
+        if inferred_state and daemon_state in (None, "", "running", "active", "unknown"):
+            daemon_state = inferred_state
+        if result_path and daemon_state in (None, "", "running", "active", "unknown"):
+            daemon_state = "done"
+        if not daemon_state:
+            daemon_state = "unknown"
+        started_at = old.get("started_at") if isinstance(old.get("started_at"), str) else None
+        if not started_at:
+            started_at = self._started_at_from_run_id(run_id)
+        if not started_at:
+            try:
+                started_at = self._utc_iso_from_timestamp(run_path.stat().st_mtime)
+            except OSError:
+                started_at = DaemonRunDir._now_iso()
+        finished_at = old.get("finished_at") if isinstance(old.get("finished_at"), str) else None
+        if not finished_at and daemon_state in {"done", "failed", "cancelled", "timeout"}:
+            finished_at = inferred_finished_at
+            if not finished_at:
+                terminal_path = Path(result_path) if result_path else (run_path / "logs" / "events.jsonl")
+                try:
+                    finished_at = self._utc_iso_from_timestamp(terminal_path.stat().st_mtime)
+                except OSError:
+                    finished_at = DaemonRunDir._now_iso()
+        if not isinstance(call_params, dict):
+            call_params = {}
+        if task and not call_params.get("task"):
+            call_params["task"] = task
+        if tools and not call_params.get("tools"):
+            call_params["tools"] = tools
+        state = {
+            "data_version": DaemonRunDir.DATA_VERSION,
+            "handle": handle,
+            "run_id": run_id,
+            "group_id": old.get("group_id"),
+            "parent_addr": old.get("parent_addr"),
+            "parent_pid": old.get("parent_pid"),
+            "task": task,
+            "tools": tools,
+            "call_parameters": call_params,
+            "model": old.get("model") or old.get("preset_model") or "unknown",
+            "max_turns": old.get("max_turns"),
+            "timeout_s": old.get("timeout_s"),
+            "state": daemon_state,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_s": old.get("elapsed_s") if old.get("elapsed_s") is not None else 0.0,
+            "turn": old.get("turn") if old.get("turn") is not None else 0,
+            "current_tool": old.get("current_tool"),
+            "tool_call_count": old.get("tool_call_count") if old.get("tool_call_count") is not None else 0,
+            "tokens": old.get("tokens") if isinstance(old.get("tokens"), dict) else {"input": 0, "output": 0, "thinking": 0, "cached": 0},
+            "result_preview": old.get("result_preview") or result_preview,
+            "result_path": old.get("result_path") or result_path,
+            "last_output": old.get("last_output"),
+            "last_output_at": old.get("last_output_at"),
+            "error": old.get("error") or inferred_error,
+            "preset_name": old.get("preset_name"),
+            "preset_provider": old.get("preset_provider"),
+            "preset_model": old.get("preset_model"),
+            "backend": old.get("backend") or "unknown",
+            "claude_session_id": old.get("claude_session_id"),
+            "codex_session_id": old.get("codex_session_id"),
+            "opencode_session_id": old.get("opencode_session_id"),
+            "mimocode_session_id": old.get("mimocode_session_id"),
+            "oh_my_pi_session_id": old.get("oh_my_pi_session_id"),
+            "cursor_session_id": old.get("cursor_session_id"),
+            "migration": {
+                "reason": reason,
+                "rebuilt_at": DaemonRunDir._now_iso(),
+                "source": "daemon_list_best_effort",
+            },
+        }
+        # Preserve fields added by specific backends or future versions (for
+        # example backend_options/backend_argv/session ids) while still
+        # normalizing the fields list relies on above.  data_version itself is
+        # deliberately overwritten to the current version.
+        for key, value in old.items():
+            if key != "data_version" and key not in state:
+                state[key] = value
+        return state
+
+    @staticmethod
+    def _has_current_daemon_data_version(state: dict) -> bool:
+        version = state.get("data_version")
+        return (
+            isinstance(version, int)
+            and not isinstance(version, bool)
+            and version == DaemonRunDir.DATA_VERSION
+        )
+
+    def _load_or_rebuild_daemon_state(self, run_path: Path) -> dict | None:
+        daemon_json_path = run_path / "daemon.json"
+        existing: dict | None = None
+        reason: str | None = None
+        try:
+            loaded = json.loads(daemon_json_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+            else:
+                reason = "daemon_json_not_object"
+        except FileNotFoundError:
+            reason = "daemon_json_missing"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            reason = "daemon_json_invalid"
+        except OSError:
+            return None
+        if reason is None and existing is not None:
+            if self._has_current_daemon_data_version(existing):
+                return existing
+            reason = "daemon_json_data_version_mismatch"
+        rebuilt = self._build_reconstructed_daemon_state(run_path, existing, reason=reason or "daemon_json_rebuild")
+        try:
+            self._atomic_write_daemon_json(daemon_json_path, rebuilt)
+        except OSError:
+            pass
+        return rebuilt
+
+    def _iter_daemon_history_states(self, skip_run_ids: set[str] | None = None) -> list[tuple[Path, dict]]:
+        daemons_dir = self._agent._working_dir / "daemons"
+        if not daemons_dir.is_dir():
+            return []
+        skip_run_ids = skip_run_ids or set()
+        rows: list[tuple[Path, dict]] = []
+        for run_path in daemons_dir.iterdir():
+            # Active runs are represented by their live DaemonRunDir object above.
+            # Do not lazy-rebuild their daemon.json here: an active writer thread
+            # may be updating it concurrently, and the live state is fresher.
+            if run_path.name in skip_run_ids:
+                continue
+            if not self._looks_like_daemon_run_dir(run_path):
+                continue
+            state = self._load_or_rebuild_daemon_state(run_path)
+            if isinstance(state, dict):
+                rows.append((run_path, state))
+        return rows
+
+    def _handle_list(
+        self,
+        contains: str | None = "",
+        status_filter: str | None = "all",
+        include_done: bool = True,
+        limit: int | None = None,
+    ) -> dict:
+        try:
+            limit_int = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            return {"status": "error", "message": f"last must be a positive integer (got {limit!r})"}
+        if limit_int is not None and limit_int < 1:
+            return {"status": "error", "message": f"last must be ≥ 1 (got {limit_int})"}
+        if limit_int is not None:
+            limit_int = min(limit_int, self._CHECK_LAST_MAX)
+
+        query = (contains or "").strip().lower()
+        wanted_status = (status_filter or "all").strip().lower()
+        include_done = include_done is not False
+
+        emanations: list[dict] = []
         running = 0
+        active_run_ids: set[str] = set()
+
         for em_id, entry in self._emanations.items():
             elapsed = time.time() - entry["start_time"]
             future = entry["future"]
+            exc = None
             if future.done():
                 exc = future.exception()
-                if exc:
-                    status = "failed"
-                else:
-                    status = "done"
+                status = "failed" if exc else "done"
             else:
                 status = "running"
                 running += 1
-                exc = None
-            info = {"id": em_id, "task": entry["task"][:80],
-                    "status": status, "elapsed_s": round(elapsed)}
-            if status == "failed" and exc:
-                info["error"] = str(exc)
             run_dir = entry.get("run_dir")
             if run_dir is not None:
-                info["run_id"] = run_dir.run_id
-                info["group_id"] = run_dir.state_snapshot().get("group_id")
-                info["path"] = str(run_dir.path)
+                state = run_dir.state_snapshot()
+                state.setdefault("handle", em_id)
+                active_run_ids.add(run_dir.run_id)
+                info = self._daemon_list_entry_from_state(
+                    state, run_dir.path, active_status=status,
+                    active_elapsed=round(elapsed), active_error=exc,
+                )
+            else:
+                info = {
+                    "id": em_id,
+                    "task": self._truncate_list_string(entry.get("task", ""), 120),
+                    "status": status,
+                    "elapsed_s": round(elapsed),
+                }
+                if exc:
+                    info["error"] = str(exc)
             emanations.append(info)
+
+        if include_done:
+            for run_path, state in self._iter_daemon_history_states(skip_run_ids=active_run_ids):
+                info = self._daemon_list_entry_from_state(state, run_path)
+                if info.get("status") == "running":
+                    running += 1
+                emanations.append(info)
+
+        total_before_filter = len(emanations)
+        if wanted_status and wanted_status != "all":
+            emanations = [e for e in emanations if str(e.get("status", "")).lower() == wanted_status]
+        if query:
+            emanations = [e for e in emanations if query in self._list_search_blob(e)]
+
+        def _sort_key(item: dict) -> str:
+            return str(item.get("started_at") or item.get("run_id") or "")
+        emanations.sort(key=_sort_key, reverse=True)
+        total_matches = len(emanations)
+        if limit_int is not None:
+            emanations = emanations[:limit_int]
         return {
             "emanations": emanations,
             "running": running,
             "max_emanations": self._max_emanations,
+            "history_included": include_done,
+            "index": "daemon_run_dirs",
+            "total_before_filter": total_before_filter,
+            "total_matches": total_matches,
+            "showing": len(emanations),
         }
 
     def _handle_ask(self, em_id: str, message: str) -> dict:

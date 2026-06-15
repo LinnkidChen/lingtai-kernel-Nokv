@@ -101,14 +101,22 @@ files, not standalone top-level skills.
     against the parent agent working directory. The runtime parses each skill's
     frontmatter and injects a compact YAML skill list into the daemon prompt.
     Use `system_prompt` to say when/how those selected skills should be applied.
+  - `mcp` answers **which one-run MCP registrations belong to this daemon**. It
+    is optional and is an array of full MCP registration objects: `name` plus
+    `transport`/`type` (`stdio` or `http`), then `command`/`args`/`env` for
+    stdio or `url`/`headers` for HTTP. The runtime serializes these registrations
+    as YAML into every backend's oneshot context. The built-in LingTai backend
+    also starts them as task-scoped MCP clients and exposes their tools for this
+    run; CLI backends receive the YAML context and may load it if their own
+    runtime supports MCP. Secret `env`/`headers` values are redacted in prompts.
   - `preset`: optional body/model/tool-shape override for this daemon.
   - `backend_options`: raw CLI flags for CLI backends only.
 - Treat `system_prompt` as the parent's behavioral contract for **all** tools
-  and selected skills, not only for communication. If a daemon receives `bash`,
+  and selected skills/MCP context, not only for communication. If a daemon receives `bash`,
   say whether it may run mutating commands; if it receives file access, say what
   it may read/write; if it receives web/MCP tools, say what external calls are
   allowed; if it can communicate, say who it may contact and what context it may
-  share; if `skills` are selected, say when to read/apply them.
+  share; if `skills` or `mcp` are selected, say when to read/apply/call them.
 - `email` is available by default because a daemon is still part of the local
   agent network: it may need to report to peers, ask a sibling for context, or
   hand off a result. Availability is not authorization to broadcast. The parent
@@ -123,9 +131,29 @@ files, not standalone top-level skills.
   runs launched in that same call. Use `group_id` for logical batch context and
   audit. It is not a hard security boundary; use each daemon's `run_id` for
   per-run filesystem/audit identity.
+- Track daemon work in the parent agent's pad, not in daemon itself. When you
+  fan out multiple tasks, immediately write a small pad table after `emanate`:
+  label/purpose, returned `id`, `group_id`, brief/context file path, expected
+  artifact, and current status. Use `daemon(action="list")` and
+  `daemon(action="check", id=...)` as the mechanical truth, then update the pad
+  as the parent-facing map. Daemon should stay thin; if you need durable memory
+  or identity, use an avatar instead.
+- Do not copy large background into every task. Put reusable context in a
+  brief/report/notes file and pass that file path explicitly in the `task`
+  (with file access if the daemon should read it). A follow-up daemon should
+  consume visible artifacts such as the previous task prompt, result file,
+  report, event summary, or context files; do not treat a daemon as a resumable
+  mind or hidden-context container. Prefer making daemon history searchable and
+  easy to point at over copying or reviving a daemon session.
 - Each emanation is disposable memory but durable evidence: its folder persists
   after completion or reclaim until cleanup.
-- `daemon(action="list")` is a status overview, not a full transcript.
+- `daemon(action="list")` is the first layer of progressive disclosure: it
+  reads active in-memory runs plus historical `daemons/*/daemon.json` run
+  records, returning compact metadata, prompt/result previews, paths, and
+  optional `contains`/`status`/`last` filtering. If a historical
+  `daemon.json` is missing, invalid, or has an old `data_version`, list
+  does a best-effort lazy rebuild from the run folder before indexing it.
+  It is not a full transcript; use the returned paths for details.
 - Completion is push-notified; do not poll only to ask "is it done yet".
 - **Idle care before resting: completion is push-notified, but do not rest on
   that alone.** With daemon work pending and unverified-healthy, arm at least
@@ -150,8 +178,11 @@ contract:
 ```json
 {
   "task": "Audit the daemon manual changes and write a concise review to reports/daemon-manual-review.md.",
-  "system_prompt": "Act as a documentation reviewer. Stay read-only except for the requested report file. Use the selected daemon-manual skills only when you need exact daemon semantics. You may use email only to ask dev-2 for missing daemon context; do not contact the human. If you email dev-2, state the exact question, include only the relevant snippet, and summarize the exchange in your final report. Do not use web tools unless the local docs are insufficient.",
+  "system_prompt": "Act as a documentation reviewer. Stay read-only except for the requested report file. Use the selected daemon-manual skills only when you need exact daemon semantics. Use the local-docs MCP only for daemon documentation lookup, not for unrelated search. You may use email only to ask dev-2 for missing daemon context; do not contact the human. If you email dev-2, state the exact question, include only the relevant snippet, and summarize the exchange in your final report. Do not use web tools unless the local docs are insufficient.",
   "tools": ["file", "bash"],
+  "mcp": [
+    {"name": "local-docs", "transport": "stdio", "command": "python", "args": ["-m", "local_docs_mcp"]}
+  ],
   "skills": [
     "src/lingtai/core/daemon/manual",
     "src/lingtai/core/daemon/manual/reference/cli-backends/SKILL.md"
@@ -160,8 +191,8 @@ contract:
 ```
 
 The same pattern applies to non-email tools: `tools` grants a capability surface;
-`skills` grants a selected workflow catalog; `system_prompt` tells the daemon how
-to exercise both in this one run.
+`skills` grants a selected workflow catalog; `mcp` grants one-run MCP registrations (serialized for all backends and loaded as task tools by the LingTai backend); `system_prompt` tells the daemon how to
+exercise all of them in this one run.
 
 ## Maintenance
 
