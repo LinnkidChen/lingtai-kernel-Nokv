@@ -131,6 +131,20 @@ files, not standalone top-level skills.
   runs launched in that same call. Use `group_id` for logical batch context and
   audit. It is not a hard security boundary; use each daemon's `run_id` for
   per-run filesystem/audit identity.
+- Track daemon work in the parent agent's pad, not in daemon itself. When you
+  fan out multiple tasks, immediately write a small pad table after `emanate`:
+  label/purpose, returned `id`, `group_id`, brief/context file path, expected
+  artifact, and current status. Use `daemon(action="list")` and
+  `daemon(action="check", id=...)` as the mechanical truth, then update the pad
+  as the parent-facing map. Daemon should stay thin; if you need durable memory
+  or identity, use an avatar instead.
+- Do not copy large background into every task. Put reusable context in a
+  brief/report/notes file and pass that file path explicitly in the `task`
+  (with file access if the daemon should read it). A follow-up daemon should
+  consume visible artifacts such as the previous task prompt, result file,
+  report, event summary, or context files; do not treat a daemon as a resumable
+  mind or hidden-context container. Prefer making daemon history searchable and
+  easy to point at over copying or reviving a daemon session.
 - Each emanation is disposable memory but durable evidence: its folder persists
   after completion or reclaim until cleanup.
 - `daemon(action="list")` is a status overview, not a full transcript.
