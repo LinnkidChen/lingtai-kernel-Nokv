@@ -30,6 +30,33 @@ if TYPE_CHECKING:
     from .llm.interface import ChatInterface
 
 
+def _ensure_spill_manifest_fields(messages: list) -> None:
+    """Backfill ``artifact_lifetime`` and ``artifact_state`` on legacy spill manifests.
+
+    Walks a ``messages`` list (as produced by ``ChatInterface.to_dict``) and
+    adds the ephemeral-metadata fields to any spill manifest that predates
+    them.  Mutates in place; idempotent.
+    """
+    from .tool_result_artifacts import ARTIFACT_MARKER
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if (
+                value.get("artifact") == ARTIFACT_MARKER
+                and value.get("status") == "spilled"
+            ):
+                value.setdefault("artifact_lifetime", "ephemeral_tmp")
+                value.setdefault("artifact_state", "available")
+            for v in value.values():
+                _walk(v)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    for msg in messages:
+        _walk(msg)
+
+
 class SessionManager:
     """Manages LLM session lifecycle, token tracking, and context compaction.
 
@@ -425,10 +452,17 @@ class SessionManager:
            matching tool_results) — handled by close_pending_tool_calls(),
            which synthesizes placeholder error results so the next send is
            well-formed for strict providers (DeepSeek, OpenAI).
+
+        Also ensures ephemeral manifest fields exist on spill manifests
+        that predate the expired-spill-messaging feature (issue #192).
+        Full stale-marking (file-existence checks) is handled upstream in
+        lifecycle.py ``_start()``; this path only backfills missing fields
+        for in-memory messages that bypassed that call.
         """
         from .llm.interface import ChatInterface
         messages = state.get("messages")
         if messages:
+            _ensure_spill_manifest_fields(messages)
             try:
                 interface = ChatInterface.from_dict(messages)
                 interface.enforce_tool_pairing()
