@@ -15,19 +15,22 @@ The **public SDK doorway** — a curated, import-light front door for building a
 - `_compat.py` — the machine-readable migration map: `Deprecation` dataclass, `DEPRECATIONS` tuple, `active_aliases()`, `migration_for()`. Drives the docs migration table and the same-object round-trip test.
 - `runtime.py` — **runtime contract seed** (pure DTOs/ABCs, no kernel import): `RuntimeState`, `EventKind`, `RuntimeOptions`, `RuntimeMessage`, `RuntimeEvent` (with `state`/`text`/`error` constructors), and the `RuntimeSession`/`Runtime` ABCs. Describes how a *future* live runtime is driven (options in, messages in, events out). No live runtime here.
 - `capabilities.py` — **CapabilityBundle manifest seed** (pure DTOs, no kernel import): `BackendReplaceability`, `RoleFlags`, `CapabilitySurfaces`, `SecurityPolicy`, `TransportSpec`, `BundleManifest` (with `validate()`/`to_dict()`), and `proof_bundle()` — a harmless metadata-only synthetic bundle. Public schema only; native privileged handlers stay in the kernel/wrapper.
+- `native.py` — **stage-1 live `NativeRuntime` adapter skeleton** (NOT a full backend). `NativeRuntime(Runtime)` (id `"native"`) is a factory for `NativeRuntimeSession(RuntimeSession)`, which wraps the wrapper `Agent` unchanged: translates `RuntimeOptions` → `Agent` kwargs (`_agent_kwargs_from_options`), drives `start()`/`stop()` lifecycle (`PENDING`→`ACTIVE`→`STOPPED`), routes `send()` onto `Agent.send()` (fire-and-forget queue), and exposes a non-blocking `events()` snapshot of lifecycle/notification/error events. Import-pure at module load (imports only `runtime`); the wrapper `Agent` is imported lazily on first `start()` via the injectable `agent_factory` (tests pass a fake). LLM/provider fields are deferred to `session.deferred['llm']`, not applied — building an `LLMService` is a later stage.
 
 ## Connections
 
 - **The kernel must never import this package.** Dependency flows one way: `lingtai_sdk` → (`lingtai`, `lingtai_kernel`). The SDK is a consumer of the other two, never a dependency of them.
-- **Eager kernel, lazy wrapper.** `import lingtai_sdk` loads the dependency-light kernel only. Wrapper-backed names import `lingtai` on first attribute access, keeping the wrapper's provider SDKs (anthropic/openai/google-genai/mcp/…) optional for pure-kernel consumers. Enforced by `tests/test_sdk_import_purity.py`.
-- `runtime.py` and `capabilities.py` import **nothing** from `lingtai`/`lingtai_kernel` — they are standalone contract modules, so importing them stays provider-free (`tests/test_sdk_runtime_contract.py`, `tests/test_sdk_capabilities.py`).
+- **Eager kernel, lazy wrapper.** `import lingtai_sdk` loads the dependency-light kernel only. Wrapper-backed names (`_LAZY_WRAPPER_EXPORTS`) import `lingtai` on first attribute access, keeping the wrapper's provider SDKs (anthropic/openai/google-genai/mcp/…) optional for pure-kernel consumers. Enforced by `tests/test_sdk_import_purity.py`.
+- **Lazy SDK-internal names.** `NativeRuntime`/`NativeRuntimeSession` (`_LAZY_SDK_EXPORTS`) resolve from the import-pure `.native` module, NOT from the wrapper — accessing them and constructing a `NativeRuntime` stays provider-free; the wrapper `Agent` loads only when a session is started. Enforced by `tests/test_sdk_native_runtime.py::test_importing_native_and_constructing_runtime_is_pure`.
+- `runtime.py`, `capabilities.py`, and `native.py` import **nothing** from `lingtai`/`lingtai_kernel` at module load — `native.py` imports only the local `runtime` contract; its wrapper `Agent` import is deferred to `start()` (`tests/test_sdk_runtime_contract.py`, `tests/test_sdk_capabilities.py`, `tests/test_sdk_native_runtime.py`).
 - Compatibility is **by re-export, not re-implementation**: `_compat.DEPRECATIONS` records legacy→SDK path moves; the round-trip test asserts each pair resolves to the *same object* (`tests/test_sdk_compat.py`).
 
 ## Seeds vs. implementations
 
-This package deliberately stops at the contract boundary. The following are **intentionally deferred** to later PRs and are NOT present here:
+This package implements only the runtime *adapter* boundary; everything below it stops at the contract. **Present** (stage 1): the `NativeRuntime` skeleton in `native.py` — it wraps the existing `Agent` and drives its start/stop lifecycle, but does not build an `LLMService`, change the kernel turn loop, or implement a non-native backend. The following remain **intentionally deferred** to later PRs and are NOT present here:
 
-- A live `NativeRuntime` (thin wrapper over the existing `Agent`) and any non-native backend (e.g. an Anthropic backend).
+- An `LLMService`-building translation (provider/model/api_key are recorded in `session.deferred`, not applied) and a non-native backend (e.g. an Anthropic backend).
+- A live event bridge from the agent's output stream onto `RuntimeEvent` — `events()` is currently a snapshot of lifecycle/notification/error events only.
 - Migration of the core `system` / `psyche` / `soul` bundles into `BundleManifest` form. The only bundle here is the synthetic `proof_bundle()`.
 - A distribution/package rename (the SDK ships inside the existing `lingtai` wheel for now).
 

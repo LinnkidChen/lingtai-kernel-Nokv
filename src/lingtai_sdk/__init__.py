@@ -60,6 +60,15 @@ _LAZY_WRAPPER_EXPORTS: dict[str, tuple[str, str]] = {
     "VisionService": ("lingtai", "VisionService"),
 }
 
+# Lazy SDK-internal exports. Unlike ``_LAZY_WRAPPER_EXPORTS``, the target module
+# lives inside ``lingtai_sdk`` and is import-pure: accessing these names does
+# NOT import the ``lingtai`` wrapper. ``NativeRuntime`` only imports the wrapper
+# when a session is actually started.
+_LAZY_SDK_EXPORTS: dict[str, tuple[str, str]] = {
+    "NativeRuntime": (".native", "NativeRuntime"),
+    "NativeRuntimeSession": (".native", "NativeRuntimeSession"),
+}
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from lingtai import (  # noqa: F401
         Agent,
@@ -69,13 +78,22 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         SearchService,
         VisionService,
     )
+    from .native import NativeRuntime, NativeRuntimeSession  # noqa: F401
 
 
 def __getattr__(name: str):  # PEP 562 module-level lazy attributes
+    import importlib
+
+    sdk_target = _LAZY_SDK_EXPORTS.get(name)
+    if sdk_target is not None:
+        module = importlib.import_module(sdk_target[0], __name__)
+        value = getattr(module, sdk_target[1])
+        globals()[name] = value
+        return value
+
     target = _LAZY_WRAPPER_EXPORTS.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
 
     module = importlib.import_module(target[0])
     value = getattr(module, target[1])
@@ -92,6 +110,9 @@ __all__ = [
     # Runtime entrypoints
     "BaseAgent",  # kernel (eager)
     "Agent",  # wrapper (lazy)
+    # Native runtime adapter (lazy, SDK-internal; wrapper loads only on start)
+    "NativeRuntime",
+    "NativeRuntimeSession",
     # Configuration / state / messaging
     "AgentConfig",
     "AgentState",

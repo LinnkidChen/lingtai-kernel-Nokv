@@ -110,9 +110,10 @@ provider-free.
 - `RuntimeSession` / `Runtime` — the ABCs a backend implements. `Runtime.run()`
   is a small convenience that creates and starts a session.
 
-There is **no live runtime in this PR.** A thin `NativeRuntime` (wrapping the
-existing `Agent` unchanged) and any non-native backend land later, once the
-shapes have stabilized against the capability/prompt contracts.
+There is **no live runtime in this (stage 0) PR.** A thin `NativeRuntime`
+(wrapping the existing `Agent` unchanged) lands in **stage 1** (see §8 and §10);
+any non-native backend lands later, once the shapes have stabilized against the
+capability/prompt contracts.
 
 ## 6. CapabilityBundle manifest seed
 
@@ -179,10 +180,12 @@ PR, sequenced so contracts stabilize before implementations depend on them.
 
 1. **Stage 0 (this PR) — foundation.** Public doorway, import-purity guarantee,
    compatibility map, runtime + capability-bundle contract seeds, docs.
-2. **Stage 1 — live NativeRuntime.** A thin `Runtime`/`RuntimeSession`
-   implementation wrapping the existing `Agent` (no kernel turn-loop changes),
-   driven through the contract from stage 0. Wrapper-side, tested against a fake
-   agent.
+2. **Stage 1 — live NativeRuntime _(skeleton landed; see §10)_.** A thin
+   `Runtime`/`RuntimeSession` implementation wrapping the existing `Agent` (no
+   kernel turn-loop changes), driven through the contract from stage 0. Tested
+   against a fake agent — no real model, API key, or running process. Stacked on
+   the stage-0 PR. LLM-service translation and a live event bridge are follow-ups
+   within this stage.
 3. **Stage 2 — capability-bundle adoption.** Express one or two *low-risk*
    real capabilities as `BundleManifest`s and wire the wrapper to read the
    manifest. Still no `system`/`psyche`/`soul`.
@@ -195,9 +198,10 @@ PR, sequenced so contracts stabilize before implementations depend on them.
    `lingtai_sdk` is the headline import; today it rides inside the `lingtai`
    wheel.
 
-### Intentionally deferred (NOT in this PR)
+### Intentionally deferred (NOT in the stage-0 PR)
 
-- Any live runtime (`NativeRuntime` and friends).
+- Any live runtime (`NativeRuntime` and friends). _(The stage-1 skeleton lands in
+  the stacked PR described in §10.)_
 - An Anthropic (or other non-native) backend.
 - Migration of core `system` / `psyche` / `soul` bundles.
 - Distribution / package rename.
@@ -215,6 +219,7 @@ src/lingtai_sdk/
   _compat.py         # legacy -> SDK migration map
   runtime.py         # runtime contract seed (DTOs + ABCs)
   capabilities.py    # CapabilityBundle manifest seed + proof_bundle()
+  native.py          # stage 1: NativeRuntime skeleton (wraps Agent; lazy)
   ANATOMY.md         # per-folder anatomy
 
 tests/
@@ -222,4 +227,58 @@ tests/
   test_sdk_compat.py            # legacy paths resolve to the same object
   test_sdk_runtime_contract.py  # runtime DTOs + a usable concrete subclass
   test_sdk_capabilities.py      # manifest invariants + proof bundle
+  test_sdk_native_runtime.py    # stage 1: translation, lifecycle, purity (fake agent)
 ```
+
+## 10. Stage 1 — the NativeRuntime skeleton (stacked PR)
+
+Stage 1 is a small PR **stacked on top of stage 0**. It adds the first live
+runtime adapter — `lingtai_sdk.native.NativeRuntime` — proving the stage-0
+contract can wrap the existing wrapper `Agent` without making the import
+boundary worse. It deliberately stops at a *skeleton*: no kernel turn-loop
+changes, no `LLMService` construction, no non-native backend.
+
+### What it adds
+
+- **`NativeRuntime(Runtime)`** (`id = "native"`) — a factory whose
+  `create_session(options)` returns a `NativeRuntimeSession`. An injectable
+  `agent_factory` lets tests substitute a fake agent.
+- **`NativeRuntimeSession(RuntimeSession)`** — wraps an `Agent`:
+  - `start()` builds the agent (lazily, via the factory), calls `Agent.start()`,
+    and transitions `PENDING → ACTIVE`, emitting a `STATE` event. Idempotent.
+  - `send(message)` normalizes `str`/`RuntimeMessage` and routes onto
+    `Agent.send()` — the existing fire-and-forget inbox path, so it never blocks
+    on a turn. Before `start()` it emits a non-fatal `ERROR` event and no-ops.
+  - `events()` yields a non-blocking, re-iterable snapshot of queued
+    lifecycle / notification / error events.
+  - `stop()` calls `Agent.stop()` and transitions `→ STOPPED`. Idempotent.
+- **`_agent_kwargs_from_options(options)`** — a pure translation helper
+  returning `(agent_kwargs, deferred)`.
+
+### Translation: applied vs. deferred
+
+| `RuntimeOptions` field | Stage-1 handling |
+|---|---|
+| `working_dir` | → `Agent(working_dir=...)` (required) |
+| `agent_name`, `capabilities`, `addons`, `streaming` | → `Agent(...)` kwargs when set |
+| `provider`, `model`, `base_url`, `api_key` | **deferred** → `session.deferred['llm']` (building an `LLMService` is a later stage; `Agent` takes a ready service, not raw provider fields) |
+| `manifest`, `system_prompt_overrides`, `extra` | **deferred** → `session.deferred[...]` (recorded, not applied) |
+
+Deferring rather than force-applying keeps stage 1 honest: anything recognized
+but not yet wired is visible on the session, never silently dropped.
+
+### Import purity
+
+`native.py` imports only the pure `runtime` contract at module load. The
+wrapper `Agent` is imported **lazily**, inside `start()` / the default factory.
+`NativeRuntime` / `NativeRuntimeSession` are exported from the package root via
+a separate `_LAZY_SDK_EXPORTS` map that resolves from the import-pure `.native`
+module — so accessing the names and *constructing* a `NativeRuntime` stays free
+of the wrapper's provider SDKs; they load only when a session actually starts.
+A subprocess test asserts this.
+
+### Tested without a model
+
+All stage-1 tests run with no API key and no real agent process: a fake agent
+is injected through `agent_factory`, so lifecycle transitions, event emission,
+`send()` routing, and the translation table are all exercised in-memory.
