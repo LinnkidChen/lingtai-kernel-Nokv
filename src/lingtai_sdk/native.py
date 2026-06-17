@@ -39,6 +39,7 @@ attributes (see ``lingtai_sdk.__getattr__``).
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -321,7 +322,11 @@ class NativeRuntimeSession(RuntimeSession):
     source = _SOURCE
 
     def __init__(
-        self, options: RuntimeOptions, *, agent_factory: AgentFactory | None = None
+        self,
+        options: RuntimeOptions,
+        *,
+        agent_factory: AgentFactory | None = None,
+        bridge_events: bool = True,
     ) -> None:
         self._options = options
         # Track whether we're on the default (service-building) path. An
@@ -329,9 +334,19 @@ class NativeRuntimeSession(RuntimeSession):
         # building entirely — so it must not require provider/model.
         self._uses_default_factory = agent_factory is None
         self._agent_factory = agent_factory or _default_agent_factory
+        #: Whether to install the live event bridge in ``start()`` (stage 4).
+        #: A host can disable it to fall back to the stage-1 lifecycle/
+        #: notification/error snapshot only.
+        self._bridge_events = bridge_events
         self._agent: Any | None = None
         self._state = RuntimeState.PENDING
         self._events: list[RuntimeEvent] = []
+        # The agent drives its hooks on its own loop thread, so event appends
+        # and the last-sampled-state read/write are guarded by a lock.
+        self._lock = threading.Lock()
+        #: Last ``agent._state`` value mapped+emitted, so ``events()`` only
+        #: emits a STATE event when the agent's life-state actually changed.
+        self._last_agent_state: str | None = None
         self._agent_kwargs, self.deferred = _agent_kwargs_from_options(options)
         #: Fields that have actually been applied to the agent (secret-free).
         #: LLM config moves here from ``deferred`` once a service is built.
@@ -367,6 +382,8 @@ class NativeRuntimeSession(RuntimeSession):
             self.applied["llm"] = _public_llm_fields(self.deferred.get("llm", {}))
             self.deferred["llm"] = {}  # no longer deferred — it's applied
         self._agent = self._agent_factory(**kwargs)
+        if self._bridge_events:
+            self._install_event_bridge(self._agent)
         self._agent.start()
         self._set_state(RuntimeState.ACTIVE)
 
@@ -395,9 +412,15 @@ class NativeRuntimeSession(RuntimeSession):
         )
 
     def events(self) -> Iterator[RuntimeEvent]:
-        # Stage 1: a non-blocking, re-iterable snapshot of the queue. A future
-        # stage bridges the agent's live output stream onto these events.
-        return iter(list(self._events))
+        # A non-blocking, re-iterable snapshot of the queue. Tool-call /
+        # tool-result / text / usage / turn-error events are appended live by
+        # the installed hook bridge (stage 4) as the agent's loop thread runs;
+        # the agent's life-state runs on that thread too, so it is *sampled*
+        # here (a STATE event is appended only when it changed) rather than
+        # pushed — keeping the bridge lock-light and the loop untouched.
+        self._sample_agent_state()
+        with self._lock:
+            return iter(list(self._events))
 
     def stop(self, timeout: float = 5.0) -> None:
         if self._state is RuntimeState.STOPPED:
@@ -406,9 +429,100 @@ class NativeRuntimeSession(RuntimeSession):
             self._agent.stop(timeout=timeout)
         self._set_state(RuntimeState.STOPPED)
 
+    # -- event bridge (stage 4) --------------------------------------------
+    def _install_event_bridge(self, agent: Any) -> None:
+        """Wrap the agent's overridable hooks so existing activity becomes events.
+
+        Purely additive: each wrapper calls the original hook and emits the
+        matching :class:`RuntimeEvent`, leaving the kernel turn loop and the
+        hooks' own contracts intact. The wrappers are installed as *instance*
+        attributes — they shadow the bound methods on this one agent only and
+        never touch the kernel/wrapper source.
+
+        - ``_on_tool_result_hook(name, args, result)`` → a ``TOOL_CALL`` event
+          (name + args) plus a ``TOOL_RESULT`` event (name + result). The
+          original's return value is passed through unchanged, so an
+          intercepting host hook still short-circuits the turn as before.
+        - ``_post_request(msg, result)`` → a ``TEXT`` event for non-empty
+          ``result['text']``, a non-fatal ``ERROR`` event per
+          ``result['errors']``, and a ``USAGE`` event sampled from
+          ``agent.get_token_usage()``.
+
+        Missing hooks/accessors are tolerated (``getattr`` guards) so a
+        slimmer fake or future agent shape degrades gracefully rather than
+        breaking the bridge.
+        """
+        original_tool_hook = getattr(agent, "_on_tool_result_hook", None)
+        if callable(original_tool_hook):
+            def _bridged_tool_hook(
+                tool_name: str, tool_args: Any, result: Any
+            ) -> Any:
+                self._emit(
+                    RuntimeEvent.tool_call(
+                        tool_name, tool_args or {}, source=self.source
+                    )
+                )
+                self._emit(
+                    RuntimeEvent.tool_result(tool_name, result, source=self.source)
+                )
+                return original_tool_hook(tool_name, tool_args, result)
+
+            agent._on_tool_result_hook = _bridged_tool_hook
+
+        original_post_request = getattr(agent, "_post_request", None)
+        if callable(original_post_request):
+            def _bridged_post_request(msg: Any, result: Any) -> None:
+                self._emit_turn_result(agent, result)
+                return original_post_request(msg, result)
+
+            agent._post_request = _bridged_post_request
+
+    def _emit_turn_result(self, agent: Any, result: Any) -> None:
+        """Translate a ``_process_response`` result dict into events."""
+        if isinstance(result, Mapping):
+            text = result.get("text")
+            if isinstance(text, str) and text:
+                self._emit(RuntimeEvent.text(text, source=self.source))
+            for err in result.get("errors") or ():
+                self._emit(
+                    RuntimeEvent.error(str(err), fatal=False, source=self.source)
+                )
+        get_usage = getattr(agent, "get_token_usage", None)
+        if callable(get_usage):
+            try:
+                usage = get_usage()
+            except Exception:
+                usage = None
+            if isinstance(usage, Mapping):
+                self._emit(RuntimeEvent.usage(usage, source=self.source))
+
+    def _sample_agent_state(self) -> None:
+        """Emit a STATE event if the agent's life-state changed since last read.
+
+        The agent owns its life-state on its loop thread; rather than splice a
+        callback into that thread, we read ``agent._state`` whenever a consumer
+        polls ``events()``. ``AgentState`` is a ``str`` enum, so ``str(...)``
+        yields its value; a plain string (test fakes) passes through.
+        """
+        agent = self._agent
+        if agent is None:
+            return
+        raw = getattr(agent, "_state", None)
+        if raw is None:
+            return
+        value = getattr(raw, "value", None) or str(raw)
+        with self._lock:
+            if value == self._last_agent_state:
+                return
+            self._last_agent_state = value
+            self._events.append(
+                RuntimeEvent(EventKind.STATE, {"state": value}, source=self.source)
+            )
+
     # -- internals ----------------------------------------------------------
     def _emit(self, event: RuntimeEvent) -> None:
-        self._events.append(event)
+        with self._lock:
+            self._events.append(event)
 
     def _set_state(self, state: RuntimeState) -> None:
         self._state = state
@@ -424,11 +538,23 @@ class NativeRuntime(Runtime):
 
     id = _SOURCE
 
-    def __init__(self, *, agent_factory: AgentFactory | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        agent_factory: AgentFactory | None = None,
+        bridge_events: bool = True,
+    ) -> None:
         self._agent_factory = agent_factory
+        #: Default for sessions: install the live event bridge (stage 4). Set
+        #: ``False`` for the stage-1 lifecycle/notification/error snapshot only.
+        self._bridge_events = bridge_events
 
     def create_session(self, options: RuntimeOptions) -> NativeRuntimeSession:
-        return NativeRuntimeSession(options, agent_factory=self._agent_factory)
+        return NativeRuntimeSession(
+            options,
+            agent_factory=self._agent_factory,
+            bridge_events=self._bridge_events,
+        )
 
 
 __all__ = [

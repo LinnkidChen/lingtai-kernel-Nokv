@@ -185,8 +185,9 @@ PR, sequenced so contracts stabilize before implementations depend on them.
    the existing `Agent` (no kernel turn-loop changes), driven through the
    contract from stage 0. Tested against a fake agent — no real model, API key,
    or running process. Stacked on the stage-0 PR. The default-factory
-   LLM-service translation landed as a stacked follow-up (§11); a live event
-   bridge is still a follow-up within this stage.
+   LLM-service translation (§11), `manifest.llm` translation (§12), and a
+   **minimal live event bridge** (§13) landed as stacked follow-ups within
+   this stage.
 3. **Stage 2 — capability-bundle adoption.** Express one or two *low-risk*
    real capabilities as `BundleManifest`s and wire the wrapper to read the
    manifest. Still no `system`/`psyche`/`soul`.
@@ -220,15 +221,18 @@ src/lingtai_sdk/
   _compat.py         # legacy -> SDK migration map
   runtime.py         # runtime contract seed (DTOs + ABCs)
   capabilities.py    # CapabilityBundle manifest seed + proof_bundle()
-  native.py          # stage 1: NativeRuntime skeleton (wraps Agent; lazy)
+  native.py          # NativeRuntime adapter (stages 1-4; wraps Agent; lazy)
   ANATOMY.md         # per-folder anatomy
 
 tests/
   test_sdk_import_purity.py     # bare import loads no wrapper / heavy provider
   test_sdk_compat.py            # legacy paths resolve to the same object
-  test_sdk_runtime_contract.py  # runtime DTOs + a usable concrete subclass
+  test_sdk_runtime_contract.py  # runtime DTOs (incl. activity constructors) + a usable concrete subclass
   test_sdk_capabilities.py      # manifest invariants + proof bundle
-  test_sdk_native_runtime.py    # stage 1: translation, lifecycle, purity (fake agent)
+  test_sdk_native_runtime.py          # stage 1: translation, lifecycle, purity (fake agent)
+  test_sdk_native_runtime_llm.py      # stage 2: LLM-service translation
+  test_sdk_native_runtime_manifest.py # stage 3: manifest.llm translation
+  test_sdk_native_runtime_events.py   # stage 4: live event bridge (fake agent)
 ```
 
 ## 10. Stage 1 — the NativeRuntime skeleton (stacked PR)
@@ -398,7 +402,8 @@ yields no `provider`/`model` and `_llm_service_from_options` raises
 
 - Migrating `system` / `psyche` / `soul` into `BundleManifest` form.
 - A non-native (e.g. Anthropic) backend.
-- A live event bridge from the agent's output stream onto `RuntimeEvent`.
+- A live event bridge from the agent's activity onto `RuntimeEvent` _(landed in
+  the stacked follow-up described in §13)._
 - Any kernel turn-loop / BaseAgent / Agent change.
 
 ### Tested without a model
@@ -410,3 +415,74 @@ exercised through a `service`-required fake agent, the pure merge/`max_rpm`/
 `context_window` helpers are asserted directly, and a subprocess test confirms
 constructing a `NativeRuntime` and a session with a `manifest['llm']` block stays
 provider-free (`tests/test_sdk_native_runtime_manifest.py`).
+
+## 13. Stage 4 — a minimal live event bridge (stacked PR)
+
+Stage 4 is a small PR **stacked on top of stage 3**. It closes the last item
+§10 left open for the `NativeRuntime` line: making the running agent's *existing*
+activity observable through the stage-0 `RuntimeEvent` contract, so a host that
+drives a session through `events()` sees more than lifecycle/notification/error
+records. It does this **without touching the kernel turn loop, BaseAgent, or
+Agent** — the bridge is built entirely from surfaces the kernel already exposes.
+
+### What it adds
+
+- **`RuntimeEvent.tool_call` / `.tool_result` / `.usage`** — three new
+  convenience constructors on the contract DTO (pure, no kernel import),
+  mirroring the existing `state` / `text` / `error` ones, so emission is tidy
+  and the event `data` shape is consistent.
+- **`_install_event_bridge(agent)`** — called from `start()` right after the
+  agent is built (when `bridge_events` is `True`, the default). It wraps the
+  agent's overridable hooks as **instance attributes** (shadowing the bound
+  methods on that one agent; the class and kernel source are untouched):
+  - `_on_tool_result_hook(name, args, result)` → emits a `TOOL_CALL` (name +
+    args) and a `TOOL_RESULT` (name + result), then calls the original and
+    **returns its value unchanged** — an intercepting host hook still
+    short-circuits the turn exactly as before.
+  - `_post_request(msg, result)` → `_emit_turn_result` emits a `TEXT` event for
+    non-empty `result['text']`, a non-fatal `ERROR` per entry in
+    `result['errors']`, and a `USAGE` event sampled from
+    `agent.get_token_usage()`.
+- **`_sample_agent_state()`** — the agent owns its life-state on its own loop
+  thread, so rather than splice a callback into that thread, `events()` samples
+  `agent._state` on each read and appends a `STATE` event only when the value
+  changed since the last read. `AgentState` is a `str` enum, so its `.value`
+  (or `str(...)` for a plain-string fake) is used.
+- **Thread-safety** — hooks fire on the agent's loop thread while a consumer
+  may be reading `events()` on another, so all event appends and the
+  last-sampled-state read/write are guarded by a per-session `threading.Lock`.
+- **`bridge_events` flag** — threaded `NativeRuntime` → `NativeRuntimeSession`,
+  default `True`. Set `False` to fall back to the stage-1 snapshot (lifecycle /
+  notification / error only). Missing hooks/accessors are tolerated via
+  `getattr` guards so a slimmer fake or future agent shape degrades gracefully.
+
+### What it deliberately is NOT
+
+This is a **minimal** bridge, not a streaming one. `events()` remains a
+non-blocking snapshot: there is no incremental token streaming, no
+async/await/generator that blocks until the next event, and no bridging of
+intra-turn provider chunks. The mapping is also lossy on purpose — it surfaces
+what the existing hooks and `_state` already expose, nothing more. Richer
+streaming surfaces remain deferred (and overlap with the non-native-backend
+work, doc §8 stage 5).
+
+### Out of scope (still deferred)
+
+- Incremental/streaming token events and a blocking `events()` iterator.
+- Bridging intra-turn provider message chunks (vs. the per-turn `_post_request`
+  summary used here).
+- Migrating `system` / `psyche` / `soul` into `BundleManifest` form.
+- A non-native (e.g. Anthropic) backend.
+- Any kernel turn-loop / BaseAgent / Agent change.
+
+### Tested without a model
+
+Stage-4 tests run with no API key and no running agent: a fake agent that
+*invokes* the wrapped hooks (the way the real turn loop would) stands in for the
+wrapper `Agent`, asserting the `TOOL_CALL`/`TOOL_RESULT`/`TEXT`/`USAGE`/`ERROR`/
+`STATE` mappings, intercept pass-through, state-change de-duplication, the
+`bridge_events=False` opt-out, and graceful degradation when an accessor is
+absent. One test borrows the genuine `BaseAgent._on_tool_result_hook` /
+`_post_request` implementations to pin the bridge to the real hook contract, and
+the new contract constructors are covered in
+`tests/test_sdk_runtime_contract.py` (`tests/test_sdk_native_runtime_events.py`).

@@ -43,6 +43,15 @@ def test_runtime_message_defaults_and_id():
     assert m.id.startswith("rtmsg_")
 
 
+def test_runtime_state_includes_native_agent_lifecycle_values():
+    assert rt.RuntimeState.ACTIVE.value == "active"
+    assert rt.RuntimeState.IDLE.value == "idle"
+    assert rt.RuntimeState.STUCK.value == "stuck"
+    assert rt.RuntimeState.ASLEEP.value == "asleep"
+    assert rt.RuntimeState.SUSPENDED.value == "suspended"
+    assert rt.RuntimeState.STOPPED.value == "stopped"
+
+
 def test_runtime_event_constructors():
     e = rt.RuntimeEvent.state(rt.RuntimeState.ACTIVE, source="native")
     assert e.kind is rt.EventKind.STATE
@@ -56,6 +65,24 @@ def test_runtime_event_constructors():
     err = rt.RuntimeEvent.error("boom", fatal=True)
     assert err.kind is rt.EventKind.ERROR
     assert err.data["error"] == "boom" and err.data["fatal"] is True
+
+
+def test_runtime_event_activity_constructors():
+    tc = rt.RuntimeEvent.tool_call("read_file", {"path": "a.txt"}, source="native")
+    assert tc.kind is rt.EventKind.TOOL_CALL
+    assert tc.data == {"name": "read_file", "args": {"path": "a.txt"}}
+    # args are copied, not aliased.
+    args = {"path": "b.txt"}
+    tc2 = rt.RuntimeEvent.tool_call("read_file", args)
+    args["path"] = "mutated"
+    assert tc2.data["args"] == {"path": "b.txt"}
+
+    tr = rt.RuntimeEvent.tool_result("read_file", {"ok": True}, source="native")
+    assert tr.kind is rt.EventKind.TOOL_RESULT
+    assert tr.data == {"name": "read_file", "result": {"ok": True}}
+
+    u = rt.RuntimeEvent.usage({"total_tokens": 7}, source="native")
+    assert u.kind is rt.EventKind.USAGE and u.data["total_tokens"] == 7
 
 
 def test_runtime_abc_not_instantiable():
