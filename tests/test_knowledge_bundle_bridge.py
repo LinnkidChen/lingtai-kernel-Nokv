@@ -97,6 +97,20 @@ def test_knowledge_manifest_actions_match_live_schema():
     assert declared == live == {"info"}
 
 
+def test_knowledge_manifest_schema_mirrors_live_get_schema():
+    """The declared SDK schema mirrors the *full* live ``get_schema`` shape.
+
+    Beyond the action enum, the bundled schema's property keys and ``required``
+    list must track the live wrapper, so an SDK declaration cannot silently drift
+    from the live core wrapper when the wrapper grows or renames a property.
+    (Descriptions are i18n'd live and intentionally not pinned.)
+    """
+    declared = kt.knowledge_catalog_manifest().metadata["schema"]
+    live = knowledgemod.get_schema()
+    assert set(declared["properties"]) == set(live["properties"])
+    assert declared["required"] == live["required"] == ["action"]
+
+
 # --- knowledge parity: the bundle path runs the real handler, byte-identical --
 
 

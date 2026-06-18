@@ -172,12 +172,47 @@ GuardCheck = Callable[[ToolProposal], GuardDecision | bool | None]
 
 
 class ToolCallGuard:
-    """Evaluate a chain of functional checks for a proposed tool call."""
+    """Evaluate a chain of functional checks for a proposed tool call.
+
+    Failure posture (read this before wiring a host-supplied check)
+    --------------------------------------------------------------
+    The guard subsystem is deliberately **fail-open at wiring/collection time but
+    fail-closed at check-evaluation time** — two different layers, two opposite
+    defaults:
+
+    * **Wiring / collection fails open.** Building the chain is best-effort: if a
+      manifest provider, registry, or guard construction raises while *assembling*
+      the guard, the wrapper wiring (:mod:`lingtai.guard_wiring`) swallows the
+      error and leaves a safe pass-through rather than blocking agent
+      construction. A guard that could not be built never gates a tool — an
+      undeclared / unknown tool always passes.
+
+    * **A check that raises during evaluation fails closed.** Once the chain is
+      assembled, :meth:`evaluate` treats an exception raised *by a check while
+      judging a proposal* as a **deny**, not as a skip: the offending check is
+      coerced via :meth:`_check_exception_decision` to a
+      :meth:`GuardDecision.deny` (carrying ``metadata["exception_type"]``) and the
+      proposed tool call is blocked. A host-supplied custom check that is itself
+      broken therefore denies the call it was judging rather than silently
+      allowing it — a buggy gatekeeper must not become an open gate.
+
+    Concretely: a guard that *fails to load* is absent (fail open); a guard that
+    *loads but throws while deciding* denies (fail closed). Hosts adding custom
+    checks should rely on this — a check need not catch its own exceptions to stay
+    safe, but it also cannot raise its way past the gate.
+    """
 
     def __init__(self, checks: Iterable[GuardCheck] | None = None) -> None:
         self._checks = list(checks or [])
 
     def evaluate(self, proposal: ToolProposal) -> GuardDecision:
+        """Run the check chain; a check that raises is coerced to a deny.
+
+        Short-circuits on the first denial. A check raising an exception is
+        **fail-closed**: it is turned into a deny (see the class docstring), so a
+        broken host-supplied check blocks the call it was judging rather than
+        letting it through.
+        """
         checks_payload: list[dict[str, Any]] = []
         strongest = GuardDecision.allow()
         for index, check in enumerate(self._checks):

@@ -1566,3 +1566,62 @@ through cleanly, caution/destructive declarations warn, and tools absent from th
 registry still fail open. Caller-supplied capability registries and the core-only
 compatibility helpers remain available, but the default live declared-set source
 is now one registry instead of hand-assembled core-only manifests.
+
+
+## 27. Phase 5 — post-merge hardening: end-to-end coverage record
+
+After the staged bundle declarations and default live guard wiring merged, this
+phase adds **hardening coverage** rather than new behavior. It records, in one
+place, the path the migration actually proves end to end today, and — honestly —
+the legs that remain deferred. No kernel turn-loop change, no non-native backend,
+no CLI assembly is introduced here.
+
+### The path covered end to end
+
+`message → event / native runtime → tool metadata / guard → safe core action`,
+verified across these existing real-seam tests (no mocks except the LLM service,
+the standard network-removal seam):
+
+- **message → event / native runtime.** `NativeRuntimeSession.send()` normalizes
+  a `str` / `RuntimeMessage`, routes it to the real `Agent.send()` inbox, and the
+  installed event bridge emits `RuntimeEvent`s (`TOOL_CALL` / `TOOL_RESULT` /
+  `TEXT` / `USAGE` / `STATE`) from the agent's real hooks. Covered by
+  `tests/test_sdk_native_runtime_events.py` (live event bridge) and
+  `tests/test_sdk_native_runtime_lifecycle.py` (boot-failure rollback, dirty-join,
+  `send()` error wrapping).
+- **tool metadata / guard → safe core action.** A real default `Agent` turns its
+  declared `system` core bundle into a source-labeled
+  `tool_call_approved.guard_advisory` when a real `system` tool call flows through
+  a real `ToolExecutor` built the way the turn loop builds it — and the call is
+  still **allowed** (advisory-first: warn, never block). An unmanifested
+  `add_tool` tool flows through cleanly with no advisory (fail open). Covered by
+  `tests/test_wrapper_guard_wiring.py::test_e2e_default_core_manifest_becomes_source_labeled_lifecycle_advisory`
+  and `…::test_e2e_unmanifested_tool_emits_no_guard_advisory`.
+- **guard failure posture.** Wiring/collection fails open
+  (`test_wrapper_guard_wiring.py::test_wire_agent_guard_fails_open_on_registry_error`);
+  a host-supplied custom check that *raises while judging a proposal* is coerced
+  to a deny (fail closed) — pinned directly on `ToolCallGuard.evaluate` by
+  `tests/test_tool_call_guard.py` and at the executor level by
+  `tests/test_tool_executor.py::test_tool_call_guard_check_exception_denies_without_crashing_parallel_batch`.
+  The dual posture is documented on `ToolCallGuard` itself (`src/lingtai_kernel/tool_call_guard.py`).
+- **SDK ↔ live wrapper schema parity.** Each wrapper bundle bridge test pins its
+  SDK declaration to the *live* core wrapper `get_schema()` — not a hardcoded
+  literal — so an SDK enum/property/`required` drift from the live wrapper is
+  caught: `test_bash_bundle_bridge.py`, `test_knowledge_bundle_bridge.py`,
+  `test_avatar_bundle_bridge.py`, `test_mcp_bundle_bridge.py`,
+  `test_skills_bundle_bridge.py` (`*_manifest_*_match_live_schema` /
+  `*_schema_mirrors_live_get_schema`).
+
+### Deliberately still deferred (NOT proven by this phase — honest scope)
+
+- **A non-native (e.g. Anthropic) backend.** The runtime path covered above runs
+  the existing native `Agent`; no non-native dispatch exists yet.
+- **CLI / backend assembly.** Nothing here selects a backend or assembles a
+  profile/template per the §7 observation entry; that remains follow-up work.
+- **Dispatch through the bundle host.** The guard reads bundle-declared *metadata*
+  (danger posture) before dispatch, but tool execution still flows through the
+  kernel `ToolExecutor` / intrinsic dispatch — not through a `BundleHost.invoke`
+  at runtime. The bundle-host parity tests prove the hosted path returns
+  byte-identical results, but the live turn loop does not yet route through it.
+- **Streaming events.** `events()` is a non-blocking snapshot; no incremental
+  token streaming (overlaps with the non-native-backend work).

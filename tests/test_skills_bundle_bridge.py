@@ -100,6 +100,19 @@ def test_skills_manifest_actions_match_live_schema():
     assert declared == live == {"info"}
 
 
+def test_skills_manifest_schema_mirrors_live_get_schema():
+    """The declared SDK schema mirrors the *full* live ``get_schema`` shape.
+
+    Property keys and ``required`` track the live wrapper so the SDK declaration
+    cannot silently drift from the live core wrapper. (Descriptions are live and
+    intentionally not pinned.)
+    """
+    declared = st.skills_catalog_manifest().metadata["schema"]
+    live = skillsmod.get_schema()
+    assert set(declared["properties"]) == set(live["properties"])
+    assert declared["required"] == live["required"] == ["action"]
+
+
 # --- skills parity: the bundle path runs the real handler, byte-identical -----
 
 
