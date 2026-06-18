@@ -26,6 +26,7 @@ class RuntimeState(str, enum.Enum):
     IDLE = "idle"
     ASLEEP = "asleep"
     STUCK = "stuck"
+    SUSPENDED = "suspended"
     STOPPED = "stopped"
 
 
@@ -105,6 +106,26 @@ class RuntimeEvent:
         cls, error: str, *, fatal: bool = False, source: str = ""
     ) -> "RuntimeEvent":
         return cls(EventKind.ERROR, {"error": error, "fatal": fatal}, source=source)
+
+    @classmethod
+    def tool_call(
+        cls, name: str, args: Mapping[str, Any], *, source: str = ""
+    ) -> "RuntimeEvent":
+        return cls(
+            EventKind.TOOL_CALL, {"name": name, "args": dict(args)}, source=source
+        )
+
+    @classmethod
+    def tool_result(
+        cls, name: str, result: Any, *, source: str = ""
+    ) -> "RuntimeEvent":
+        return cls(
+            EventKind.TOOL_RESULT, {"name": name, "result": result}, source=source
+        )
+
+    @classmethod
+    def usage(cls, usage: Mapping[str, Any], *, source: str = "") -> "RuntimeEvent":
+        return cls(EventKind.USAGE, dict(usage), source=source)
 
 
 class RuntimeSession(ABC):
