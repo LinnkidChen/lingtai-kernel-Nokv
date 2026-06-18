@@ -795,3 +795,111 @@ flags, danger, transport, and nested blocks cannot be silently mis-read, and
 (b) a privileged manifest can be hosted only by an explicitly-constructed native
 authority over a `native` transport. The migration itself — and any real
 privileged surface — remains future, higher-risk work.
+
+## 16. Stage 8 — core bundle manifests + a native adapter shim (stacked PR)
+
+Stage 8 is the **first deliberate contact** with the privileged core surfaces
+`system` / `psyche` / `soul` — but **only** as a manifest contract plus a
+stub-injection seam. It declares the three core bundles as `BundleManifest`s and
+adds a thin native adapter that hosts them from an *injected* handler. It
+migrates **no implementation**: it never imports, moves, rewrites, or calls the
+real `system` / `psyche` / `soul`, and it does not touch the kernel turn loop.
+This is the payoff of stage 7's strict-contract layer — the manifests are now
+declared against a contract that cannot be silently mis-read, and they can be
+hosted only by an explicitly-constructed native authority.
+
+### 16.1 The three core manifests
+
+A new import-pure module `lingtai_sdk.core_bundles` adds `system_bundle()`,
+`psyche_bundle()`, and `soul_bundle()`, each returning a `BundleManifest` with
+the identical privileged posture:
+
+- `required=True` — boots with every agent;
+- `privileged=True` + `native_only=True` — touches kernel-protected surfaces and
+  only the native runtime may host it;
+- `backend_replaceability=NATIVE_ONLY` — no non-native backend may re-implement it;
+- `transport.kind == native` — carried by the native runtime in-process;
+- `surfaces.tools == (name,)` — exactly the one public tool, named after the
+  bundle (`system` / `psyche` / `soul`), and no other surface.
+
+They differ only in declared `SecurityDanger` (the strict stage-7 allow-list),
+mirroring the real surfaces:
+
+- **`system` → `destructive`** — runtime inspection, lifecycle control,
+  synchronization, and inter-agent management; some actions irreversibly tear
+  down agent state. Highest risk.
+- **`psyche` → `caution`** — identity, pad, and context management (edit/load
+  identity and pad, molt, naming); context shedding has lasting effects.
+- **`soul` → `caution`** — the agent's inner voice (past-self consultation,
+  self-inquiry, flow/voice tuning); lower-risk than lifecycle or context
+  shedding, but `config` / `voice` persist preferences and therefore are not
+  read-only.
+
+Each manifest carries **helpful, non-secret** metadata only (`core`, a one-line
+`role` statement, and an `actions` list) — description, never an implementation.
+`core_bundle_manifests()` returns the three in stable order (`system`, `psyche`,
+`soul`); `core_bundle_names()` and `is_core_manifest()` are the matching
+helpers.
+
+### 16.2 The native adapter shim
+
+The shim turns a core manifest plus an *injected* callable into a hosted bundle,
+without ever calling the real core:
+
+- `native_core_host(manifest, handler)` builds a `capability_host.NativeBundleHost`
+  constructed with `native_authority=True`, hosting the bundle's single declared
+  tool with the supplied `handler`. It refuses a non-core manifest or a
+  non-callable handler with `BundleHostError`, then defers the manifest/handler
+  parity and the native-authority/`native`-transport rules to `NativeBundleHost`
+  itself (it never relaxes that contract).
+- `native_core_hosts(handlers)` builds `{name: NativeBundleHost}` for all three
+  core bundles from a `{name: callable}` mapping. A missing handler, or a handler
+  for a name that is not a core bundle, raises `BundleHostError` — so a partial
+  wiring can never boot a subset of the privileged core silently.
+
+The handler callables are whatever the native runtime *injects in a later stage*.
+This shim provides only the contract enforcement around a supplied callable.
+
+### What it deliberately is NOT
+
+- It does **not** migrate, move, rewrite, import, or call the existing `system` /
+  `psyche` / `soul` implementations. The handlers are injected; this stage ships
+  manifests + the injection seam only.
+- It does **not** change the kernel turn loop, `BaseAgent`, or `Agent`.
+- It does **not** export the core manifests or the adapter from the
+  `lingtai_sdk` package doorway — like the stage-5/7 host helpers, they live on
+  the `core_bundles` submodule, keeping the public surface minimal until a real
+  runtime wires them.
+- The non-native `BundleHost` still **refuses** every core bundle (they are all
+  privileged / native-only); only a native authority may host them.
+
+### Import purity
+
+`lingtai_sdk.core_bundles` is import-pure: it imports only the import-pure
+`.capabilities` / `.capability_host` / `.errors` siblings, so importing it (and
+declaring the core manifests) pulls in **no** `lingtai` wrapper module — i.e. the
+real `system` / `psyche` / `soul` is not migrated. Asserted by
+`tests/test_sdk_core_bundles.py::test_core_bundles_import_is_pure_and_migrates_nothing`.
+
+### Tested without a model
+
+Stage-8 tests need no API key and no running agent
+(`tests/test_sdk_core_bundles.py`), and use **dummy lambda handlers only** — no
+real core call. They assert: all three manifests carry the shared
+`required`/`privileged`/`native_only`/`NATIVE_ONLY`/`native` posture and declare
+exactly their one public tool; each validates strictly and round-trips through
+`load_manifest()`; the danger postures are `destructive`/`caution`/`caution` and all
+allow-listed; the ordering is stable; the non-native `BundleHost` refuses every
+core bundle; `native_core_host()` hosts a core bundle with an injected dummy
+(and refuses a non-core manifest or non-callable handler); `native_core_hosts()`
+builds all three and refuses a missing / undeclared / non-callable handler; every
+produced host is a `NativeBundleHost` (never an in-process `BundleHost`); and
+importing `core_bundles` migrates nothing (no `lingtai` module loaded).
+
+### Roadmap note
+
+This is the contract-and-seam half of the deferred core-bundle migration: the
+manifests now *exist* and can be hosted via an explicit native authority, but the
+privileged *behavior* is still deferred. A later, higher-risk stage supplies the
+real injected handlers from the native runtime and wires the hosted core bundles
+into a live turn loop.
