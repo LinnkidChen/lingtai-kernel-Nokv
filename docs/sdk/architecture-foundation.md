@@ -828,8 +828,10 @@ mirroring the real surfaces:
 - **`system` → `destructive`** — runtime inspection, lifecycle control,
   synchronization, and inter-agent management; some actions irreversibly tear
   down agent state. Highest risk.
-- **`psyche` → `caution`** — identity, pad, and context management (edit/load
-  identity and pad, molt, naming); context shedding has lasting effects.
+- **`psyche` → `destructive`** — identity, pad, and context management
+  (edit/load identity and pad, molt, naming); the surface includes the set-once
+  `name.set` true-name write, so bundle-level posture matches the strongest
+  irreversible sub-action.
 - **`soul` → `caution`** — the agent's inner voice (past-self consultation,
   self-inquiry, flow/voice tuning); lower-risk than lifecycle or context
   shedding, but `config` / `voice` persist preferences and therefore are not
@@ -888,7 +890,7 @@ Stage-8 tests need no API key and no running agent
 real core call. They assert: all three manifests carry the shared
 `required`/`privileged`/`native_only`/`NATIVE_ONLY`/`native` posture and declare
 exactly their one public tool; each validates strictly and round-trips through
-`load_manifest()`; the danger postures are `destructive`/`caution`/`caution` and all
+`load_manifest()`; the danger postures are `destructive`/`destructive`/`caution` and all
 allow-listed; the ordering is stable; the non-native `BundleHost` refuses every
 core bundle; `native_core_host()` hosts a core bundle with an injected dummy
 (and refuses a non-core manifest or non-callable handler); `native_core_hosts()`
@@ -1533,3 +1535,34 @@ handlers on a `BaseAgent` with a mock LLM service, using only side-effect-free
 actions: email `check`/`contacts` (empty mailbox), the reserved `unread` error, and
 unknown actions; daemon `list` (fresh run dir) and unknown actions. **No test sends
 real mail, sleeps, spawns, drives, or kills any process or subagent.**
+
+
+## 24. Stage 3K — canonical bundle registry + default live declared-set wiring
+
+After the per-domain tool-bundle declarations landed, the SDK had many local
+`<domain>_manifests()` aggregators but no single authoritative view over the
+whole declared set. Stage 3K adds that connective tissue:
+
+- `lingtai_sdk.bundle_registry` is import-pure and collects every declared SDK
+  `BundleManifest` exactly once in stable order: core → file read/query → file
+  mutation → communication/execution → tool-config/catalog → shell → avatar. Core
+  is sourced from `core_bundles`, not the lifecycle/psyche/soul re-export modules,
+  so `system` / `psyche` / `soul` are never double-counted.
+- `BundleRegistry` validates every manifest and indexes by bundle name and by
+  tool name. Duplicate bundle names or duplicate tool ownership raise
+  `BundleLoadError` immediately rather than silently last-writer-winning.
+- `DispatchTarget` records the owning bundle, manifest, and declared danger for a
+  tool name. This is a lookup/guard/router seam only; it holds no handler and does
+  not call any tool.
+- The package root exposes `BundleRegistry`, `DispatchTarget`,
+  `all_bundle_manifests`, and `default_registry` lazily through the SDK-internal
+  export table, preserving `import lingtai_sdk` wrapper/provider purity.
+
+The wrapper live guard wiring now consumes the canonical registry on its default
+path: `lingtai.guard_wiring.wire_agent_guard(agent)` installs an advisory
+`ToolCallGuard` from `default_registry().manifests()`. Because the live policy
+mode remains `ADVISORY`, this cannot block a tool call: safe declarations pass
+through cleanly, caution/destructive declarations warn, and tools absent from the
+registry still fail open. Caller-supplied capability registries and the core-only
+compatibility helpers remain available, but the default live declared-set source
+is now one registry instead of hand-assembled core-only manifests.

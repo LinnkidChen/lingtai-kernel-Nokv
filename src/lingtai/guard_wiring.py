@@ -16,13 +16,12 @@ Behaviour contract (deliberately advisory-first / fail-open)
   ``destructive`` tool is surfaced as a *warning*, never denied, in default live
   wiring. Blocking is reachable only by an explicit ``mode=`` opt-in and is never
   the wrapper default.
-* **Default agents get core advisories only.** The default capability→manifest
-  registry (:func:`default_manifest_registry`) is still empty, but Stage 20
-  default wiring also collects the always-present core manifests
-  (``system``/``psyche``/``soul``). Those declared core tools warn in advisory
-  mode; undeclared/MCP/add-tool surfaces remain pass-through.
+* **Default agents use the canonical SDK bundle registry.** Stage 3K adds a
+  name/tool-indexed registry over all declared SDK bundles; default live wiring
+  installs an advisory guard from that registry so every declared caution /
+  destructive surface warns consistently. Safe tools still pass through cleanly.
 * **Unknown / unmanifested tools fail open.** MCP tools, ``add_tool`` tools, and
-  any capability tool without a manifest are unknown to the bridge and pass
+  any tool without a declared SDK bundle are unknown to the bridge and pass
   through cleanly — this slice can only ever *add advisories* for explicitly
   declared surfaces, never block an undeclared tool.
 * **No lifecycle/system tool is blocked.** Because the live mode is advisory,
@@ -42,13 +41,8 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable
 
 from lingtai_kernel.tool_call_guard import ToolCallGuard
+from lingtai_sdk.bundle_registry import default_registry
 from lingtai_sdk.capabilities import BundleManifest
-from lingtai_sdk.core_bundles import (
-    core_bundle_names,
-    psyche_bundle,
-    soul_bundle,
-    system_bundle,
-)
 from lingtai_sdk.guard_bridge import (
     GuardPolicyMode,
     tool_call_guard_from_manifests,
@@ -73,6 +67,12 @@ ManifestRegistry = dict[str, ManifestProvider]
 #: tools warn, they are never blocked by default live wiring.
 DEFAULT_LIVE_GUARD_MODE: GuardPolicyMode = GuardPolicyMode.ADVISORY
 
+#: Core intrinsic bundle names, kept in the same stable order as
+#: ``lingtai_sdk.core_bundles.core_bundle_manifests()`` but sourced through the
+#: Stage-3K canonical registry below so live guard wiring has one declared-set
+#: source of truth.
+CORE_BUNDLE_NAMES: tuple[str, str, str] = ("system", "psyche", "soul")
+
 
 def default_manifest_registry() -> ManifestRegistry:
     """The default capability→manifest registry — still empty.
@@ -87,28 +87,18 @@ def default_manifest_registry() -> ManifestRegistry:
 
 
 def core_manifest_registry() -> ManifestRegistry:
-    """The populated core capability→manifest registry (Stage 20).
+    """The populated core capability→manifest registry.
 
-    Maps each of the three privileged core surfaces — ``system`` / ``psyche`` /
-    ``soul`` — to the SDK provider that returns its declared
-    :class:`~lingtai_sdk.capabilities.BundleManifest`
-    (:mod:`lingtai_sdk.core_bundles`). This is the actual registry *population*:
-    the providers are the real, evidence-based core danger postures
-    (``system`` → destructive, ``psyche`` / ``soul`` → caution).
-
-    This is deliberately a **separate, named** registry — NOT the capability
-    default registry. The core surfaces are kernel *intrinsics* (always present,
-    never listed in an agent's ``_capabilities``), so the capability-walk
-    collector (:func:`collect_agent_bundle_manifests`) never reaches them.
-    Stage 20 default live wiring therefore calls
-    :func:`collect_core_bundle_manifests` explicitly (unless ``include_core`` is
-    ``False``) to make the Stage-18 guard behaviour-active for real core tools
-    while preserving advisory-only/fail-open semantics.
+    Compatibility view over the Stage-3K canonical bundle registry, restricted to
+    the three privileged core surfaces (``system`` / ``psyche`` / ``soul``). The
+    core surfaces are kernel *intrinsics* (always present, never listed in an
+    agent's ``_capabilities``), so older callers that explicitly collect only the
+    core manifests can keep using this named registry while the default live path
+    now consumes :func:`collect_default_bundle_manifests`.
     """
     return {
-        "system": system_bundle,
-        "psyche": psyche_bundle,
-        "soul": soul_bundle,
+        name: (lambda name=name: default_registry().get(name))
+        for name in CORE_BUNDLE_NAMES
     }
 
 
@@ -135,7 +125,7 @@ def collect_core_bundle_manifests(
     if registry is None:
         registry = core_manifest_registry()
     manifests: list[BundleManifest] = []
-    for name in core_bundle_names():
+    for name in CORE_BUNDLE_NAMES:
         provider = registry.get(name)
         if provider is None:
             continue
@@ -248,6 +238,27 @@ def reset_bundle_guard(agent: Any) -> None:
     setattr(agent, PROVENANCE_SOURCE, ())
 
 
+def collect_default_bundle_manifests(agent: Any) -> list[BundleManifest]:
+    """Collect the full Stage-3K canonical declared SDK bundle set.
+
+    This is the default live registry/dispatch seam: every SDK-declared bundle
+    manifest is collected once through :func:`lingtai_sdk.bundle_registry.default_registry`,
+    then installed in advisory mode by :func:`wire_agent_guard`. It still migrates
+    no handlers and blocks nothing by default; the guard bridge treats ``safe``
+    tools as clean pass-through and turns ``caution`` / ``destructive`` tools into
+    warnings only.
+
+    Fail-open: if the registry ever raises (for example because a future manifest
+    introduced a duplicate name/tool), construction continues with no manifests
+    and a best-effort log entry rather than failing closed.
+    """
+    try:
+        return list(default_registry().manifests())
+    except Exception as exc:  # fail open — never block construction
+        _safe_log(agent, "guard_wiring_default_registry_failed", reason=str(exc))
+        return []
+
+
 def wire_agent_guard(
     agent: Any,
     *,
@@ -270,8 +281,8 @@ def wire_agent_guard(
       the capability walk alone never reaches them; this is the seam that makes
       the Stage-18 wiring *behaviour-active* on every agent instead of dormant;
     * installs an **advisory** guard (default ``mode``) onto the Stage-16 seam:
-      ``system`` (destructive) and ``psyche`` / ``soul`` (caution) become a
-      *warning*, never a denial. No lifecycle/system tool is blocked by default;
+      declared caution/destructive tools (including ``system`` and ``psyche``)
+      become a *warning*, never a denial. No lifecycle/system tool is blocked by default;
     * unknown / unmanifested tools (MCP, ``add_tool``, capability tools without a
       manifest) remain unknown to the bridge and fail open — this slice only ever
       *adds advisories* for the declared core surfaces;
@@ -294,13 +305,20 @@ def wire_agent_guard(
             # untouched rather than overwriting it with core advisories.
             _safe_log(agent, "guard_wiring_skipped_manual_guard")
             return
-        manifests = collect_agent_bundle_manifests(agent, registry=registry)
-        if include_core:
-            # Core surfaces are intrinsics (always present), not capabilities, so
-            # they are collected directly rather than via the capability walk.
-            core_manifests = collect_core_bundle_manifests(agent)
-            have = {m.name for m in manifests}
-            manifests.extend(m for m in core_manifests if m.name not in have)
+        if registry is None and include_core:
+            # Stage 3K default: install advisories from the canonical declared
+            # SDK bundle registry, not just the three core intrinsics. Safe
+            # declarations still pass through cleanly; caution/destructive
+            # declarations warn only because DEFAULT_LIVE_GUARD_MODE is advisory.
+            manifests = collect_default_bundle_manifests(agent)
+        else:
+            manifests = collect_agent_bundle_manifests(agent, registry=registry)
+            if include_core:
+                # Compatibility path for caller-supplied capability registries:
+                # still add the three core intrinsic manifests explicitly.
+                core_manifests = collect_core_bundle_manifests(agent)
+                have = {m.name for m in manifests}
+                manifests.extend(m for m in core_manifests if m.name not in have)
         if not manifests:
             # Nothing declared. Only reset a guard *this wrapper* previously
             # installed (provenance flag set); never clobber a host/subclass
@@ -359,9 +377,11 @@ __all__ = [
     "PROVENANCE_FLAG",
     "PROVENANCE_SOURCE",
     "default_manifest_registry",
+    "CORE_BUNDLE_NAMES",
     "core_manifest_registry",
     "collect_core_bundle_manifests",
     "collect_agent_bundle_manifests",
+    "collect_default_bundle_manifests",
     "install_bundle_guard",
     "reset_bundle_guard",
     "wire_agent_guard",

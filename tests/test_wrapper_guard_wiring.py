@@ -7,10 +7,10 @@ behaviour-visible but **advisory-first**:
 
 * default live wiring NEVER introduces a blocking denial — a manifest-declared
   ``destructive`` tool becomes a *warning*, not a block, in default live mode;
-* default agents get advisory-only core warnings for ``system``/``psyche``/
-  ``soul`` (Stage 20), while undeclared/non-core tools stay pass-through;
-* unknown / unmanifested tools (MCP, add_tool, capability tools without a
-  manifest) fail open — they are never blocked by this slice;
+* default agents use the Stage-3K canonical bundle registry, so every declared
+  caution/destructive SDK surface warns in default live mode;
+* safe declared tools and unknown / unmanifested tools (MCP, add_tool, custom
+  tools without a manifest) fail open — they are never blocked by this slice;
 * the installed guard is actually threaded through the Stage-16 seam to the
   ``ToolExecutor`` the turn loop builds;
 * no lifecycle/system tool is blocked by default wiring.
@@ -156,20 +156,24 @@ def test_wire_agent_guard_no_capability_manifests_and_no_core_is_pass_through():
 def test_wire_agent_guard_default_advises_core_tools_never_blocks():
     """Stage 20 behaviour-active default: a default-registry wiring still installs
     advisory guards for the always-present core surfaces. ``system`` (destructive)
-    and ``psyche``/``soul`` (caution) WARN, never deny — no lifecycle block."""
+    and ``psyche`` (destructive) / ``soul`` (caution) WARN, never deny — no lifecycle block."""
     agent = MagicMock()
     agent._tool_call_guard = ToolCallGuard()
     agent._capabilities = [("vision", {})]  # core surfaces are NOT capabilities
 
     gw.wire_agent_guard(agent)  # default registry, include_core defaults True
 
-    for tool, danger in (("system", "destructive"), ("psyche", "caution"), ("soul", "caution")):
+    for tool, danger in (("system", "destructive"), ("psyche", "destructive"), ("soul", "caution")):
         decision = agent._tool_call_guard.evaluate(_proposal(tool))
         assert decision.allowed is True, f"{tool} must never be blocked by default"
         assert decision.action == "warn"
         assert decision.metadata["danger"] == danger
         assert decision.metadata["policy_mode"] == "advisory"
-    # A non-core capability tool with no manifest still fails open.
+    # Stage 3K default registry also covers non-core declared bundles: destructive
+    # tools warn, safe tools pass through cleanly.
+    assert agent._tool_call_guard.evaluate(_proposal("bash")).action == "warn"
+    assert agent._tool_call_guard.evaluate(_proposal("read")).approval_mode == "pass_through"
+    # A truly unmanifested tool still fails open.
     assert agent._tool_call_guard.evaluate(_proposal("vision")).approval_mode == "pass_through"
 
 
@@ -253,8 +257,8 @@ def test_wire_agent_guard_fails_open_on_registry_error():
 
 def test_live_agent_default_construction_advises_core_but_never_blocks(tmp_path):
     """Stage 20: a real wrapper ``Agent`` built with the default registry owns an
-    *advisory* guard for the always-present core surfaces — ``psyche``/``soul``
-    warn (caution), ``system`` warns (destructive), and NONE is ever blocked.
+    *advisory* guard for the always-present core surfaces — ``system``/``psyche``
+    warn (destructive), ``soul`` warns (caution), and NONE is ever blocked.
     Unknown / non-core tools still fail open (pass-through)."""
     from lingtai.agent import Agent
 
@@ -266,11 +270,12 @@ def test_live_agent_default_construction_advises_core_but_never_blocks(tmp_path)
     )
     guard = agent._tool_call_guard
     assert isinstance(guard, ToolCallGuard)
-    for tool in ("system", "psyche", "soul"):
+    for tool in ("system", "psyche", "soul", "bash"):
         decision = guard.evaluate(_proposal(tool))
         assert decision.allowed is True, f"{tool} must never be blocked"
         assert decision.action == "warn"
-    # An unknown / non-core tool (e.g. an MCP or add_tool tool) fails open.
+    assert guard.evaluate(_proposal("read")).approval_mode == "pass_through"
+    # An unknown / custom add_tool-style tool fails open.
     unknown = guard.evaluate(_proposal("some_unmanifested_tool"))
     assert unknown.allowed is True
     assert unknown.approval_mode == "pass_through"
@@ -604,7 +609,7 @@ def test_wire_agent_guard_with_core_registry_advises_core_tools_never_blocks():
 
     for tool, expect_danger in (
         ("system", "destructive"),
-        ("psyche", "caution"),
+        ("psyche", "destructive"),
         ("soul", "caution"),
     ):
         decision = agent._tool_call_guard.evaluate(_proposal(tool))

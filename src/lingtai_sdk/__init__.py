@@ -84,6 +84,11 @@ _LAZY_SDK_EXPORTS: dict[str, tuple[str, str]] = {
     "RuntimeOptions": (".runtime", "RuntimeOptions"),
     "RuntimeSession": (".runtime", "RuntimeSession"),
     "RuntimeState": (".runtime", "RuntimeState"),
+    # Declared-bundle registry / dispatch-target seam (stage 3K; import-pure)
+    "BundleRegistry": (".bundle_registry", "BundleRegistry"),
+    "DispatchTarget": (".bundle_registry", "DispatchTarget"),
+    "all_bundle_manifests": (".bundle_registry", "all_bundle_manifests"),
+    "default_registry": (".bundle_registry", "default_registry"),
 }
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -111,6 +116,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         RuntimeOptions,
         RuntimeSession,
         RuntimeState,
+    )
+    from .bundle_registry import (  # noqa: F401
+        BundleRegistry,
+        DispatchTarget,
+        all_bundle_manifests,
+        default_registry,
     )
 
 
@@ -159,6 +170,11 @@ __all__ = [
     "RuntimeOptions",
     "RuntimeSession",
     "RuntimeState",
+    # Declared-bundle registry / dispatch-target seam (lazy, SDK-internal)
+    "BundleRegistry",
+    "DispatchTarget",
+    "all_bundle_manifests",
+    "default_registry",
     # Configuration / state / messaging
     "AgentConfig",
     "AgentState",
