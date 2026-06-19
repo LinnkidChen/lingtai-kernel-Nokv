@@ -30,6 +30,7 @@ src/lingtai/bin/
 
 # Local caches
 .cache/
+.library/
 
 # Environments
 .env

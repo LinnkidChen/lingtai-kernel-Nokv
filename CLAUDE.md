@@ -233,7 +233,7 @@ Base prompt (minimal — identity and general guidance only) → Sections (injec
 - All imports in the wrapper use `from lingtai.kernel.xxx import ...` for kernel types. The old top-level `lingtai_kernel` package was removed (hard cut) — never reintroduce it as an import path.
 - Repo housekeeping: durable public documentation belongs under `docs/` (or the
   relevant package/anatomy file) and should be tracked normally. Agent/session
-  scratch belongs under ignored `reports/`, `tmp/`, `.cache/`, or
-  `discussions/` paths and should not be uploaded. PR explainers are local
+  scratch belongs under ignored `reports/`, `tmp/`, `.cache/`, `.library/`,
+  or `discussions/` paths and should not be uploaded. PR explainers are local
   artifacts by default; promote only polished, long-lived outcomes into `docs/`
   with rationale.
