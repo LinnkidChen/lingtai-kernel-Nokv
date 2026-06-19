@@ -39,7 +39,7 @@ _HEAVY_PROVIDERS = (
 # bare ``import lingtai`` must not eagerly load any of these.
 _WRAPPER_SUBMODULES = (
     "lingtai.agent",
-    "lingtai.capabilities",
+    "lingtai.core.registry",
     "lingtai.core",
     "lingtai.llm",
     "lingtai.services",
@@ -106,10 +106,10 @@ def test_lazy_names_resolve_to_wrapper_objects():
     # ``from lingtai import Agent`` and ``from lingtai.agent import Agent`` agree.
     code = (
         "import lingtai\n"
-        "import lingtai.agent, lingtai.capabilities, lingtai.core.bash\n"
+        "import lingtai.agent, lingtai.core.registry, lingtai.core.bash\n"
         "import lingtai.services.vision, lingtai.services.websearch, lingtai.services.file_io\n"
         "assert lingtai.Agent is lingtai.agent.Agent\n"
-        "assert lingtai.setup_capability is lingtai.capabilities.setup_capability\n"
+        "assert lingtai.setup_capability is lingtai.core.registry.setup_capability\n"
         "assert lingtai.BashManager is lingtai.core.bash.BashManager\n"
         "assert lingtai.VisionService is lingtai.services.vision.VisionService\n"
         "assert lingtai.SearchService is lingtai.services.websearch.SearchService\n"

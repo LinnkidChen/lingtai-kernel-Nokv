@@ -109,7 +109,7 @@ daemon/run_dir.py
 - `BaseAgent._enqueue_system_notification` — compact daemon completion/failure events
 - `lingtai.kernel.token_ledger` — `append_token_entry` for token accounting
 - `lingtai.i18n` — `t()` for localized strings
-- `lingtai.capabilities` — `setup_capability`, `_GROUPS` for preset sandbox instantiation
+- `lingtai.core.registry` — `setup_capability`, `_GROUPS`, `_BUILTIN` for preset sandbox instantiation
 - `lingtai.kernel.presets` — `load_preset`, `expand_inherit` for per-emanation preset resolution
 - `lingtai.kernel.preset_connectivity` — `check_connectivity` for LLM reachability pre-flight
 - `lingtai.kernel.config_resolve` — `resolve_env` for API key resolution

@@ -22,8 +22,8 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 - **→ `lingtai.kernel.logging.get_logger`** (mcp.py:16) — structured logging.
 - **→ `lingtai.kernel.services.mail`** (mail.py:2) — pure re-export of kernel mail types.
 - **→ `mcp.client.stdio`**, **`mcp.client.streamable_http`**, **`mcp.client.session`** (mcp.py:224, 406-407) — third-party MCP SDK. Imported lazily inside async connect methods.
-- **← `lingtai.capabilities.vision`** — uses `services.vision.VisionService`.
-- **← `lingtai.capabilities.web_search`** — uses `services.websearch.SearchService`.
+- **← `lingtai.core.vision`** — uses `services.vision.VisionService`.
+- **← `lingtai.core.web_search`** — uses `services.websearch.SearchService`.
 - **← `lingtai.core.*`** — read/write/edit/glob/grep use `FileIOService`.
 
 ## Composition

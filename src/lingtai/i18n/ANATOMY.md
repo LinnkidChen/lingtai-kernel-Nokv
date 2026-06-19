@@ -20,7 +20,7 @@ Wrapper-side i18n loader — language-aware string tables for lingtai capabiliti
 ## Connections
 
 - **→ `lingtai.kernel.i18n`** (L46): `register_strings()` — pushes kernel-namespace keys from lingtai tables into kernel's cache. This is how lingtai ships `wen.json` translations for kernel-level strings.
-- **← `lingtai.capabilities.vision`** (vision:21), **`lingtai.capabilities.web_search`** (web_search:14): both import `t` for i18n of tool descriptions/schemas.
+- **← `lingtai.core.vision`** (vision:21), **`lingtai.core.web_search`** (web_search:14): both import `t` for i18n of tool descriptions/schemas.
 - **← `lingtai.services.vision.*`**, **`lingtai.services.websearch.*`**: capabilities use `t()` for user-facing strings.
 
 ## Composition

@@ -42,7 +42,7 @@ def load_init(working_dir: Path) -> dict:
     """
     from lingtai.kernel.config_resolve import resolve_paths
     from lingtai.kernel.presets import materialize_active_preset
-    from lingtai.capabilities import CORE_DEFAULTS
+    from lingtai.core.registry import CORE_DEFAULTS
 
     from lingtai.kernel.migrate import run_agent_migrations
 
@@ -332,7 +332,7 @@ def main(*, prog: str = "lingtai-agent") -> None:
             sys.exit(1)
         run(working_dir)
     elif args.command == "check-caps":
-        from lingtai.capabilities import get_all_providers
+        from lingtai.core.registry import get_all_providers
         print(json.dumps(get_all_providers()))
     elif args.command == "log":
         _handle_log_command(args)

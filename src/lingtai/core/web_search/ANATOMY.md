@@ -1,4 +1,4 @@
-# src/lingtai/capabilities/web_search/
+# src/lingtai/core/web_search/
 
 Web search capability — web lookup via pluggable SearchService backends.
 
@@ -19,10 +19,10 @@ Web search capability — web lookup via pluggable SearchService backends.
 
 - **→ `lingtai.i18n.t`** (L14) — i18n for tool description and schema strings.
 - **→ `lingtai.services.websearch.SearchService`** (L15) — abstract service interface + `create_search_service()` factory.
-- **→ `capabilities._media_host.resolve_media_host`** (L110) — injected for non-duckduckgo providers.
-- **→ `capabilities._zhipu_mode.resolve_z_ai_mode`** (L113) — injected for `zhipu` provider.
+- **→ `lingtai.core._media_host.resolve_media_host`** (L110) — injected for non-duckduckgo providers.
+- **→ `lingtai.core._zhipu_mode.resolve_z_ai_mode`** (L113) — injected for `zhipu` provider.
 - **→ `lingtai.kernel.base_agent.BaseAgent`** — type-only (L18).
-- **← `capabilities.__init__`** — registered as `".web_search"` in `_BUILTIN`.
+- **← `lingtai.core.registry`** — registered as `".web_search"` in `_BUILTIN`.
 
 ## Composition
 

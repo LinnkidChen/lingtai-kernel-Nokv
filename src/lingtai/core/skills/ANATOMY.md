@@ -9,7 +9,7 @@ Skills capability — per-agent skill catalog and skill-manual surface. This is 
 
 ## Connections
 
-- `lingtai.capabilities` maps canonical `skills` here. Former skill-catalog `library.paths` compatibility is removed in the clean rename.
+- `lingtai.core.registry` maps canonical `skills` here. Former skill-catalog `library.paths` compatibility is removed in the clean rename.
 - `Agent._install_intrinsic_manuals()` copies every capability `manual/` bundle into `.library/intrinsic/capabilities/<name>/`, then re-runs `skills._reconcile()` for first-turn catalog freshness when `skills` is loaded (`../../agent.py:158-229`).
 - The daemon capability blacklists `skills` so emanations do not recursively receive the skill catalog tool (`../daemon/__init__.py:34`).
 - `lingtai.core.skills_bundle` (the wrapper-side SDK bundle bridge, stage 3G) injects `make_handler(agent, paths)` into the `lingtai_sdk.skill_tools` catalog bundle host. Additive only — `setup()` remains the live registration path; the bridge installs no guard and changes no dispatch.

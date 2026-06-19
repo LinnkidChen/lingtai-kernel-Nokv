@@ -3,10 +3,7 @@
 When a capability's resolved provider isn't in its supported list, it should
 either fall back to its declared agnostic fallback or silently skip
 registration. Never raise."""
-import logging
 from unittest.mock import MagicMock
-
-import pytest
 
 
 def _stub_agent(language: str = "en"):
@@ -34,7 +31,7 @@ def _stub_agent(language: str = "en"):
 
 def test_web_search_unknown_provider_falls_back_to_duckduckgo():
     """web_search with provider='deepseek' (unknown) falls back to duckduckgo."""
-    from lingtai.capabilities.web_search import setup as ws_setup
+    from lingtai.core.web_search import setup as ws_setup
     a = _stub_agent()
     # Pretend agent's main LLM is deepseek (which has no web search service)
     ws_setup(a, provider="deepseek", api_key=None)
@@ -44,9 +41,9 @@ def test_web_search_unknown_provider_falls_back_to_duckduckgo():
 
 def test_vision_unknown_provider_silently_skips():
     """vision with provider='deepseek' (no vision, no fallback) skips registration."""
-    from lingtai.capabilities.vision import setup as vision_setup
+    from lingtai.core.vision import setup as vision_setup
     a = _stub_agent()
-    result = vision_setup(a, provider="deepseek", api_key=None, api_key_env="X")
+    vision_setup(a, provider="deepseek", api_key=None, api_key_env="X")
     assert "vision" not in a._tool_handlers
     events = [e for e, _ in a._log_events]
     assert "capability_skipped" in events
@@ -55,7 +52,7 @@ def test_vision_unknown_provider_silently_skips():
 def test_web_search_supported_provider_uses_it(monkeypatch):
     """web_search with provider='gemini' (supported) uses gemini, no fallback."""
     monkeypatch.setenv("GEMINI_API_KEY", "sk-test")
-    from lingtai.capabilities.web_search import setup as ws_setup
+    from lingtai.core.web_search import setup as ws_setup
     a = _stub_agent()
     ws_setup(a, provider="gemini", api_key="sk-test")
     assert "web_search" in a._tool_handlers
@@ -63,7 +60,7 @@ def test_web_search_supported_provider_uses_it(monkeypatch):
 
 def test_web_search_no_provider_uses_duckduckgo():
     """web_search with no provider arg defaults to duckduckgo (existing behavior)."""
-    from lingtai.capabilities.web_search import setup as ws_setup
+    from lingtai.core.web_search import setup as ws_setup
     a = _stub_agent()
     ws_setup(a)
     assert "web_search" in a._tool_handlers

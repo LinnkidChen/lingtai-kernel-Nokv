@@ -22,7 +22,7 @@ the regular `read` tool.
 
 ## Connections
 
-- `lingtai.capabilities` maps builtin capability name `knowledge` here. Former
+- `lingtai.core.registry` maps builtin capability name `knowledge` here. Former
   `library` and `codex` capability names are not registered.
 - `setup()` registers exactly one tool, `knowledge`, with a single `info`
   action. The historical `knowledge_limit` kwarg is accepted and ignored.

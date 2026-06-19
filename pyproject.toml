@@ -66,8 +66,6 @@ lingtai = [
     "mcp_catalog.json",
     "core/*/*.json",
     "core/*/manual/**/*",
-    "capabilities/*/*.json",
-    "capabilities/*/manual/**/*",
     "intrinsic_skills/*/**/*",
     "prompts/*.md",
     # Rust sidecar binary bundled at build time by setup.py — present in

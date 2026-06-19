@@ -8,7 +8,7 @@ must not appear in sys.modules" invariant no longer holds. The invariant that
 DOES still hold, and is the architectural constraint worth enforcing, is:
 
   - the kernel's own package tree never imports a *wrapper* submodule
-    (``lingtai.agent``, ``lingtai.capabilities``, ``lingtai.core``,
+    (``lingtai.agent``, ``lingtai.core`` (incl. the capability registry),
     ``lingtai.llm`` adapters, ``lingtai.services``), and
   - importing ``lingtai.kernel`` does not eagerly pull any of those wrapper
     submodules into ``sys.modules``.
@@ -28,7 +28,6 @@ from pathlib import Path
 # allowed; everything below is the batteries-included layer.
 _WRAPPER_SUBMODULES = (
     "lingtai.agent",
-    "lingtai.capabilities",
     "lingtai.core",
     "lingtai.llm",
     "lingtai.services",

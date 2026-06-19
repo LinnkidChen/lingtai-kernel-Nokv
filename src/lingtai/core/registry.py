@@ -1,4 +1,10 @@
-"""Composable agent capabilities — add via Agent(capabilities=[...])."""
+"""Composable agent capabilities — add via Agent(capabilities=[...]).
+
+The registry, normalization, and setup dispatcher live here in ``lingtai.core``.
+Both the always-on floor (``knowledge``, ``skills``, file tools, …) and the
+opt-in multimodal capabilities (``vision``, ``web_search``) are sibling modules
+under ``lingtai.core``.
+"""
 from __future__ import annotations
 
 import importlib
@@ -8,10 +14,9 @@ if TYPE_CHECKING:
     from lingtai.kernel.base_agent import BaseAgent
 
 # Registry of built-in capability names → module paths.
-# Entries starting with "." are relative to this package (lingtai.capabilities);
-# absolute paths point at lingtai.core (the always-on agent floor). Both forms
-# work because importlib.import_module honors the `package=` kwarg only for
-# relative names.
+# Entries starting with "." are relative to this package (lingtai.core);
+# absolute paths also point at lingtai.core. Both forms work because
+# importlib.import_module honors the `package=` kwarg only for relative names.
 _BUILTIN: dict[str, str] = {
     # Always-on floor (lingtai.core)
     "knowledge": "lingtai.core.knowledge",
@@ -25,7 +30,7 @@ _BUILTIN: dict[str, str] = {
     "edit": "lingtai.core.edit",
     "glob": "lingtai.core.glob",
     "grep": "lingtai.core.grep",
-    # Optional/multimodal capabilities (this package)
+    # Optional/multimodal capabilities (sibling modules under lingtai.core)
     "vision": ".vision",
     "web_search": ".web_search",
 }

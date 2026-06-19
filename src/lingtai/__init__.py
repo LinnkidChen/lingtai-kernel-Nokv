@@ -47,7 +47,7 @@ from lingtai.kernel.services.logging import LoggingService, JSONLLoggingService
 # their heavy deps stay out of a bare ``import lingtai``.
 _LAZY_WRAPPER_EXPORTS: dict[str, tuple[str, str]] = {
     "Agent": (".agent", "Agent"),
-    "setup_capability": (".capabilities", "setup_capability"),
+    "setup_capability": (".core.registry", "setup_capability"),
     "BashManager": (".core.bash", "BashManager"),
     "AvatarManager": (".core.avatar", "AvatarManager"),
     # services.file_io
@@ -74,7 +74,7 @@ _LAZY_WRAPPER_EXPORTS: dict[str, tuple[str, str]] = {
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .agent import Agent  # noqa: F401
-    from .capabilities import setup_capability  # noqa: F401
+    from .core.registry import setup_capability  # noqa: F401
     from .core.bash import BashManager  # noqa: F401
     from .core.avatar import AvatarManager  # noqa: F401
     from .services.file_io import (  # noqa: F401

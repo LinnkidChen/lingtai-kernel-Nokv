@@ -61,11 +61,11 @@ class Agent(BaseAgent):
 
         # Expand groups and normalize to dict
         if isinstance(capabilities, list):
-            from .capabilities import expand_groups, normalize_capabilities
+            from .core.registry import expand_groups, normalize_capabilities
             expanded = expand_groups(capabilities)
             capabilities = normalize_capabilities({name: {} for name in expanded})
         elif isinstance(capabilities, dict):
-            from .capabilities import _GROUPS, normalize_capabilities
+            from .core.registry import _GROUPS, normalize_capabilities
             expanded_dict: dict[str, dict] = {}
             for name, cap_kwargs in capabilities.items():
                 if name in _GROUPS:
@@ -86,7 +86,7 @@ class Agent(BaseAgent):
         # Apply core defaults — the `lingtai.core.*` floor boots on every agent
         # unless explicitly disabled via `disable=[...]` or `"name": null` in
         # the capabilities dict. init.json kwargs override default kwargs.
-        from .capabilities import apply_core_defaults
+        from .core.registry import apply_core_defaults
         capabilities = apply_core_defaults(capabilities, disable=disable)
 
         # Track for avatar replay
@@ -181,7 +181,7 @@ class Agent(BaseAgent):
         Not directly sealed — but setup() calls add_tool() which checks the seal.
         Must only be called from __init__ (before start()).
         """
-        from .capabilities import setup_capability
+        from .core.registry import setup_capability
 
         serializable_kw = {
             k: v for k, v in kwargs.items()
@@ -210,7 +210,6 @@ class Agent(BaseAgent):
         Never touches ``.library/custom/``. That is the agent's territory.
         """
         import shutil
-        import lingtai.capabilities as caps_pkg
         import lingtai.core as core_pkg
         import lingtai.intrinsic_skills as skills_pkg
 
@@ -251,10 +250,10 @@ class Agent(BaseAgent):
                     continue
                 shutil.copytree(entry, intrinsic_dir / subdir / entry.name)
 
-        # core/ and capabilities/ both install into intrinsic/capabilities/ —
-        # agents see one flat capability namespace.
+        # core/ capabilities install into intrinsic/capabilities/ — agents see
+        # one flat capability namespace. (The standalone intrinsic_skills/ bundles
+        # install alongside them.)
         install_from(core_pkg, "capabilities")
-        install_from(caps_pkg, "capabilities")
         install_skills_from(skills_pkg, "capabilities")
 
         # If the skills capability is loaded, re-run its reconcile now that
@@ -925,7 +924,7 @@ class Agent(BaseAgent):
         from lingtai.kernel.config_resolve import resolve_paths
         from lingtai.kernel.migrate import run_agent_migrations
         from lingtai.kernel.presets import expand_inherit, materialize_active_preset
-        from .capabilities import CORE_DEFAULTS
+        from .core.registry import CORE_DEFAULTS
 
         run_agent_migrations(self._working_dir)
 
@@ -1246,7 +1245,7 @@ class Agent(BaseAgent):
         # Preserve null sentinels through env-resolution (it converts None to {}).
         null_outs = {n for n, v in raw_caps.items() if v is None}
 
-        from .capabilities import (
+        from .core.registry import (
             _GROUPS,
             apply_core_defaults,
             normalize_capabilities,

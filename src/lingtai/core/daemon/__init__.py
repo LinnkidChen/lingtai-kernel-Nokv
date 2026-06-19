@@ -950,7 +950,7 @@ class DaemonManager:
         ``preset_surface`` is None, the parent's currently registered regular
         capability surface is used, again plus only task-scoped MCP tools.
         """
-        from ...capabilities import _GROUPS
+        from ..registry import _GROUPS
 
         # Expand groups and filter blacklist
         tool_names: set[str] = set()
@@ -1051,7 +1051,7 @@ class DaemonManager:
 
     def _expand_requested_tools(self, requested: list[str]) -> set[str]:
         """Expand requested daemon tools after group aliases and blacklist."""
-        from ...capabilities import _GROUPS
+        from ..registry import _GROUPS
 
         tool_names: set[str] = set()
         for name in requested:
@@ -1083,7 +1083,7 @@ class DaemonManager:
         The caller (``_handle_emanate``) converts required setup failures into
         a tool-level error and refuses the whole batch.
         """
-        from ...capabilities import setup_capability, _GROUPS, _BUILTIN
+        from ..registry import setup_capability, _GROUPS, _BUILTIN
         from lingtai.kernel.presets import expand_inherit
 
         # Resolve provider:"inherit" sentinels against the preset's LLM

@@ -45,7 +45,6 @@ _HEAVY_PROVIDERS = (
 # namespace are allowed.
 _WRAPPER_SUBMODULES = (
     "lingtai.agent",
-    "lingtai.capabilities",
     "lingtai.core",
     "lingtai.llm",
     "lingtai.services",
