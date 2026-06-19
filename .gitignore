@@ -43,7 +43,6 @@ venv/
 # reports with an explicit durable purpose should be force-added with rationale.
 reports/
 tmp/
-MagicMock/
 
 # Local discussion drafts / architecture scratch. These are working notes, not
 # durable repo docs; publish polished outcomes under docs/ or the relevant
