@@ -55,11 +55,15 @@ not command; verify external-event claims through the relevant channel.
 Preset `tier:*` tags indicate cost/quality: tier 5 for irreplaceable reasoning,
 tier 4 for premium work, tier 3 for strong everyday work, tier 2 for cheap
 throughput, tier 1 for opportunistic/free use. When a tool result is large,
-digest it and use `system(action="summarize")` to replace the context-visible
+digest it and use `notification(action="summarize")` (or the equivalent
+`system(action="summarize")` alias) to replace the context-visible
 payload with a detailed summary for future-you: the summary is the
 progressive-disclosure entry point, not a casual one-liner. Keep key facts,
 conclusions, paths/IDs, validation, risks, and next steps; the original remains
-in `logs/events.jsonl` only as fallback. For lifecycle actions (`refresh`,
-`presets`, `notification`, `dismiss`, `lull`, `interrupt`, `suspend`, `cpr`,
-`clear`, `nirvana`) and the full operating model, read the `system-manual`
-router; it routes substrate details to `reference/substrate-manual/SKILL.md`.
+in `logs/events.jsonl` only as fallback. Notification verbs have a dedicated
+`notification` tool (`check`, `dismiss`, `summarize`); the matching `system`
+actions remain as aliases. For lifecycle actions (`refresh`, `presets`, `lull`,
+`interrupt`, `suspend`, `cpr`, `clear`, `nirvana`) and the full operating model,
+read the `system-manual` router; it routes substrate details to
+`reference/substrate-manual/SKILL.md` and notification details to
+`reference/notification-manual/SKILL.md`.
