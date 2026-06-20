@@ -178,6 +178,39 @@ def _claude_code_env() -> dict[str, str]:
     return env
 
 
+def _normalize_claude_usage(usage: dict | None) -> dict | None:
+    """Normalize a Claude Code stream-json ``usage`` block to UI totals.
+
+    Claude Code's final ``result`` event carries a ``usage`` block like::
+
+        {"input_tokens": 6950, "cache_creation_input_tokens": 3068,
+         "cache_read_input_tokens": 15621, "output_tokens": 4, ...}
+
+    Returns ``{"input", "output", "cached", "thinking"}`` with::
+
+        cached = cache_read_input_tokens + cache_creation_input_tokens
+
+    ``thinking`` is 0 — Claude Code does not surface a separate thinking-token
+    count in this block. Returns ``None`` if ``usage`` is missing/not a dict or
+    carries no countable tokens, so callers can skip persistence cleanly.
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    def _int(value) -> int:
+        return value if isinstance(value, int) else 0
+
+    input_tokens = _int(usage.get("input_tokens"))
+    output_tokens = _int(usage.get("output_tokens"))
+    cached = (_int(usage.get("cache_read_input_tokens"))
+              + _int(usage.get("cache_creation_input_tokens")))
+    thinking = 0
+    if not (input_tokens or output_tokens or cached or thinking):
+        return None
+    return {"input": input_tokens, "output": output_tokens,
+            "cached": cached, "thinking": thinking}
+
+
 # Safe CLI option key: letters/digits with '-' or '_' separators. No leading
 # '-' (the helper adds '--' itself). No spaces, no shell metachars — argv is
 # passed as a list to subprocess, but we still refuse anything that doesn't
@@ -1510,6 +1543,10 @@ class DaemonManager:
         semantics don't map cleanly onto the kernel's LLM-adapter
         accounting. Mixing them into ``sum_token_ledger`` would
         produce a misleading "lifetime totals" number for the parent.
+        The final ``result`` event's ``usage`` is instead persisted to
+        ``daemon.json.cli_tokens`` via ``record_cli_tokens`` — UI-only,
+        never touching either token ledger — so the TUI ``/daemons``
+        view can still surface what the CLI run cost.
 
         Falls back to the legacy JSONL scan if no ``session_id`` ever
         appears in the stream.
@@ -1633,8 +1670,10 @@ class DaemonManager:
             # read/write semantics differ from the kernel's LLM adapters)
             # and create a misleading "lifetime totals" number. Spend
             # remains visible to the agent via daemon(check) — the
-            # `last_output` field, cli_output events, and stderr — but
-            # not in sum_token_ledger.
+            # `last_output` field, cli_output events, and stderr — and,
+            # for UI display, the final result event's usage is persisted
+            # separately to daemon.json.cli_tokens (see the result-event
+            # handler below). Neither path touches sum_token_ledger.
 
         def _handle_user_event(event: dict) -> None:
             # User events in stream-json mode carry tool_result blocks back
@@ -1689,6 +1728,24 @@ class DaemonManager:
                 elif etype == "result":
                     final_result_text = event.get("result") or ""
                     final_is_error = bool(event.get("is_error"))
+                    # Persist Claude Code's reported token usage for UI
+                    # display only. This goes to daemon.json.cli_tokens via
+                    # record_cli_tokens — NOT to append_tokens — so the
+                    # parent/daemon token ledgers stay free of external CLI
+                    # billing (whose cache semantics don't match the kernel
+                    # adapter accounting). See the note in this method's
+                    # docstring and run_dir.record_cli_tokens.
+                    usage = _normalize_claude_usage(event.get("usage"))
+                    if usage is not None:
+                        try:
+                            run_dir.record_cli_tokens(
+                                input=usage["input"], output=usage["output"],
+                                cached=usage["cached"],
+                                thinking=usage["thinking"],
+                                raw=event.get("usage"),
+                            )
+                        except Exception:
+                            pass
                     # If there are still tool_use blocks pending without
                     # a matching tool_result (shouldn't happen on success,
                     # but be defensive), clear them so daemon.json's
@@ -3315,6 +3372,20 @@ class DaemonManager:
                 elif etype == "result":
                     final_result_text = event.get("result") or ""
                     final_is_error = bool(event.get("is_error"))
+                    # Accumulate the follow-up's token usage into
+                    # daemon.json.cli_tokens for UI display — same UI-only,
+                    # never-ledger policy as the initial emanation run.
+                    usage = _normalize_claude_usage(event.get("usage"))
+                    if usage is not None:
+                        try:
+                            run_dir.record_cli_tokens(
+                                input=usage["input"], output=usage["output"],
+                                cached=usage["cached"],
+                                thinking=usage["thinking"],
+                                raw=event.get("usage"),
+                            )
+                        except Exception:
+                            pass
 
             if time.monotonic() >= deadline:
                 timed_out = True
