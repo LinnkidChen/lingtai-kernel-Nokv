@@ -360,6 +360,73 @@ def test_summing_parent_ledger_includes_daemon_spend(tmp_path):
     assert totals["api_calls"] == 2
 
 
+def test_initial_daemon_json_has_zeroed_cli_tokens(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"] == {
+        "input": 0, "output": 0, "thinking": 0, "cached": 0, "calls": 0,
+    }
+
+
+def test_record_cli_tokens_accumulates_in_daemon_json(tmp_path):
+    rd = _make_run_dir(tmp_path, backend="claude-p")
+    rd.record_cli_tokens(input=6950, output=4, cached=18689, thinking=0)
+    rd.record_cli_tokens(input=100, output=50, cached=200, thinking=0)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"] == {
+        "input": 7050, "output": 54, "thinking": 0, "cached": 18889, "calls": 2,
+    }
+
+
+def test_record_cli_tokens_does_not_touch_token_ledgers(tmp_path):
+    """CLI usage is UI-only — neither the daemon's nor the parent's ledger sees it."""
+    rd = _make_run_dir(tmp_path)
+    rd.record_cli_tokens(input=6950, output=4, cached=18689, thinking=0)
+    assert not rd.token_ledger_path.exists()
+    parent_ledger = tmp_path / "parent" / "logs" / "token_ledger.jsonl"
+    assert not parent_ledger.exists()
+    # The kernel `tokens` running totals stay zero too.
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["tokens"] == {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+
+
+def test_record_cli_tokens_backfills_missing_cli_tokens_for_old_state(tmp_path):
+    """Follow-up usage on a pre-upgrade run_dir should not crash."""
+    rd = _make_run_dir(tmp_path)
+    rd._state.pop("cli_tokens")
+    rd._atomic_write_json(rd.daemon_json_path, rd._state)
+    rd.record_cli_tokens(input=3, output=2, cached=1, thinking=0)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"] == {
+        "input": 3, "output": 2, "thinking": 0, "cached": 1, "calls": 1,
+    }
+
+
+def test_record_cli_tokens_logs_cli_usage_event_with_raw(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    raw = {"input_tokens": 6950, "cache_read_input_tokens": 15621,
+           "cache_creation_input_tokens": 3068, "output_tokens": 4}
+    rd.record_cli_tokens(input=6950, output=4, cached=18689, thinking=0, raw=raw)
+    last = json.loads(rd.events_path.read_text().splitlines()[-1])
+    assert last["event"] == "cli_usage"
+    assert last["input"] == 6950
+    assert last["output"] == 4
+    assert last["cached"] == 18689
+    assert last["thinking"] == 0
+    assert last["raw"] == raw
+    assert "ts" in last
+
+
+def test_record_cli_tokens_skips_write_when_all_zero(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    before = rd.events_path.read_text()
+    rd.record_cli_tokens(input=0, output=0, cached=0, thinking=0)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"]["calls"] == 0
+    # No cli_usage event appended when there is nothing to count.
+    assert rd.events_path.read_text() == before
+
+
 def test_mark_done_writes_terminal_state(tmp_path):
     rd = _make_run_dir(tmp_path)
     rd.mark_done("Task done. Found 3 TODOs.")

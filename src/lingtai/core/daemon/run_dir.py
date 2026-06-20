@@ -28,7 +28,7 @@ class DaemonRunDir:
             .heartbeat                   # mtime-touched on activity
             history/chat_history.jsonl   # session transcript
             logs/token_ledger.jsonl      # per-call tokens, daemon-scoped
-            logs/events.jsonl            # tool_call, tool_result, cli_output, daemon_*
+            logs/events.jsonl            # tool_call, tool_result, cli_output, cli_usage, daemon_*
             result.txt                   # full terminal result when available
     """
 
@@ -98,6 +98,13 @@ class DaemonRunDir:
             "current_tool": None,
             "tool_call_count": 0,
             "tokens": {"input": 0, "output": 0, "thinking": 0, "cached": 0},
+            # CLI-backend usage (claude-p / codex / ...) is accumulated here
+            # for UI display only — NOT in `tokens` (which feeds the kernel
+            # token ledgers). External CLIs bill on their own provider account
+            # with cache semantics that don't map onto the adapter accounting,
+            # so this lives separate. `calls` increments once per usage event.
+            "cli_tokens": {"input": 0, "output": 0, "thinking": 0,
+                           "cached": 0, "calls": 0},
             "result_preview": None,
             "result_path": None,
             "last_output": None,
@@ -442,6 +449,69 @@ class DaemonRunDir:
                        "run_id": self._run_id},
             ),
         )
+
+    # ------------------------------------------------------------------
+    # CLI-backend usage — UI-only, never touches the token ledgers
+    # ------------------------------------------------------------------
+
+    def record_cli_tokens(self, *, input: int, output: int,
+                          cached: int, thinking: int = 0,
+                          raw: dict | None = None) -> None:
+        """Accumulate external CLI token usage into daemon.json ``cli_tokens``.
+
+        This is deliberately separate from :meth:`append_tokens`: CLI backends
+        (claude-p / claude-code, codex, ...) run as external processes billing
+        on their own provider account, and their cache-creation/cache-read
+        semantics don't map onto the kernel's adapter accounting. So this
+        method writes ONLY to ``daemon.json.cli_tokens`` — never to the daemon
+        or parent ``token_ledger.jsonl`` — purely so the TUI ``/daemons`` view
+        can show what a CLI run cost without contaminating ``sum_token_ledger``
+        lifetime totals.
+
+        Normalized totals accumulate across usage events:
+            input    — sum of ``input_tokens``
+            output   — sum of ``output_tokens``
+            cached   — sum of cache_read + cache_creation input tokens
+            thinking — sum of any recognizable thinking/reasoning tokens (0 if none)
+            calls    — incremented once per recorded usage event
+
+        Skips entirely (no state mutation, no ``calls`` bump, no event) when
+        all four totals are zero — there is genuinely nothing to count, and we
+        avoid ledger-style noise. ``raw`` (if provided) is appended to
+        ``logs/events.jsonl`` as a ``cli_usage`` event for forensic inspection.
+        """
+        if not (input or output or cached or thinking):
+            return
+
+        def _write():
+            cli_tokens = self._state.setdefault(
+                "cli_tokens",
+                {"input": 0, "output": 0, "thinking": 0,
+                 "cached": 0, "calls": 0},
+            )
+            cli_tokens.setdefault("input", 0)
+            cli_tokens.setdefault("output", 0)
+            cli_tokens.setdefault("cached", 0)
+            cli_tokens.setdefault("thinking", 0)
+            cli_tokens.setdefault("calls", 0)
+            cli_tokens["input"] += input
+            cli_tokens["output"] += output
+            cli_tokens["cached"] += cached
+            cli_tokens["thinking"] += thinking
+            cli_tokens["calls"] += 1
+            self._atomic_write_json(self.daemon_json_path, self._state)
+            entry = {
+                "event": "cli_usage",
+                "input": input,
+                "output": output,
+                "cached": cached,
+                "thinking": thinking,
+                "ts": self._now_iso(),
+            }
+            if raw is not None:
+                entry["raw"] = raw
+            self._append_jsonl(self.events_path, entry)
+        self._safe("record_cli_tokens", _write)
 
     # ------------------------------------------------------------------
     # Terminal markers
