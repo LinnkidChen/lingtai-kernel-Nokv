@@ -13,6 +13,7 @@ parameter``). These tests assert the wire kwargs the session sends:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from lingtai.llm.openai.adapter import (
     CodexOpenAIAdapter,
     CodexResponsesSession,
     OpenAIResponsesSession,
+    _lingtai_user_agent,
 )
 from lingtai_kernel.llm.base import FunctionSchema
 
@@ -106,6 +108,55 @@ def test_codex_request_includes_default_prompt_cache_key():
 
     sent = session._client.responses.kwargs[0]
     assert sent["prompt_cache_key"] == "lingtai-codex:gpt-5.5:v1"
+
+
+def test_codex_request_sends_honest_lingtai_identity_headers():
+    """Every Codex request carries honest LingTai client-identity headers (#436):
+    ``originator: lingtai`` and a ``LingTai/<version>`` User-Agent. We identify
+    as LingTai, NOT as the Codex CLI (no ``codex_exec`` impersonation)."""
+    session = _create_codex_session([_completed()], model="gpt-5.5")
+
+    session.send("please answer via tool")
+
+    headers = session._client.responses.kwargs[0]["extra_headers"]
+    assert headers["originator"] == "lingtai"
+    # Normal case resolves the installed package version: ``LingTai/<version>``.
+    ua = headers["User-Agent"]
+    assert re.fullmatch(r"LingTai/\d+\.\d+.*", ua), f"unexpected User-Agent: {ua!r}"
+    # We do NOT impersonate the official Codex CLI.
+    assert "codex_exec" not in ua
+    assert headers["originator"] != "codex_exec"
+
+
+def test_codex_caller_headers_override_identity_headers():
+    """Caller-supplied ``extra_headers`` override the honest identity defaults
+    (identity headers are the base layer; caller wins). Audit gap (#436/#437)."""
+    session = CodexResponsesSession(
+        client=FakeClient([_completed()]),
+        model="gpt-5.5",
+        instructions="system",
+        tools=None,
+        tool_choice=None,
+        extra_kwargs={"extra_headers": {"originator": "caller", "User-Agent": "Caller/1"}},
+    )
+
+    session.send("hi")
+
+    headers = session._client.responses.kwargs[0]["extra_headers"]
+    assert headers["originator"] == "caller"
+    assert headers["User-Agent"] == "Caller/1"
+
+
+def test_lingtai_user_agent_falls_back_when_version_unresolvable(monkeypatch):
+    """If the package version can't be resolved, the UA degrades to a bare
+    ``LingTai`` token rather than raising (#436)."""
+    import importlib.metadata as md
+
+    def _boom(_name):
+        raise md.PackageNotFoundError("lingtai")
+
+    monkeypatch.setattr(md, "version", _boom)
+    assert _lingtai_user_agent() == "LingTai"
 
 
 def test_codex_request_omits_prompt_cache_retention():
@@ -454,8 +505,9 @@ def test_codex_session_normalization_priority_session_then_thread():
     assert sent2["extra_headers"]["thread_id"] == "thread-only"
 
 
-def test_codex_bare_session_omits_headers():
-    """A directly-constructed session with no ids sends no header (bare/test path)."""
+def test_codex_bare_session_omits_cache_headers_but_sends_identity():
+    """A directly-constructed session with no ids sends no cache-affinity header
+    (bare/test path), but still sends honest LingTai client-identity headers (#436)."""
     session = CodexResponsesSession(
         client=FakeClient([_completed()]),
         model="gpt-5.5",
@@ -467,7 +519,14 @@ def test_codex_bare_session_omits_headers():
 
     session.send("hi")
 
-    assert "extra_headers" not in session._client.responses.kwargs[0]
+    headers = session._client.responses.kwargs[0].get("extra_headers", {})
+    # No cache-affinity / cache-key headers on the bare path.
+    assert "session_id" not in headers
+    assert "thread_id" not in headers
+    assert "codex-cache-key" not in headers
+    # Honest identity headers are always present.
+    assert headers["originator"] == "lingtai"
+    assert headers["User-Agent"].startswith("LingTai")
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +810,10 @@ def test_codex_usage_extra_empty_when_no_cache_affinity_headers():
 
     result = session.send("hi")
 
-    assert "extra_headers" not in session._client.responses.kwargs[0]
+    # Identity headers are always sent (#436), but no cache-affinity headers and
+    # therefore no token-ledger id fields on the bare path.
+    headers = session._client.responses.kwargs[0].get("extra_headers", {})
+    assert "session_id" not in headers and "thread_id" not in headers
     assert result.usage.extra == {}
 
 
