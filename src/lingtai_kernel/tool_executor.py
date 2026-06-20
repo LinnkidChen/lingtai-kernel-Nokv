@@ -34,6 +34,23 @@ def _resolve_max_result_chars(value: int) -> int:
     return value if type(value) is int and 0 < value <= _DEFAULT_MAX_RESULT_CHARS else _DEFAULT_MAX_RESULT_CHARS
 
 
+def _resolve_hint_threshold(value: int | None) -> int:
+    """Resolve the large-result hint threshold from an optional caller-supplied value.
+
+    ``None`` → default (``DEFAULT_SUMMARIZE_NOTIFICATION_THRESHOLD`` from messaging).
+    ``<= 0`` → 0, meaning the hint is disabled.
+    Non-int or invalid → fall back conservatively to the default.
+    """
+    from .base_agent.messaging import DEFAULT_SUMMARIZE_NOTIFICATION_THRESHOLD
+    if value is None:
+        return DEFAULT_SUMMARIZE_NOTIFICATION_THRESHOLD
+    if not (type(value) is int):
+        return DEFAULT_SUMMARIZE_NOTIFICATION_THRESHOLD
+    if value <= 0:
+        return 0
+    return value
+
+
 class ToolExecutor:
     """Executes tool calls sequentially or in parallel."""
 
@@ -50,6 +67,7 @@ class ToolExecutor:
         working_dir: Path | str | None = None,
         max_result_chars: int = _DEFAULT_MAX_RESULT_CHARS,
         tool_call_guard: ToolCallGuard | None = None,
+        summarize_notification_threshold: int | None = None,
     ) -> None:
         self._dispatch_fn = dispatch_fn
         self._make_tool_result_fn = make_tool_result_fn
@@ -63,6 +81,9 @@ class ToolExecutor:
         self._max_result_chars = _resolve_max_result_chars(max_result_chars)
         self._tool_call_guard = tool_call_guard or ToolCallGuard()
         self._current_api_call_id: str | None = None
+        self._summarize_notification_threshold = _resolve_hint_threshold(
+            summarize_notification_threshold
+        )
 
     def _tool_trace_id(self, tc: ToolCall) -> str:
         """Return the stable trace id for one top-level tool-call execution.
@@ -282,6 +303,104 @@ class ToolExecutor:
             result.update(self._guard.progress_metadata())
         return result
 
+    def _attach_tool_result_metadata(
+        self,
+        result: Any,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> Any:
+        """Inject ``_tool_result_metadata`` into every dict-shaped tool result.
+
+        Metadata is always present so agents and orchestrators have a constant
+        affordance for tool identity, size, and summarize guidance — regardless
+        of whether the result is large.  String results and non-dict payloads
+        are left unchanged to avoid mutating non-kernel-owned schemas.
+
+        Excluded: daemon_tool_result relays, already-summarized blocks, spill
+        manifests (they carry their own size hints via the spill path).  The key
+        ``_tool_result_metadata`` is reserved and will not collide with normal
+        tool output.
+
+        Fields always present:
+          tool_call_id    — provider-assigned call id (or "<unknown>")
+          tool_name       — name of the tool that produced the result
+          char_count      — serialized character count of the substantive result
+                            (measured before this metadata is added)
+          threshold_chars — the configured summarize notification threshold
+                            (0 means long-result hinting is disabled)
+          long_tool_result — True iff char_count > threshold_chars > 0
+          hint            — short human/agent-readable string distinguishing
+                            long vs non-long result
+          summarize_instruction — concise instruction for calling system.summarize;
+                            always states that summarize operates on already-
+                            completed prior results (not the current one)
+        """
+        if not isinstance(result, dict):
+            return result
+        if tool_name == "daemon_tool_result":
+            return result
+        # Idempotent: skip if metadata already injected.
+        if "_tool_result_metadata" in result:
+            return result
+
+        from .tool_result_artifacts import is_spill_manifest
+        from .intrinsics.system.summarize import _is_already_summarized
+
+        if _is_already_summarized(result):
+            return result
+        if is_spill_manifest(result):
+            return result
+
+        import json as _json
+        try:
+            serialized = _json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return result
+        char_count = len(serialized)
+
+        threshold = self._summarize_notification_threshold
+        tcid = tool_call_id or "<unknown>"
+
+        # long_tool_result is True only when threshold > 0 and result exceeds it.
+        is_long = (threshold > 0) and (char_count > threshold)
+
+        if is_long:
+            hint = (
+                f"Large result: {char_count} chars exceeds the {threshold}-char threshold."
+            )
+            summarize_instruction = (
+                f"Digest this result, then on the next step (or alongside other independent "
+                f"work) call system(action=\"summarize\", items=[{{\"tool_call_id\": \"{tcid}\", "
+                f"\"summary\": \"<your summary>\"}}]) to replace the context-visible payload "
+                f"with your own summary. system.summarize operates on already-completed prior "
+                f"tool results — it cannot summarize the current result in the same tool batch "
+                f"before that result exists. The full original is preserved in events.jsonl."
+            )
+        else:
+            if threshold <= 0:
+                hint = "Long-result hinting is disabled (threshold=0); summarize remains available for any prior result worth condensing."
+            else:
+                hint = f"Result within threshold ({char_count} chars ≤ {threshold} chars); summarize is optional when the result is worth condensing."
+            summarize_instruction = (
+                f"Call system(action=\"summarize\", items=[{{\"tool_call_id\": \"{tcid}\", "
+                f"\"summary\": \"<your summary>\"}}]) on a later step to compress any prior "
+                f"completed tool result that is worth condensing. system.summarize operates on "
+                f"already-completed prior tool results only — it cannot summarize a result in "
+                f"the same tool batch before that result exists."
+            )
+
+        result["_tool_result_metadata"] = {
+            "tool_call_id": tcid,
+            "tool_name": tool_name,
+            "char_count": char_count,
+            "threshold_chars": threshold,
+            "long_tool_result": is_long,
+            "hint": hint,
+            "summarize_instruction": summarize_instruction,
+        }
+        return result
+
     @staticmethod
     def _append_advisory(result: Any, advisory: dict[str, Any] | None) -> Any:
         if not isinstance(result, dict) or not advisory:
@@ -446,6 +565,7 @@ class ToolExecutor:
         and bypass ``ToolExecutor``.
         """
         self._attach_tool_call_progress(result)
+        self._attach_tool_result_metadata(result, tool_name=tool_name, tool_call_id=tool_call_id)
         capped = _spill_oversized_result(
             result,
             max_chars=self._max_result_chars,
