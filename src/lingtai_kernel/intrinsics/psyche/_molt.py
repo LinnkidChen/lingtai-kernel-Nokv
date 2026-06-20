@@ -41,6 +41,7 @@ def _publish_post_molt(
     summary_path: Path | None,
     before_tokens: int,
     after_tokens: int,
+    session_journal_path: str | None = None,
 ) -> None:
     """Drop a `.notification/post-molt.json` reminder for the fresh agent.
 
@@ -81,6 +82,7 @@ def _publish_post_molt(
             "reminder": reminder,
             "ack_options": ["continue", "defer", "obsolete"],
             "summary_path": summary_rel,
+            "session_journal_path": session_journal_path,
             "tokens_before": before_tokens,
             "tokens_after": after_tokens,
         }
@@ -158,6 +160,27 @@ def _context_molt(agent, args: dict) -> dict:
         return {"error": "summary is required — write a briefing to your future self."}
     if not summary.strip():
         return {"error": "summary cannot be empty — write what you need to remember."}
+
+    # Session-journal gate (issue #350). Every molt that reaches this function
+    # is agent-initiated: it is dispatched from a model-issued psyche tool call
+    # (context → molt), so it MUST point at the durable session-journal entry
+    # written for the just-finished segment. The check runs BEFORE any state
+    # mutation so a missing/invalid journal refuses the molt without shedding
+    # context or incrementing molt_count.
+    #
+    # The gate is unconditional here on purpose: ``_initiator`` is a model-
+    # provided tool arg, not trusted kernel state, so a value of "system" must
+    # NOT bypass the gate (issue #350 — otherwise a model could pass
+    # ``_initiator: "system"`` to skip writing a journal). True system-forced
+    # molts route through ``context_forget`` instead, which synthesizes its own
+    # call/result pair end-to-end and never re-enters this function.
+    from ._session_journal import validate_session_journal_path
+
+    ok, journal_err, session_journal_path = validate_session_journal_path(
+        agent._working_dir, args.get("session_journal_path")
+    )
+    if not ok:
+        return {"error": journal_err}
 
     if agent._chat is None:
         return {"error": "No active chat session to molt."}
@@ -426,6 +449,7 @@ def _context_molt(agent, args: dict) -> dict:
         molt_count=agent._molt_count,
         before_tokens=before_tokens,
         after_tokens=after_tokens,
+        session_journal_path=session_journal_path,
     )
 
     # Post-molt reminder. ToolExecutor strips visible ``reasoning`` and
@@ -442,6 +466,7 @@ def _context_molt(agent, args: dict) -> dict:
         summary_path=summary_path,
         before_tokens=before_tokens,
         after_tokens=after_tokens,
+        session_journal_path=session_journal_path,
     )
 
     # The faint-memory result.
@@ -460,6 +485,7 @@ def _context_molt(agent, args: dict) -> dict:
             if archive_path.exists() else None,
         "summary_path": str(summary_path.relative_to(agent._working_dir))
             if summary_path is not None else None,
+        "session_journal_path": session_journal_path,
     }
 
 
