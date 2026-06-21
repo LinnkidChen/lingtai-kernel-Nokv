@@ -8,14 +8,17 @@ description: >
   communication/memory/idle/system-operations model;
   `reference/procedures-manual/SKILL.md` for the expanded procedures/action discipline,
   skill routing, responsiveness, deliverables, artifact sharing, and issue
-  reporting guidance; and `reference/sqlite-log-query/SKILL.md` for SQLite/log.sqlite
-  runtime trace inspection and trajectory/anomaly mining from event traces. Also
+  reporting guidance; `reference/summarize-manual/SKILL.md` for tool-result
+  summarization, progressive disclosure, original-result recovery, and
+  summarize-vs-molt distinctions; and `reference/sqlite-log-query/SKILL.md` for
+  SQLite/log.sqlite runtime trace inspection and trajectory/anomaly mining from
+  event traces. Also
   route here for lifecycle operations, notification
   handling, molt/memory questions, MCP/addon ownership, preset tiers,
   collaboration/network topology, resident prompt design, and the `system` tool
   actions.
 version: 1.2.0
-tags: [lingtai, agent, runtime, procedures, substrate, system, lifecycle, memory, communication, skills, molt]
+tags: [lingtai, agent, runtime, procedures, substrate, system, lifecycle, memory, communication, skills, molt, summarize]
 ---
 
 # System Manual — Progressive Disclosure Router
@@ -55,6 +58,12 @@ selects that topic.
     idle/lifecycle procedure, molt checklist, skill routing, web/file/media/
     artifact handling, standalone HTML deliverables, sharing artifacts, issue
     reporting, and resident procedures maintenance.
+
+- name: summarize-manual
+  location: reference/summarize-manual/SKILL.md
+  description: |
+    Detailed operational guide for `system(action="summarize")`: what tool-result summarization is, why it implements progressive disclosure, when to summarize urgently versus during idle cleanup, how to write good summaries, how to recover the original result by `tool_call_id`, and how summarize differs from molt.
+
 - name: sqlite-log-query
   location: reference/sqlite-log-query/SKILL.md
   description: |
@@ -89,6 +98,7 @@ selects that topic.
 |---|---|
 | Expanded substrate; body/extensions; bash vs daemon vs avatar vs MCP; lifecycle states; ACTIVE/IDLE/ASLEEP/SUSPENDED; same-channel communication; basic notifications; memory layers; molt model; idle/soul; preset tiers; `system` operations | `reference/substrate-manual/SKILL.md` |
 | Expanded procedures; progressive disclosure; writing skills/knowledge; action discipline; responsiveness; skill routing; HTML deliverables; artifact sharing; issue reporting; when to read which manual | `reference/procedures-manual/SKILL.md` |
+| Tool-result summarization; large-result reminders; progressive disclosure of raw outputs; original-result recovery; summarize vs molt | `reference/summarize-manual/SKILL.md` |
 | SQLite; `log.sqlite`; LingTai runtime logs; JSONL traces; `lingtai-agent log doctor`; `lingtai-agent log query`; `lingtai-agent log rebuild`; events/chat_entries schema; daemon/chat-history trace indexing; WAL/live-read caveats; SQL recipes; trajectory/anomaly mining; improvement digests; cheap-model strategy | `reference/sqlite-log-query/SKILL.md` |
 | Notifications; the `notification` tool; check/dismiss_channel/dismiss_event/dismiss_ref; `.notification/<channel>.json`; channel allowlist; top-level `instructions`; protected channels; generic vs producer dismiss; stale-version/force; undismissable large-result reminders | `reference/notification-manual/SKILL.md` |
 | Goal notifications; `.notification/goal.json`; active goal source of truth; goal `instructions`; idle goal reminder; cancel/complete goal | `reference/goal-manual/SKILL.md` |

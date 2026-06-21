@@ -47,19 +47,13 @@ not bloat the resident prompt with one-off details.
 
 ### Tool-result digestion
 
-A summarized tool result is the good long-lived form once the raw output has
-served its purpose. Do not reserve `system.summarize` only for long results:
-large-result metadata/reminders are merely a stronger prompt that context hygiene
-is already at risk. Even a short or medium result should be summarized when the
-future agent only needs an index of what you learned.
-
-Good tool-result summaries preserve the grain: conclusion, key evidence, local
-paths/IDs, validation status, risks/caveats, and next steps. The full original
-remains in `events.jsonl` for fallback; the context-visible copy should become
-the concise index once digested. Timing matters: `system.summarize` can summarize
-only already-completed prior tool results, so digest a result after reading it
-and summarize it on a later step (possibly in parallel with other independent
-work).
+Progressive disclosure applies to tool results as much as to manuals. A raw tool
+result is useful while you inspect it; after you have consumed it, the better
+active-context form is an index-style summary. Runtime `_runtime.guidance` gives
+the high-attention reminder when summarization is timely. For the full procedure
+— urgent large-result handling, idle cleanup sweeps, quality checklist,
+original-result recovery, and summarize-vs-molt boundaries — read
+`reference/summarize-manual/SKILL.md`.
 
 ## 2. Action and responsiveness
 
@@ -205,6 +199,7 @@ mechanics here. For the checklist, templates, and summary rules, go to
 | Runtime model, lifecycle, communication, memory layers, substrate expansion | `system-manual` → `reference/substrate-manual/SKILL.md` |
 | Procedures expansion, routing logic, deliverable/reporting discipline | `system-manual` → `reference/procedures-manual/SKILL.md` |
 | SQLite, log.sqlite, runtime trace inspection, `lingtai-agent log doctor/query/rebuild` | `system-manual` → `reference/sqlite-log-query/SKILL.md` |
+| Tool-result summarization, large-result reminders, original-result recovery, summarize vs molt | `system-manual` → `reference/summarize-manual/SKILL.md` |
 | Molt, pad tending, session journaling, post-wipe recovery | `psyche-manual` |
 | Spawning/managing avatars | `avatar-manual` |
 | Internal email protocol | `email-manual` |
