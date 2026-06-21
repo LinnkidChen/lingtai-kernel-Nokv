@@ -25,6 +25,6 @@ Patch release for the Python runtime/kernel package after the tool-result metada
 ## Artifact SHA-256
 
 ```text
-e476637365e581b2e5644bf13562f2ecf1a3df8e83bfd4b383e8afed3076b502  lingtai-0.13.1-cp312-cp312-macosx_11_0_arm64.whl
-8714db1167dae54fc9b05bb2909104168ff92a033b2955d33a51e8bafc04213d  lingtai-0.13.1.tar.gz
+3a0590cd0e1a5bedb50314f41e192db3ea3ecdcf3a81850e404fa408fd7d4fa1  lingtai-0.13.1-cp312-cp312-macosx_11_0_arm64.whl
+052dac67b0eb4efb28910a3abfa5ab4f5026e6827c7d6476fefc8b21e030bdad  lingtai-0.13.1.tar.gz
 ```
