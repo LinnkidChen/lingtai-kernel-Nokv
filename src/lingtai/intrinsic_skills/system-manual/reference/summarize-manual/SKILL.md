@@ -1,0 +1,137 @@
+---
+name: summarize-manual
+description: Detailed operational guide for system(action="summarize"): what tool-result summarization is, why it implements progressive disclosure, when to summarize urgently versus during idle cleanup, how to write good summaries, how to recover the original tool result by tool_call_id, and how summarize differs from molt.
+---
+
+# Summarize Manual
+
+`system(action="summarize")` is context hygiene for completed tool results. It
+replaces the context-visible copy of one or more prior tool-result blocks with
+your own summary. It does **not** delete the original event; the raw result
+remains in logs for fallback.
+
+Use this manual when runtime guidance tells you to summarize, when a
+`large_tool_result` reminder appears, when tool output has served its immediate
+purpose, or when you need to explain how summarize differs from molt.
+
+## 1 · The principle: progressive disclosure
+
+A raw tool result is the first layer: it is useful while you inspect it. After
+you have consumed it, the better layer is an index that future-you can reason
+from without carrying the raw bulk.
+
+A good summary should let future-you decide whether the hidden raw result must
+be reopened. Preserve:
+
+- the conclusion or decision;
+- key evidence, measurements, or error text;
+- paths, URLs, message IDs, tool_call_ids, commit hashes, job IDs, and other
+  anchors;
+- validation status and commands/tests run;
+- risks, caveats, and unresolved questions;
+- next steps.
+
+Do not write casual one-liners for consequential results. The summary is the
+progressive-disclosure entry point.
+
+## 2 · The two summarize cadences
+
+### Urgent cadence: summarize the bulky result now
+
+Use this when a tool result is long, noisy, or raises a `large_tool_result`
+reminder.
+
+1. Read or inspect the result first.
+2. Decide what future-you needs from it.
+3. On a later step, call `system(action="summarize")` on the completed prior
+   result. Do not try to summarize the current result in the same tool batch
+   before it exists.
+4. Batch several already-digested results in one summarize call when convenient.
+
+### Idle cleanup cadence: sweep what is already consumed
+
+Use this when the task quiets down, before the context window becomes urgent.
+Look back over older tool results that are already digested, obsolete, or only
+useful as evidence anchors, and replace them with summaries. This keeps active
+context small enough that the next task starts clean.
+
+Idle cleanup is also the right time to prepare for a deliberate molt. If
+substantial work is complete, durable stores are tended, and no human reply is
+pending, prefer molting while context is still cheap over waiting until pressure
+warnings force the issue.
+
+## 3 · How to call summarize
+
+Summarize prior completed tool results only:
+
+```json
+{
+  "action": "summarize",
+  "items": [
+    {
+      "tool_call_id": "call_abc123",
+      "summary": "What future-you needs: conclusion, evidence, anchors, validation, risks, next steps."
+    }
+  ]
+}
+```
+
+Operational rules:
+
+- `tool_call_id` is the producer call ID shown on the original result, not the
+  visible `_tool_call_id` event ref.
+- A successful summarize replaces only the active-context copy; it does not
+  mutate the original event log.
+- If a large-result notification points at that result, successful summarize
+  clears the reminder.
+- If the result is still ambiguous, reopen or inspect it before summarizing.
+
+## 4 · Recovering the original result
+
+A summarized block should carry a retrieval hint. The usual fallback is to search
+the agent event log by the preserved `tool_call_id`:
+
+```bash
+grep 'call_abc123' <workdir>/logs/events.jsonl
+```
+
+For structured trace work, use the SQLite/log tooling documented in
+`reference/sqlite-log-query/SKILL.md`, for example `lingtai-agent log query`, to
+locate the event and inspect nearby context.
+
+If the original was a spill result, the log entry or summary should also point to
+the spill path under `tmp/tool-results/`. Preserve that path in the summary.
+
+## 5 · Good and bad uses
+
+Good uses:
+
+- a large test output after you know which tests passed/failed;
+- a long file read after extracting the relevant lines and path;
+- a search sweep after preserving matched files and decisions;
+- a channel read after responding and keeping the message IDs that matter;
+- a resolved error once the recovery path is known.
+
+Bad uses:
+
+- summarizing before you have read or understood the result;
+- hiding evidence that you still need to inspect line by line;
+- replacing a required deliverable with a vague recap;
+- assuming summarize is a durable memory layer.
+
+## 6 · Summarize is not molt
+
+`system(action="summarize")` reduces active-context bulk for selected tool
+results. It does not update pad, character, knowledge, skills, or the
+session-journal, and it does not shed the conversation.
+
+Molt is a psyche operation. It preserves durable stores, writes the session
+journal and molt briefing, and starts a fresh conversation context. Before
+molting, read `psyche-manual` and follow its required checklist.
+
+Use them together:
+
+1. Summarize bulky consumed tool results so the active context is navigable.
+2. Tend durable stores for facts, procedures, identity changes, and current plan.
+3. Molt deliberately while you still have enough context to write a good
+   briefing, not only when warnings become urgent.

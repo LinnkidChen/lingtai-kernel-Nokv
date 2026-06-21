@@ -118,107 +118,17 @@ semantics, and the undismissable large-result reminders, read
 
 ### `summarize`
 
-`summarize` is a context-hygiene action for large or already-digested tool
-results. It replaces the **context-visible copy** of a prior tool result with
-your agent-authored summary while preserving the original payload in
-`logs/events.jsonl`.
+`summarize` is the system action for tool-result context hygiene: after you have
+consumed a completed prior tool result, replace its context-visible raw payload
+with a summary that preserves the conclusion, evidence, anchors, validation,
+risks, and next steps. Runtime high-attention guidance for this behavior is
+carried in `_runtime.guidance` from `src/lingtai/prompts/guidance.json`; follow
+that latest guidance first when it appears.
 
-**Why:** `summarize` is a consumption step, not deletion. Treat a large result as
-raw ore: first read it, extract the grain, then replace the bulky visible copy
-with a summary that future-you can actually use. The original event remains
-recoverable for forensics, but the summary is the progressive-disclosure entry
-point that later context, future turns, and post-molt reasoning will see first.
-
-**Write the summary for yourself.** It is not a casual one-liner to silence a
-notification. A useful summary should be compact but specific enough that you can
-continue the work without reopening the raw payload. Include the details that
-make the result operational:
-
-- What the result was and why it mattered.
-- The decision, conclusion, verdict, failure mode, or extracted evidence.
-- Important paths, URLs, message ids, tool-call ids, PR numbers, commits,
-  branches, report files, or artifact locations.
-- Commands or validation that were run and their outcomes.
-- Risks, uncertainties, blockers, caveats, and any interpretation limits.
-- The current task state and the next action if the result belongs to active
-  work.
-
-**Good uses:**
-
-- Collapse a long search/test/log output after extracting the exact commands,
-  pass/fail counts, relevant files, and follow-up needed.
-- Collapse a bulky daemon/check result after recording the verdict, report path,
-  PR/commit ids, validation, and merge/deploy gate state.
-- Collapse repeated notification/dismiss errors after noting they were hygiene
-  artifacts and whether any real task state changed.
-
-**Bad uses:**
-
-- Hiding a result you have not read.
-- Replacing evidence before extracting the important details.
-- Writing a vague summary such as “tests passed” when future-you needs the
-  command, scope, counts, related commit/PR, and remaining risk.
-- Summarizing human or peer messages before you have replied on the producer
-  channel.
-
-Example:
-
-```python
-system(action="summarize", items=[
-  {
-    "tool_call_id": "call_abc123",
-    "summary": (
-      "Pytest run for PR #416: `python -m pytest -q -k 'codex or openai or responses'` "
-      "passed with 158 passed, 2255 deselected. This validates the Codex cache-rate "
-      "rotate tests and related OpenAI/Responses surface before merge commit `b014490`. "
-      "No failures; remaining task is to update release notes."
-    ),
-  },
-])
-```
-
-The tool result shown in context becomes your summary plus a retrieval hint. If
-you later need the full original, search the event log by `tool_call_id`, for
-example:
-
-```bash
-grep 'call_abc123' logs/events.jsonl
-# or use: lingtai-agent log query ...
-```
-
-The summary is not canonical; it records what the agent understood at the time.
-If the task is consequential, make the summary faithful and detailed enough that
-mistakes are inspectable and future-you knows where to verify.
-
-**Large-result notifications:** When a main-agent tool result exceeds the
-summarize notification threshold (default: 3,000 chars), the kernel publishes a
-`system` notification listing pending large results. This is a context-hygiene
-signal, not a separate human task. Treat it as a prompt to digest the result
-deliberately before deep work continues.
-
-Operational rules:
-
-1. Digest the result first. Extract facts, conclusions, decisions, paths, ids,
-   commands, validation, risks, blockers, and next steps.
-2. Write the summary for future-you. It is the progressive-disclosure entry point
-   shown in later context; the raw event may be expensive to retrieve and may be
-   invisible after molt unless you preserved the facts elsewhere.
-3. Call `system(action="summarize", items=[...])` for every pending large-result
-   case you have digested. Batch related cases in one call when possible. A
-   successful summarize auto-clears the matching `large_tool_result` reminder —
-   there is no separate dismiss step, and `large_tool_result` reminders are
-   undismissable through the `notification` tool (see notification-manual).
-4. For ordinary (non-large-result) stale reminder notifications, dismiss them via
-   the `notification` tool after the work is handled, or let the kernel clear
-   them when the producer state empties.
-5. Do not loop on stale notification versions. If a `notification` dismiss fails
-   with `stale_channel_version`, read the current notification state or
-   force-clear a known stale channel only after the substantive payload has been
-   digested. See `reference/notification-manual/SKILL.md` for dismiss specifics.
-
-The notification threshold is set via `manifest.summarize_notification_threshold`
-in `init.json` / defaults. It must be non-negative. Per-call overrides to
-`system(action="summarize")` at runtime return an error.
+For the full operating procedure — urgent large-result summarization, idle
+cleanup sweeps, original-result recovery by `tool_call_id`, summary quality,
+large-result notification behavior, and the distinction between summarize and
+molt — read `reference/summarize-manual/SKILL.md`.
 
 ### Sleep, lull, interrupt, suspend, CPR, clear, nirvana
 
