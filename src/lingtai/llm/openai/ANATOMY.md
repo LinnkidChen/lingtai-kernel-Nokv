@@ -19,8 +19,8 @@ OpenAI adapter — wraps the `openai` SDK for Chat Completions and Responses API
 | `OpenAIChatSession` | 492–1003 | Chat Completions session with context overflow auto-recovery; sends optional `prompt_cache_key` |
 | `OpenAIResponsesSession` | 1006–1204 | Responses API session with server-side `previous_response_id` chaining, optional `context_management` compaction, and optional `prompt_cache_key` |
 | `OpenAIAdapter` | 1207–1520 | `LLMAdapter` implementation; dispatches to Completions or Responses path; receives injected `compact_threshold`; derives the default `prompt_cache_key` via `_default_prompt_cache_key` / `_resolve_prompt_cache_key` |
-| `CodexResponsesSession` | ~1594–1900 | Stateless Responses variant for ChatGPT-OAuth `/backend-api/codex`. **Normalizes** its three affinity inputs at construction into ONE stable id (priority `prompt_cache_key` > `session_id` > `thread_id`) so `prompt_cache_key == session_id == thread_id` always. Sends `session_id` / `thread_id` REST headers (`_cache_affinity_headers`, underscore spelling) only when a per-agent identity was supplied (a lone cache key stays body-only — header carve-out). Always sends honest `originator` / `User-Agent` identity headers. Copies the single id into `UsageMetadata.extra` (`_usage_extra`) for `token_ledger.jsonl`. The id never changes for the life of the session — no rotation, no epoch |
-| `CodexOpenAIAdapter` | ~1905–2070 | Adapter variant that builds `CodexResponsesSession`; derives the per-agent id as a PURE hash of the anchor (`_codex_session_id(anchor)`; explicit `codex_session_id` used verbatim); `_resolve_codex_ids` returns `(id, id)` — thread tracks session — and `(None, None)` only for a bare/test adapter; `_default_prompt_cache_key` returns the SAME per-agent value (falls back to `lingtai-codex:{model}:v1` only on the bare/no-anchor path). No epoch, no clock, no event sink |
+| `CodexResponsesSession` | `adapter.py:1641` | Stateless Responses session for ChatGPT-backed Codex: full-history replay, encrypted reasoning include, cache-affinity headers, honest client/account identity, and honest Codex metadata envelope. |
+| `CodexOpenAIAdapter` | `adapter.py:2017` | Codex provider specialization: forces Responses mode, derives stable per-agent cache/session ids plus a LingTai installation id from the configured anchor, and wires account/metadata hints into Codex sessions. |
 
 ### adapter.py helpers
 
@@ -28,6 +28,7 @@ OpenAI adapter — wraps the `openai` SDK for Chat Completions and Responses API
 |----------|-------|------|
 | `_base_url_namespace()` | 102–116 | Stable namespace token for an OpenAI-compatible `base_url` (URL host, or short hash fallback) used in the default `prompt_cache_key` |
 | `_codex_session_id()` | ~80–94 | Derive the stable 8-char Codex cache-affinity id (issue #378): `sha256(anchor).hexdigest()[:8]`, lowercase hex, where `anchor` MUST be a per-agent identity (the resolved `init.json` path). The same value is used byte-identically for `session_id`, `thread_id`, and the default `prompt_cache_key` on the root/main path. PURE hash — no time/epoch — so it is stable across restarts |
+| `_codex_installation_id()` | `adapter.py:154` | Derives a UUID-shaped, non-secret LingTai installation id for Codex `client_metadata` from the same local anchor/id; never reuses `~/.codex/installation_id`. |
 | `_codex_identity_headers()` | ~140–155 | Honest LingTai client-identity headers sent on every Codex request (#436): `{originator: lingtai, User-Agent: LingTai/<version>}`. Cache-irrelevant; account hygiene only |
 | `_validate_compact_threshold()` | 69–83 | Validates/normalizes OpenAI Responses auto-compaction threshold; positive `int` or explicit `None` (disable) only |
 | `_codex_responses_trace_path()` / `_codex_responses_trace_record()` | 63–157 | Opt-in Codex Responses stream diagnostic trace helpers; safe metadata only, default off |
@@ -116,7 +117,15 @@ The REST `/backend-api/codex/responses` endpoint does **not** accept `previous_r
 
 **Codex-only.** When the user's OAuth auth data supplies an account id (`CodexTokenManager.get_account_id()`, see `../../auth/ANATOMY.md`), `CodexResponsesSession` sends it as the canonical `ChatGPT-Account-ID` header so the request is attributed to the right ChatGPT account. It does NOT change the honest `originator`/`User-Agent` identity above — no Codex-CLI impersonation. The value flows `_register.py` (`codex_account_id=mgr.get_account_id()`) → `CodexOpenAIAdapter.codex_account_id` (mutable; the OAuth-refresh monkey-patch re-reads it via `get_account_id()` so a refresh that changes the id stays current on later-built sessions) → `CodexResponsesSession(account_id=...)` (`self._account_id`). Emitted only when non-empty; otherwise the header is omitted entirely. The account id is a non-secret identifier and — unlike the affinity ids — is **NOT** copied into `UsageMetadata.extra` or any log/ledger.
 
+### Codex honest metadata envelope
+
+See `docs/references/codex-http-anatomy-investigation.md` for the capture history, Codex CLI comparison, and the safety rationale behind which metadata LingTai does and does not send.
+
+When a Codex session has a stable LingTai session/thread identity, `CodexResponsesSession` adds an honest metadata envelope alongside the cache-affinity headers (`adapter.py:1730`, `adapter.py:1885`, `adapter.py:1900`). Each request gets a fresh `x-client-request-id`; `x-codex-window-id` is the LingTai window id `<session_id>:0`; `x-codex-turn-metadata` is compact JSON carrying `session_id`, `thread_id`, a generated `turn_id`, a truthful LingTai `sandbox` label, and `turn_started_at_unix_ms`; and body `client_metadata.x-codex-installation-id` is carried through `extra_body` because the OpenAI Python SDK has no typed `client_metadata` argument. This is compatibility metadata, not CLI impersonation: LingTai keeps `originator: lingtai` / `User-Agent: LingTai/<version>`, does not send `x-codex-beta-features`, and derives its installation id from LingTai state rather than from the official Codex CLI installation file.
+
 ## State
+
+- `CodexResponsesSession._installation_id` / `_metadata_sandbox`: optional honest Codex metadata state used to build `client_metadata.x-codex-installation-id` and turn metadata without leaking local paths or claiming official CLI features.
 
 - **`OpenAIChatSession._interface`** — canonical `ChatInterface`, single source of truth. Mutated in-place: `add_user_message`, `add_tool_results`, `add_assistant_message`, `drop_trailing`.
 - **`OpenAIChatSession._request_timeout`** — per-request HTTP timeout set by caller before dispatch (line 319). Prevents race between watchdog and SDK.

@@ -308,9 +308,16 @@ def test_codex_sends_stable_headers_from_session_anchor():
     assert h0["session_id"] == expected
     assert h0["thread_id"] == expected
     assert s0["prompt_cache_key"] == expected
-    # Stable across multiple ordinary sends of the same session.
-    assert h0 == h1
+    # Cache-affinity / identity headers stay stable across ordinary sends.
+    stable_keys = {"originator", "User-Agent", "session_id", "thread_id"}
+    assert {key: h0[key] for key in stable_keys} == {key: h1[key] for key in stable_keys}
     assert s1["prompt_cache_key"] == expected
+    # Request/turn metadata is honest per-request metadata and intentionally varies.
+    assert h0["x-client-request-id"] != h1["x-client-request-id"]
+    assert h0["x-codex-window-id"] == h1["x-codex-window-id"] == f"{expected}:0"
+    assert json.loads(h0["x-codex-turn-metadata"])["turn_id"] != json.loads(
+        h1["x-codex-turn-metadata"]
+    )["turn_id"]
 
 
 def test_codex_headers_differ_for_different_agents():
@@ -981,3 +988,60 @@ def _expected_codex_hash(anchor: str) -> str:
     from lingtai.llm.openai.adapter import _codex_session_id
 
     return _codex_session_id(anchor)
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+
+
+def test_codex_sends_honest_request_and_turn_metadata_headers():
+    session = _create_codex_session_cfg(
+        [_completed()],
+        codex_session_id="stable123",
+        codex_account_id=_TEST_ACCOUNT_ID,
+    )
+
+    session.send("x")
+
+    kwargs = session._client.responses.kwargs[0]
+    headers = kwargs["extra_headers"]
+    assert headers["originator"] == "lingtai"
+    assert "codex_exec" not in headers["User-Agent"]
+    assert headers["ChatGPT-Account-ID"] == _TEST_ACCOUNT_ID
+    assert kwargs["prompt_cache_key"] == "stable123"
+    assert headers["session_id"] == "stable123"
+    assert headers["thread_id"] == "stable123"
+
+    assert _UUID_RE.match(headers["x-client-request-id"])
+    assert headers["x-codex-window-id"] == "stable123:0"
+    assert "x-codex-beta-features" not in headers
+
+    turn_metadata = json.loads(headers["x-codex-turn-metadata"])
+    assert turn_metadata["session_id"] == "stable123"
+    assert turn_metadata["thread_id"] == "stable123"
+    assert _UUID_RE.match(turn_metadata["turn_id"])
+    assert turn_metadata["sandbox"] == "lingtai"
+    assert isinstance(turn_metadata["turn_started_at_unix_ms"], int)
+    assert turn_metadata["turn_started_at_unix_ms"] > 0
+
+    client_metadata = kwargs["extra_body"]["client_metadata"]
+    assert set(client_metadata) == {"x-codex-installation-id"}
+    assert _UUID_RE.match(client_metadata["x-codex-installation-id"])
+
+
+def test_codex_omits_x_codex_metadata_without_session_identity():
+    session = _create_codex_session_cfg([_completed()])
+
+    session.send("x")
+
+    kwargs = session._client.responses.kwargs[0]
+    headers = kwargs["extra_headers"]
+    assert headers["originator"] == "lingtai"
+    assert "session_id" not in headers
+    assert "thread_id" not in headers
+    assert "x-client-request-id" not in headers
+    assert "x-codex-window-id" not in headers
+    assert "x-codex-turn-metadata" not in headers
+    assert "x-codex-beta-features" not in headers
+    assert "extra_body" not in kwargs

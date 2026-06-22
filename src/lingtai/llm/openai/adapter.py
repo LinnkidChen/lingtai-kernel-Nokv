@@ -152,6 +152,19 @@ def _lingtai_user_agent() -> str:
         return "LingTai"
 
 
+def _codex_installation_id(anchor: str | None) -> str | None:
+    """Return a stable, honest LingTai installation id for Codex metadata.
+
+    Codex CLI sends an opaque UUID-shaped ``x-codex-installation-id``. LingTai
+    must not borrow ``~/.codex/installation_id`` or impersonate the CLI, so we
+    derive our own UUID-shaped identifier from the same non-secret local anchor
+    used for Codex cache affinity. The raw path/anchor is never sent.
+    """
+
+    if not anchor:
+        return None
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"lingtai-codex-installation:{anchor}"))
+
 def _codex_identity_headers() -> dict[str, str]:
     """Honest client-identity headers sent on every Codex request (see #436)."""
     return {"originator": _CODEX_ORIGINATOR, "User-Agent": _lingtai_user_agent()}
@@ -1662,6 +1675,8 @@ class CodexResponsesSession(OpenAIResponsesSession):
         session_id: str | None = None,
         thread_id: str | None = None,
         account_id: str | None = None,
+        installation_id: str | None = None,
+        metadata_sandbox: str = "lingtai",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -1673,6 +1688,8 @@ class CodexResponsesSession(OpenAIResponsesSession):
         # is a non-secret account identifier and is never copied into usage
         # metadata or logs.
         self._account_id = account_id if isinstance(account_id, str) and account_id else None
+        self._installation_id = installation_id
+        self._metadata_sandbox = metadata_sandbox or "lingtai"
         # Codex REST cache-affinity identity: ONE stable per-agent value used
         # byte-identically for ``prompt_cache_key`` / ``session_id`` /
         # ``thread_id`` on EVERY request, and NEVER changed for the life of the
@@ -1721,6 +1738,29 @@ class CodexResponsesSession(OpenAIResponsesSession):
         if self._thread_id:
             headers["thread_id"] = self._thread_id
         return headers
+
+    def _codex_metadata_headers(self) -> dict[str, str]:
+        """Return honest LingTai Codex metadata headers for this request."""
+
+        if not (self._session_id and self._thread_id):
+            return {}
+        turn_metadata = {
+            "session_id": self._session_id,
+            "thread_id": self._thread_id,
+            "turn_id": str(uuid.uuid4()),
+            "sandbox": self._metadata_sandbox,
+            "turn_started_at_unix_ms": int(time.time() * 1000),
+        }
+        return {
+            "x-client-request-id": str(uuid.uuid4()),
+            "x-codex-window-id": f"{self._session_id}:0",
+            "x-codex-turn-metadata": json.dumps(turn_metadata, separators=(",", ":"), sort_keys=True),
+        }
+
+    def _codex_client_metadata(self) -> dict[str, str]:
+        if not self._installation_id:
+            return {}
+        return {"x-codex-installation-id": self._installation_id}
 
     def _effective_affinity(self) -> tuple[str | None, dict[str, str]]:
         """Resolve this request's (prompt_cache_key, headers) pair.
@@ -1854,6 +1894,7 @@ class CodexResponsesSession(OpenAIResponsesSession):
             extra_headers = {
                 **_codex_identity_headers(),
                 **affinity_headers,
+                **self._codex_metadata_headers(),
             }
             # The user's own ChatGPT account id, when available. Canonical
             # official spelling ``ChatGPT-Account-ID`` (HTTP header names are
@@ -1868,6 +1909,12 @@ class CodexResponsesSession(OpenAIResponsesSession):
                     **extra_headers,
                     **kwargs.get("extra_headers", {}),
                 }
+            client_metadata = self._codex_client_metadata()
+            if client_metadata:
+                extra_body = dict(kwargs.get("extra_body") or {})
+                existing_client_metadata = dict(extra_body.get("client_metadata") or {})
+                extra_body["client_metadata"] = {**existing_client_metadata, **client_metadata}
+                kwargs["extra_body"] = extra_body
             acc = StreamingAccumulator()
             response_id = None
             usage = UsageMetadata()
@@ -2080,6 +2127,8 @@ class CodexOpenAIAdapter(OpenAIAdapter):
         else:
             self._codex_id = None  # no per-agent identity -> no headers
         self._codex_thread_salt = codex_thread_salt  # legacy pass-through; unused
+        installation_anchor = self._codex_session_anchor or self._codex_id
+        self._codex_installation_id = _codex_installation_id(installation_anchor)
         # The user's own ChatGPT account id, resolved upstream from their OAuth
         # auth data (explicit ``account_id`` field or decoded id_token claim).
         # Mutable so the token-refresh path can keep it current if refreshed
@@ -2172,4 +2221,5 @@ class CodexOpenAIAdapter(OpenAIAdapter):
             # The user's own ChatGPT account id (read fresh from the adapter so a
             # token refresh that changes it is reflected on newly built sessions).
             account_id=self.codex_account_id,
+            installation_id=self._codex_installation_id,
         )
