@@ -523,6 +523,99 @@ def get_schema(lang: str = "en") -> dict:
     }
 
 
+# Sentinel strings a cooperatively-exited run returns through the future.
+# ``[cancelled]`` is emitted on a timed-out/reclaimed run; ``[no output]`` on a
+# run that produced no final text. ``[intercepted]`` is a guard-handled *normal*
+# exit and must NOT be classified as a terminal abort.
+_CANCELLED_SENTINEL = "[cancelled]"
+_NO_OUTPUT_SENTINEL = "[no output]"
+
+# Fraction of the timeout past which a ``[no output]`` run is treated as a
+# timeout by the low-priority elapsed fallback (P5).
+_ELAPSED_TIMEOUT_FRACTION = 0.9
+
+
+def _classify_terminal_state(
+    entry: dict | None,
+    future_succeeded: bool,
+    text: str,
+    timeout_s: float,
+) -> str:
+    """Classify the true terminal state of a *successfully-returned* emanation.
+
+    Returns one of ``"timeout"``, ``"cancelled"``, ``"failed"``, ``"done"``.
+
+    Called only when ``future.result()`` succeeded (no exception). When the
+    future raises, ``_on_emanation_done`` sets ``status="failed"`` directly and
+    does not call this helper.
+
+    The sole purpose is to keep a non-normal terminal state (timeout / cancelled
+    / failed) from being misread as a tiny ``"done"`` and silently swallowed by
+    the ``suppressed_short`` gate. Only a genuine ``"done"`` may be suppressed.
+
+    Priority order (first match wins):
+
+      P1  ``run_dir.state_snapshot()["state"]`` — authoritative recorded state.
+          This is the same signal current main already trusts; the marker is
+          written by the run loop's ``mark_timeout`` / ``mark_cancelled`` /
+          ``mark_failed`` / ``mark_done`` before the future resolves.
+      P2  ``timeout_event.is_set()`` — watchdog fired. Fallback for when the
+          run terminated before it could record its state.
+      P3  ``cancel_event.is_set()`` — manual reclaim (only when timeout_event is
+          not also set; the watchdog sets both).
+      P4  ``[cancelled]`` sentinel text — last-resort backstop.
+      P5  elapsed >= fraction * timeout_s with a ``[no output]`` body — a
+          deliberately low-priority heuristic for the rare case where neither
+          the recorded state nor the events survived.
+      P6  ``"done"`` — genuine success (suppression-eligible).
+    """
+    run_dir = entry.get("run_dir") if entry else None
+
+    # --- P1: recorded run_dir state (authoritative) ---
+    if run_dir is not None:
+        try:
+            recorded = run_dir.state_snapshot().get("state")
+        except Exception:
+            recorded = None
+        if recorded in ("timeout", "cancelled", "failed"):
+            return recorded
+        if recorded == "done":
+            return "done"
+
+    # --- P2: watchdog timeout event ---
+    timeout_event = entry.get("timeout_event") if entry else None
+    if timeout_event is not None:
+        try:
+            if timeout_event.is_set():
+                return "timeout"
+        except Exception:
+            pass
+
+    # --- P3: manual cancel event (timeout not set) ---
+    cancel_event = entry.get("cancel_event") if entry else None
+    if cancel_event is not None:
+        try:
+            if cancel_event.is_set():
+                return "cancelled"
+        except Exception:
+            pass
+
+    # --- P4: [cancelled] sentinel backstop ---
+    if text == _CANCELLED_SENTINEL:
+        return "cancelled"
+
+    # --- P5: elapsed-near-timeout backstop (low priority) ---
+    if text == _NO_OUTPUT_SENTINEL and timeout_s > 0 and entry is not None:
+        start_time = entry.get("start_time")
+        if start_time is not None:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_s * _ELAPSED_TIMEOUT_FRACTION:
+                return "timeout"
+
+    # --- P6: genuine success ---
+    return "done"
+
+
 class DaemonManager:
     """Manages subagent (emanation) lifecycle."""
 
@@ -2424,6 +2517,11 @@ class DaemonManager:
                 "start_time": time.time(),
                 "cancel_event": cancel_event,
                 "timeout_event": timeout_event,
+                # Per-batch timeout actually applied (may differ from the
+                # manager default when the caller overrode it). Recorded so
+                # _on_emanation_done classifies the terminal state and logs
+                # against the real deadline, not self._timeout.
+                "timeout_s": effective_timeout,
                 "followup_buffer": "",
                 "followup_lock": threading.Lock(),
                 "run_dir": run_dir,
@@ -2601,6 +2699,11 @@ class DaemonManager:
                 "start_time": time.time(),
                 "cancel_event": cancel_event,
                 "timeout_event": timeout_event,
+                # Per-batch timeout actually applied (may differ from the
+                # manager default when the caller overrode it). Recorded so
+                # _on_emanation_done classifies the terminal state and logs
+                # against the real deadline, not self._timeout.
+                "timeout_s": effective_timeout,
                 "followup_buffer": "",
                 "followup_lock": threading.Lock(),
                 "run_dir": run_dir,
@@ -4982,40 +5085,41 @@ class DaemonManager:
         return {"status": "reclaimed", "cancelled": cancelled}
 
     def _on_emanation_done(self, em_id: str, task_summary: str, future) -> None:
-        elapsed = 0.0
         entry = self._emanations.get(em_id)
-        if entry:
-            elapsed = time.time() - entry["start_time"]
+        elapsed = time.time() - entry["start_time"] if entry else 0.0
+        timeout_s = entry.get("timeout_s", self._timeout) if entry else self._timeout
         run_dir = entry.get("run_dir") if entry else None
 
-        # Derive a fallback status from the future result. The future returns
-        # text on cooperative exit (including the short ``[cancelled]`` sentinel
-        # a timed-out/reclaimed run returns) and raises on a hard failure.
-        status = "done"
+        # Extract the result. The future returns text on cooperative exit
+        # (including the short ``[cancelled]`` / ``[no output]`` sentinels a
+        # timed-out/reclaimed run returns) and raises on a hard failure.
+        future_succeeded = False
+        exc = None
         try:
             text = future.result()
-            self._log("daemon_result", em_id=em_id, status="done",
-                      text_length=len(text), elapsed_ms=round(elapsed * 1000))
+            future_succeeded = True
         except Exception as e:
-            status = "failed"
+            exc = e
             text = f"Failed: {e}"
-            self._log("daemon_error", em_id=em_id,
-                      exception=type(e).__name__, exception_message=str(e))
 
-        # The run directory's recorded state is authoritative for the terminal
-        # status: a cancelled/timed-out run returns the short ``[cancelled]``
-        # sentinel through the future, which would otherwise be misclassified as
-        # a tiny "done" and swallowed by the short-result gate below. Prefer it
-        # so every terminal status (done / failed / cancelled / timeout) is
-        # labelled and reported correctly, and the parent always learns the
-        # daemon terminated even when it failed silently.
-        if run_dir is not None:
-            try:
-                recorded = run_dir.state_snapshot().get("state")
-            except Exception:
-                recorded = None
-            if recorded in ("done", "failed", "cancelled", "timeout"):
-                status = recorded
+        # Classify the terminal state. ``_classify_terminal_state`` keeps the
+        # recorded ``run_dir`` state authoritative (current main's behaviour) and
+        # layers timeout_event / cancel_event / sentinel / elapsed fallbacks on
+        # top, so a non-normal terminal state (timeout / cancelled / failed) is
+        # never misclassified as a tiny ``done`` and swallowed by the short-
+        # result gate below. The parent always learns the daemon terminated even
+        # when it failed silently. A raised future is ``failed`` unconditionally.
+        if future_succeeded:
+            status = _classify_terminal_state(entry, future_succeeded, text, timeout_s)
+        else:
+            status = "failed"
+
+        self._log("daemon_result", em_id=em_id, status=status,
+                  text_length=len(text), elapsed_ms=round(elapsed * 1000),
+                  timeout_s=timeout_s)
+        if not future_succeeded and exc is not None:
+            self._log("daemon_error", em_id=em_id,
+                      exception=type(exc).__name__, exception_message=str(exc))
 
         # Suppress notifications only for short *successful* results to prevent
         # notification storms. Every non-success terminal state (failed,
