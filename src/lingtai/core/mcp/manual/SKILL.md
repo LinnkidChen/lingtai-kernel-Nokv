@@ -121,6 +121,26 @@ If neither path yields docs, fall back to the MCP's own runtime self-description
 
 One action: `mcp(action="show")`. Returns this manual body, the current registry contents, and a runtime health snapshot (registry path, count, problems).
 
+Each `registered` entry may also carry a non-secret **`identity`** block, so you can tell *which* configured account/bot/channel an MCP surface represents without reading private config:
+
+```json
+{
+  "name": "telegram",
+  "summary": "...",
+  "identity": {
+    "mcp": "telegram",
+    "account_count": 1,
+    "last_verified_at": "2026-06-24T09:59:00+00:00",
+    "accounts": [
+      {"alias": "main", "bot_username": "my_agent_bot", "bot_id": 123456789,
+       "bot_display_name": "My Agent", "is_bot": true}
+    ]
+  }
+}
+```
+
+Identity comes from the addon-written, non-secret document at `system/mcp_identities/<name>.json` (schema `lingtai.mcp.identity.v1`), surfaced both here and as an `<identity>` block under the server in your `<registered_mcp>` prompt section. It is a **strict allowlist projection** — only non-secret identity fields (alias, provider username/id/display name, non-secret routing counts) are ever shown; tokens, passwords, app secrets, refresh/access tokens, headers, and any unrecognized field are dropped. The block appears only for servers that have published an identity file (currently the curated messaging addons: `telegram`, `feishu`, `wechat`, `whatsapp`); it is absent otherwise and reflects each account's last-cached state (no live network call). For richer per-account detail, the addon's own `accounts` action remains authoritative.
+
 All registry mutations happen via `write` / `edit` / `bash`. The `mcp` capability never writes to the registry.
 
 ## See also

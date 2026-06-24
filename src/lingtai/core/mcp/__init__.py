@@ -195,6 +195,129 @@ def _append_record(working_dir: Path, record: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Account-identity discovery (read-only, secret-safe).
+#
+# Curated addon servers (telegram, feishu, wechat, whatsapp, ...) persist a
+# non-secret identity document to ``system/mcp_identities/<name>.json`` using
+# the shared ``lingtai.mcp.identity.v1`` schema. Those documents let an agent
+# tell *which* configured account/bot/channel a registered MCP surface
+# represents — without reading private config or making network calls. Before
+# this reader they were only reachable through each addon's own ``accounts``
+# action, invisible from the generic ``mcp(action="show")`` surface.
+#
+# This reader is a strict projection, never a passthrough: it surfaces only an
+# explicit allowlist of non-secret keys. Even if an identity file on disk were
+# to contain a secret-shaped field (a producer bug, a hand-edited file), the
+# projection drops it. Tokens, passwords, app secrets, refresh/access tokens,
+# headers, and any unrecognized key never propagate.
+# ---------------------------------------------------------------------------
+
+IDENTITY_DIRNAME = "mcp_identities"
+IDENTITY_SCHEMA = "lingtai.mcp.identity.v1"
+
+# Allowlist of non-secret per-account identity keys. Anything not listed here
+# is dropped by the projection. Keep this list secret-free: no *token,
+# *secret, *password, api_key, headers, or authorization keys.
+IDENTITY_SAFE_ACCOUNT_KEYS: tuple[str, ...] = (
+    # generic identity
+    "alias",
+    "display_name",
+    "username",
+    "account_id",
+    "last_verified_at",
+    "is_bot",
+    # telegram
+    "bot_id",
+    "bot_username",
+    "bot_display_name",
+    # feishu / lark
+    "app_id",
+    # email-style addons
+    "address",
+    "email",
+    # non-secret routing / size hints
+    "allowed_users_count",
+    "contact_count",
+    "channel_count",
+    "config_source",
+)
+
+
+def _identities_dir(working_dir: Path) -> Path:
+    return Path(working_dir) / "system" / IDENTITY_DIRNAME
+
+
+def _project_account(raw: object) -> dict:
+    """Project one account dict down to the non-secret allowlist."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: raw[k]
+        for k in IDENTITY_SAFE_ACCOUNT_KEYS
+        if k in raw and not isinstance(raw[k], (dict, list))
+    }
+
+
+def read_identities(working_dir: Path) -> dict[str, dict]:
+    """Read all per-MCP identity documents, projected to non-secret fields.
+
+    Returns a mapping ``{mcp_name: summary}`` where each ``summary`` is::
+
+        {
+            "mcp": <name>,
+            "account_count": <int>,
+            "accounts": [ {<safe keys only>}, ... ],
+            "generated_at": <iso str>,        # when present
+            "last_verified_at": <iso str>,    # when present
+        }
+
+    Files that are missing, unreadable, malformed, or that do not carry the
+    expected ``lingtai.mcp.identity.v1`` schema are skipped silently — identity
+    discovery is best-effort and must never break the ``show`` surface.
+    """
+    base = _identities_dir(working_dir)
+    if not base.is_dir():
+        return {}
+
+    out: dict[str, dict] = {}
+    for path in sorted(base.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("mcp: skipping unreadable identity file %s: %s", path, e)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("schema") != IDENTITY_SCHEMA:
+            continue
+
+        name = payload.get("mcp") or path.stem
+        if not isinstance(name, str) or not name:
+            continue
+
+        raw_accounts = payload.get("accounts")
+        accounts = [
+            _project_account(a) for a in raw_accounts
+        ] if isinstance(raw_accounts, list) else []
+        accounts = [a for a in accounts if a]
+
+        summary: dict = {
+            "mcp": name,
+            "account_count": len(accounts),
+            "accounts": accounts,
+        }
+        gen = payload.get("generated_at")
+        if isinstance(gen, str):
+            summary["generated_at"] = gen
+        verified = payload.get("last_verified_at")
+        if isinstance(verified, str):
+            summary["last_verified_at"] = verified
+        out[name] = summary
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Boot-time decompression: addons:[...] → registry
 # ---------------------------------------------------------------------------
 
@@ -271,9 +394,38 @@ def _escape_xml(s: str) -> str:
     )
 
 
-def _build_registry_xml(records: list[dict]) -> str:
+def _build_identity_xml(identity: dict | None, indent: str = "    ") -> list[str]:
+    """Render a non-secret <identity> block for one MCP, or [] if absent."""
+    if not identity:
+        return []
+    accounts = identity.get("accounts") or []
+    if not accounts:
+        return []
+    lines = [f"{indent}<identity>"]
+    verified = identity.get("last_verified_at")
+    if verified:
+        lines.append(
+            f"{indent}  <last_verified_at>"
+            f"{_escape_xml(str(verified))}</last_verified_at>"
+        )
+    for acct in accounts:
+        lines.append(f"{indent}  <account>")
+        for key in IDENTITY_SAFE_ACCOUNT_KEYS:
+            if key in acct:
+                lines.append(
+                    f"{indent}    <{key}>{_escape_xml(str(acct[key]))}</{key}>"
+                )
+        lines.append(f"{indent}  </account>")
+    lines.append(f"{indent}</identity>")
+    return lines
+
+
+def _build_registry_xml(
+    records: list[dict], identities: dict[str, dict] | None = None
+) -> str:
     if not records:
         return ""
+    identities = identities or {}
     lines = [
         "The following MCP servers are registered for this agent. To activate "
         "one, add an entry under `mcp` in your init.json and run "
@@ -294,6 +446,7 @@ def _build_registry_xml(records: list[dict]) -> str:
         homepage = r.get("homepage")
         if homepage:
             lines.append(f"    <homepage>{_escape_xml(homepage)}</homepage>")
+        lines.extend(_build_identity_xml(identities.get(r["name"])))
         lines.append("  </mcp>")
     lines.append("</registered_mcp>")
     return "\n".join(lines)
@@ -303,12 +456,21 @@ def _build_registry_xml(records: list[dict]) -> str:
 # Reconciliation (shared by setup and `show` action)
 # ---------------------------------------------------------------------------
 
+def _registered_entry(record: dict, identity: dict | None) -> dict:
+    """Build one ``registered`` entry, attaching identity only when present."""
+    entry = {"name": record["name"], "summary": record["summary"]}
+    if identity and identity.get("accounts"):
+        entry["identity"] = identity
+    return entry
+
+
 def _reconcile(agent: "BaseAgent") -> dict:
     """Read registry, render into prompt, return health snapshot."""
     working_dir = agent._working_dir
     records, problems = read_registry(working_dir)
+    identities = read_identities(working_dir)
 
-    xml = _build_registry_xml(records)
+    xml = _build_registry_xml(records, identities)
     agent.update_system_prompt("mcp", xml, protected=True)
 
     # Health: the umbrella manual must be present.
@@ -332,7 +494,7 @@ def _reconcile(agent: "BaseAgent") -> dict:
         "registry_path": str(_registry_path(working_dir)),
         "registered_count": len(records),
         "registered": [
-            {"name": r["name"], "summary": r["summary"]}
+            _registered_entry(r, identities.get(r["name"]))
             for r in records
         ],
         "problems": problems,
