@@ -102,6 +102,9 @@ def test_schema_exposes_rich_formatting_fields():
     ):
         assert field in props
 
+    assert "" in props["parse_mode"]["enum"]
+    assert "plain text" in props["parse_mode"]["description"]
+
 
 # ---------------------------------------------------------------------------
 # Manager pass-through (the acceptance-critical parse_mode path lives here)
@@ -157,6 +160,51 @@ def test_send_without_formatting_is_unchanged(tmp_path):
         None,
         None,
         {},  # no rich-text options leaked in
+    )]
+
+
+def test_empty_parse_mode_is_treated_as_plain_text(tmp_path):
+    """Optional parse_mode serialized as "" should mean omitted/plain text."""
+    manager, account = _manager(tmp_path)
+
+    result = manager._send({
+        "account": "mybot",
+        "chat_id": 123,
+        "text": "plain",
+        "parse_mode": "",
+    })
+
+    assert result == {"status": "sent", "message_id": "mybot:123:111"}
+    assert account.calls == [(
+        "send_message",
+        123,
+        "plain",
+        None,
+        None,
+        {},
+    )]
+    sent_files = list((Path(tmp_path) / "telegram" / "mybot" / "sent").glob("*/message.json"))
+    assert len(sent_files) == 1
+    assert json.loads(sent_files[0].read_text())["parse_mode"] is None
+
+
+def test_empty_parse_mode_reply_is_treated_as_plain_text(tmp_path):
+    manager, account = _manager(tmp_path)
+
+    result = manager._reply({
+        "message_id": "mybot:123:456",
+        "text": "plain reply",
+        "parse_mode": "",
+    })
+
+    assert result == {"status": "sent", "message_id": "mybot:123:111"}
+    assert account.calls == [(
+        "send_message",
+        123,
+        "plain reply",
+        None,
+        456,
+        {},
     )]
 
 

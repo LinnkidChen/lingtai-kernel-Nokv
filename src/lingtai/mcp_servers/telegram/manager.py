@@ -214,8 +214,11 @@ SCHEMA = {
         },
         "parse_mode": {
             "type": "string",
-            "enum": ["HTML", "MarkdownV2", "Markdown"],
-            "description": "Telegram Bot API parse_mode for rich text (send/reply/edit, and media captions).",
+            "enum": ["HTML", "MarkdownV2", "Markdown", ""],
+            "description": (
+                "Telegram Bot API parse_mode for rich text (send/reply/edit, "
+                "and media captions). Omit or pass an empty string for plain text."
+            ),
         },
         "entities": {
             "type": "array",
@@ -930,6 +933,18 @@ class TelegramManager:
 
     _PARSE_MODES = {"HTML", "MarkdownV2", "Markdown"}
 
+    @staticmethod
+    def _normalize_parse_mode(value: Any) -> Any:
+        """Treat an empty parse_mode as omitted/plain text.
+
+        Some tool callers serialize absent optional string fields as ``""``.
+        Telegram Bot API itself omits parse_mode for plain text, so normalize
+        the empty string before validation and payload persistence.
+        """
+        if value == "":
+            return None
+        return value
+
     def _rich_text_options(self, args: dict) -> tuple[dict[str, Any], str | None]:
         """Extract Bot API rich text options for text messages from tool args.
 
@@ -938,7 +953,7 @@ class TelegramManager:
         as before.
         """
         opts: dict[str, Any] = {}
-        parse_mode = args.get("parse_mode")
+        parse_mode = self._normalize_parse_mode(args.get("parse_mode"))
         if parse_mode is not None:
             if parse_mode not in self._PARSE_MODES:
                 return {}, "parse_mode must be one of: HTML, MarkdownV2, Markdown"
@@ -958,7 +973,7 @@ class TelegramManager:
         latter is treated as caption entities for convenience.
         """
         opts: dict[str, Any] = {}
-        parse_mode = args.get("parse_mode")
+        parse_mode = self._normalize_parse_mode(args.get("parse_mode"))
         if parse_mode is not None:
             if parse_mode not in self._PARSE_MODES:
                 return {}, "parse_mode must be one of: HTML, MarkdownV2, Markdown"
@@ -1079,7 +1094,7 @@ class TelegramManager:
             "text": text,
             "media": media,
             "reply_markup": reply_markup,
-            "parse_mode": args.get("parse_mode"),
+            "parse_mode": self._normalize_parse_mode(args.get("parse_mode")),
             "entities": args.get("entities"),
             "caption_entities": args.get("caption_entities"),
             "link_preview_options": args.get("link_preview_options"),
@@ -1219,7 +1234,7 @@ class TelegramManager:
             "text": text,
             "media": args.get("media"),
             "reply_markup": args.get("reply_markup"),
-            "parse_mode": args.get("parse_mode"),
+            "parse_mode": self._normalize_parse_mode(args.get("parse_mode")),
             "entities": args.get("entities"),
             "caption_entities": args.get("caption_entities"),
             "link_preview_options": args.get("link_preview_options"),
