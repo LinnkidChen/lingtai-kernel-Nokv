@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 from uuid import uuid4
 
+from .. import _skill
+
 if TYPE_CHECKING:
     from .service import FeishuService
 
@@ -37,6 +39,12 @@ def _load_notification_header_template() -> str:
 
 
 _NOTIFICATION_HEADER_TEMPLATE = _load_notification_header_template()
+
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter name/description are
+# injected into the tool schema as a progressive-disclosure catalog entry.
+_SKILL_NAME = "feishu-mcp-manual"
+_SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH = _skill.load_skill(__package__)
 
 # Emoji reactions for different states
 # Feishu supported emoji types: OK, THUMBSUP, SMILE, HEART, THANKS, etc.
@@ -229,7 +237,7 @@ SCHEMA = {
                 "send", "check", "read", "reply", "search",
                 "delete", "edit",
                 "contacts", "add_contact", "remove_contact",
-                "accounts",
+                "accounts", "manual",
             ],
             "description": (
                 "send: send a text message to a user or chat "
@@ -251,7 +259,8 @@ SCHEMA = {
                 "add_contact: save a contact "
                 "(open_id, alias; optional name, chat_id). "
                 "remove_contact: remove a contact (alias or open_id). "
-                "accounts: list configured app accounts."
+                "accounts: list configured app accounts. "
+                + _skill.manual_action_description(_SKILL_FRONTMATTER, _SKILL_NAME)
             ),
         },
         "account": {
@@ -435,10 +444,22 @@ class FeishuManager:
                 return self._remove_contact(args)
             elif action == "accounts":
                 return self._accounts()
+            elif action == "manual":
+                return self._manual()
             else:
                 return {"error": f"Unknown feishu action: {action!r}"}
         except Exception as e:
             return {"error": str(e)}
+
+    def _manual(self) -> dict:
+        # The manual lives in this package's bundled SKILL.md (standard skill
+        # format: YAML frontmatter + markdown body), loaded at import time.
+        # action='manual' returns the full skill markdown plus parsed metadata
+        # and the resolved path; the frontmatter is also injected into the
+        # schema's 'manual' action description as a catalog entry.
+        return _skill.manual_payload(
+            _SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH, _SKILL_NAME
+        )
 
     # ------------------------------------------------------------------
     # Incoming messages — called by FeishuService via on_message callback

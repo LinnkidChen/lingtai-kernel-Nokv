@@ -21,8 +21,15 @@ from typing import Any, Callable
 
 from .client import CloudMailClient, CloudMailError
 from ._watermark import WatermarkStore
+from .. import _skill
 
 log = logging.getLogger("lingtai_cloud_mail")
+
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter name/description are
+# injected into the tool schema as a progressive-disclosure catalog entry.
+_SKILL_NAME = "cloud-mail-mcp-manual"
+_SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH = _skill.load_skill(__package__)
 
 DESCRIPTION = (
     "Cloud Mail REST email client for a self-hosted Cloud Mail deployment "
@@ -38,8 +45,11 @@ SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["check", "search", "read", "send", "accounts", "add_user"],
-            "description": "Which Cloud Mail operation to perform.",
+            "enum": ["check", "search", "read", "send", "accounts", "add_user", "manual"],
+            "description": (
+                "Which Cloud Mail operation to perform. "
+                + _skill.manual_action_description(_SKILL_FRONTMATTER, _SKILL_NAME)
+            ),
         },
         "account": {
             "type": "string",
@@ -191,12 +201,24 @@ class CloudMailManager:
                 return {"status": "ok", "accounts": [a.status() for a in self._accounts]}
             if action == "add_user":
                 return self._handle_add_user(args)
+            if action == "manual":
+                return self._handle_manual()
             return {"status": "error", "error": f"unknown action: {action!r}"}
         except CloudMailError as exc:
             return {"status": "error", "error": str(exc), "error_type": "CloudMailError"}
         except Exception as exc:  # defensive — never leak a traceback to the model
             log.exception("cloud_mail action %r failed", action)
             return {"status": "error", "error": str(exc), "error_type": type(exc).__name__}
+
+    def _handle_manual(self) -> dict:
+        # The manual lives in this package's bundled SKILL.md (standard skill
+        # format: YAML frontmatter + markdown body), loaded at import time.
+        # action='manual' returns the full skill markdown plus parsed metadata
+        # and the resolved path; the frontmatter is also injected into the
+        # schema's 'manual' action description as a catalog entry.
+        return _skill.manual_payload(
+            _SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH, _SKILL_NAME
+        )
 
     def _handle_check(self, args: dict) -> dict:
         acct = self._resolve(args.get("account"))

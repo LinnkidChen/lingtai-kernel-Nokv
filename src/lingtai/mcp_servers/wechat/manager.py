@@ -25,6 +25,7 @@ from .types import (
 from . import api
 from . import media as media_mod
 from .lockfile import AccountLock, PollerLockBusy
+from .. import _skill
 
 if TYPE_CHECKING:
     pass
@@ -39,6 +40,12 @@ def _load_notification_header_template() -> str:
 
 
 _NOTIFICATION_HEADER_TEMPLATE = _load_notification_header_template()
+
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter name/description are
+# injected into the tool schema as a progressive-disclosure catalog entry.
+_SKILL_NAME = "wechat-mcp-manual"
+_SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH = _skill.load_skill(__package__)
 
 TEXT_CHUNK_LIMIT = 4000
 SESSION_EXPIRED_ERRCODE = -14
@@ -57,6 +64,7 @@ SCHEMA = {
             "enum": [
                 "send", "check", "read", "reply", "search",
                 "contacts", "add_contact", "remove_contact", "accounts",
+                "manual",
             ],
             "description": (
                 "send: send a message to a WeChat user "
@@ -70,7 +78,8 @@ SCHEMA = {
                 "contacts: list saved contacts. "
                 "add_contact: save a contact (user_id, alias). "
                 "remove_contact: remove a contact (alias or user_id). "
-                "accounts: list configured WeChat accounts."
+                "accounts: list configured WeChat accounts. "
+                + _skill.manual_action_description(_SKILL_FRONTMATTER, _SKILL_NAME)
             ),
         },
         "user_id": {
@@ -485,10 +494,22 @@ class WechatManager:
                 return self._handle_remove_contact(args)
             elif action == "accounts":
                 return self._handle_accounts()
+            elif action == "manual":
+                return self._handle_manual()
             else:
                 return {"error": f"Unknown wechat action: {action!r}"}
         except Exception as e:
             return {"error": str(e)}
+
+    def _handle_manual(self) -> dict:
+        # The manual lives in this package's bundled SKILL.md (standard skill
+        # format: YAML frontmatter + markdown body), loaded at import time.
+        # action='manual' returns the full skill markdown plus parsed metadata
+        # and the resolved path; the frontmatter is also injected into the
+        # schema's 'manual' action description as a catalog entry.
+        return _skill.manual_payload(
+            _SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH, _SKILL_NAME
+        )
 
     # ── Action handlers ────────────────────────────────────────
 
