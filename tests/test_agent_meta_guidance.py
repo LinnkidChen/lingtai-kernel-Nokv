@@ -13,9 +13,10 @@ STATIC_CODEX_COMMENT = {
     "summary": "Codex plans turns as full or incremental.",
     "summarize_note": "wait until >=20 API calls before non-urgent summarize.",
     "context_budget_note": (
-        "Can wait until 150k token context to proactively "
-        "summarize; if summarize cannot bring context under "
-        "150k, consider molt."
+        "Can wait until roughly 150k token context before proactive "
+        "summarize, but if summarizing still leaves the main context "
+        "above roughly 100k tokens, consider molt to avoid repeated "
+        "summarize misses and improve token efficiency."
     ),
 }
 
@@ -41,8 +42,8 @@ def test_agent_prompt_builder_refreshes_meta_guidance_adapter_rules(tmp_path):
     assert "responses_rest_epoch_reset" in prompt
     assert ">=20 API calls" in prompt
     assert ">=20 API calls" in prompt
-    assert "Can wait until 150k token context" in prompt
-    assert "if summarize cannot bring context under 150k, consider molt" in prompt
+    assert "roughly 150k token context" in prompt
+    assert "above roughly 100k tokens, consider molt" in prompt
 
 
 def test_agent_batched_prompt_builder_refreshes_meta_guidance_adapter_rules(tmp_path):
@@ -53,5 +54,5 @@ def test_agent_batched_prompt_builder_refreshes_meta_guidance_adapter_rules(tmp_
     assert "## meta_guidance" in prompt
     assert "### codex runtime rules" in prompt
     assert "responses_rest_epoch_reset" in prompt
-    assert "Can wait until 150k token context" in prompt
-    assert "if summarize cannot bring context under 150k, consider molt" in prompt
+    assert "roughly 150k token context" in prompt
+    assert "above roughly 100k tokens, consider molt" in prompt

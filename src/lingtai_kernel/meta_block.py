@@ -309,9 +309,12 @@ TOOL_RESULT_CHARS_README = (
     "listing top 10 tool results over 1000 chars by char count "
     "(id, tool_name, chars; no preview); no need to summarize this helper "
     "(it appears only on the latest tool result _meta and older copies are "
-    "stripped); proactively summarize prior tool results that are useless, "
-    "already digested, irrelevant, obsolete, or no longer needed in full, "
-    "using the listed ids/tool names"
+    "stripped); these are summarize candidates, not a directive to summarize "
+    "every entry: prefer summarizing prior results that are already "
+    "consumed/digested and useless, irrelevant, obsolete, or no longer needed "
+    "in full, weighing context pressure, recoverability from logs, and future "
+    "reuse/token savings, and batch them by the listed ids/tool names; if an "
+    "adapter comment is present, follow its adapter-specific summarize rules too"
 )
 
 

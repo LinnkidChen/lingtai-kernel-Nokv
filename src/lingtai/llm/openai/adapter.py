@@ -300,7 +300,15 @@ _CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 # ``previous_response_id`` and WebSocket ``full`` sends the full input frame.
 _CODEX_TRANSPORT_DEFAULT = "rest"
 _CODEX_WS_EPOCH_RESET_TURNS_ENV = "LINGTAI_CODEX_WS_EPOCH_RESET_TURNS"
-_CODEX_WS_EPOCH_RESET_TURNS_DEFAULT = 20
+# The mandatory turn-count epoch reset is CANCELLED (Jason, 2026-06-25): there is
+# no need to force a fresh full epoch purely by turn count. A full/fresh epoch is
+# now caused only by explicit context/history-rewrite actions (summarize/refresh),
+# by bootstrap/no-baseline, and by a true prefix-mismatch fallback/diagnostic —
+# never by idle->active, notification wake, dismiss, or a periodic countdown.
+# ``0`` disables the turn-count reset (see ``_maybe_reset_ws_epoch``). The env var
+# and the explicit ``ws_epoch_reset_turns=`` kwarg remain as an opt-in seam for
+# tests / experiments, but the runtime default no longer schedules any reset.
+_CODEX_WS_EPOCH_RESET_TURNS_DEFAULT = 0
 
 # Non-input request fields that must match between two requests for an
 # incremental delta to be valid. Mirrors the official ``get_incremental_items``
@@ -499,6 +507,32 @@ def _ws_is_synthesized_orphan_output(item: Any) -> bool:
         and item.get("type") == "function_call_output"
         and item.get("output") == _RESPONSES_ORPHAN_OUTPUT_PLACEHOLDER
     )
+
+
+def _strip_synthesized_orphan_outputs(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop every synthesized orphan ``function_call_output`` placeholder.
+
+    The wire-layer guard ``_pair_responses_orphan_function_calls`` injects
+    placeholder ``function_call_output`` items (issue #170) for unanswered
+    ``function_call``s. Those placeholders are required ON THE WIRE so the
+    provider does not 400 on dangling calls, and the guard now appends them as a
+    contiguous tail block so they do not split the real ``function_call`` prefix.
+    They are still the WRONG thing to record as the continuation BASELINE: the
+    real tool results replace them next turn, and any synthesized placeholder
+    that becomes a prefix anchor can produce the observed ``prefix_mismatch``
+    with ``mismatch_prev_type=function_call_output`` vs
+    ``mismatch_cur_type=function_call`` in multi-call turns resolving
+    incrementally.
+
+    The fix is to compare and store the baseline with ALL synthesized
+    placeholders removed (not just trailing ones), leaving only the real,
+    position-stable items. The real outputs always strictly extend that stripped
+    prefix, so the continuation stays ``*_incremental``. Pure and content-free:
+    returns a new list, never mutates the caller's items.
+    """
+    return [item for item in items if not _ws_is_synthesized_orphan_output(item)]
 
 
 def _freeze_responses_outputs(
@@ -2170,8 +2204,40 @@ class OpenAIAdapter(LLMAdapter):
 
 _CODEX_DELAYED_SUMMARIZE_MIN_API_CALLS = 20
 _CODEX_CONTEXT_BUDGET_NOTE = (
-    "Can wait until 150k token context to proactively summarize; "
-    "if summarize cannot bring context under 150k, consider molt."
+    "Can wait until roughly 150k token context before proactive summarize, "
+    "but if summarizing still leaves the main context above roughly 100k "
+    "tokens, consider molt to avoid repeated summarize misses and improve "
+    "token efficiency."
+)
+_CODEX_SUMMARIZE_ECONOMY_NOTE = (
+    "Summarize breaks the current continuation/cache prefix and should be "
+    "treated as an investment, not a fixed countdown. Under low pressure, "
+    "defer and batch consumed high-recoverability results; summarize when "
+    "estimated future token savings can repay the cache miss with margin, "
+    "or when current/projected context pressure risks overflow. If a "
+    "summarize pass still leaves the main context above roughly 100k tokens, "
+    "consider molting instead of repeatedly paying summarize misses."
+)
+_CODEX_LONG_CONTEXT_STRATEGY = (
+    "For long logs, diffs, repo scans, papers, issue sweeps, runtime traces, "
+    "or other noisy high-context reads, prefer daemon/file-based exploration "
+    "and return a distilled report to the main agent. Avoid ingesting large "
+    "raw outputs into the main Codex context just to summarize them later."
+)
+_CODEX_NOTIFICATION_DISMISS_NOTE = (
+    "Notification dismiss only clears notification state; it does not compact "
+    "history or reset Codex continuation. Avoid low-value dismiss-only turns: "
+    "coalesce dismissals with useful work when safe, and do not interpret a "
+    "full-labeled dismiss turn as dismiss itself causing a reset."
+)
+_CODEX_SYSTEM_PROMPT_UPDATE_NOTE = (
+    "In-flight Codex/Responses sessions keep their system prompt (instructions) "
+    "FROZEN: update_system_prompt is a no-op on this path, so pad / system-prompt "
+    "edits do not break the current input-prefix continuation or cache — they are "
+    "preserved. A changed system prompt takes effect only when a NEW Codex session "
+    "is created (molt / refresh / restart / bootstrap). If you need an instruction "
+    "change to take effect immediately, refresh or molt deliberately and expect a "
+    "fresh epoch / cache cost; otherwise let it apply on the next natural session."
 )
 
 
@@ -2203,6 +2269,10 @@ def _codex_static_adapter_comment(
                 "cleanup and does not compact context."
             ),
             "context_budget_note": _CODEX_CONTEXT_BUDGET_NOTE,
+            "summarize_economy_note": _CODEX_SUMMARIZE_ECONOMY_NOTE,
+            "long_context_strategy": _CODEX_LONG_CONTEXT_STRATEGY,
+            "notification_dismiss_note": _CODEX_NOTIFICATION_DISMISS_NOTE,
+            "system_prompt_update_note": _CODEX_SYSTEM_PROMPT_UPDATE_NOTE,
         }
 
     return {
@@ -2232,6 +2302,10 @@ def _codex_static_adapter_comment(
             "epoch."
         ),
         "context_budget_note": _CODEX_CONTEXT_BUDGET_NOTE,
+        "summarize_economy_note": _CODEX_SUMMARIZE_ECONOMY_NOTE,
+        "long_context_strategy": _CODEX_LONG_CONTEXT_STRATEGY,
+        "notification_dismiss_note": _CODEX_NOTIFICATION_DISMISS_NOTE,
+        "system_prompt_update_note": _CODEX_SYSTEM_PROMPT_UPDATE_NOTE,
     }
 
 class CodexResponsesSession(OpenAIResponsesSession):
@@ -2779,27 +2853,33 @@ class CodexResponsesSession(OpenAIResponsesSession):
         if pending is None or last is None or not last.response_id:
             self._ws_pending_baseline_input = None
             return
-        full_now = self._frozen_responses_input(self._interface)
-        base_len = len(pending)
+        # Compare and record the baseline with EVERY synthesized orphan
+        # ``function_call_output`` placeholder removed — not just trailing ones.
+        # The placeholder is a wire-only stand-in for an unanswered call; its
+        # position drifts relative to the real output next turn (an assistant turn
+        # that emits several calls resolving incrementally), which previously broke
+        # the strict prefix and forced ``*_full`` (the observed ``prefix_mismatch``
+        # ``function_call_output`` vs ``function_call``). Stripping placeholders
+        # from both sides leaves only the real, position-stable items, so the real
+        # tool-result continuation strictly extends the baseline and stays
+        # ``*_incremental``. See ``_strip_synthesized_orphan_outputs``.
+        pending_real = _strip_synthesized_orphan_outputs(pending)
+        full_now = _strip_synthesized_orphan_outputs(
+            self._frozen_responses_input(self._interface)
+        )
+        # Park the placeholder-stripped baseline as ``last_request.input`` so the
+        # next turn's ``_codex_incremental_diagnose`` prefix check compares the
+        # stable, placeholder-free shape against the next full converted input.
+        if isinstance(last_request := self._ws_session.last_request, dict):
+            last_request["input"] = list(pending_real)
+        base_len = len(pending_real)
         # Only treat the tail as server-added output when the interface still
         # strictly extends what we sent (it always should: we appended an
         # assistant turn). If it does not, leave ``items_added`` empty so the next
-        # turn falls back to ``ws_full`` with a ``missing_output_items`` reason
+        # turn falls back to ``*_full`` with a ``missing_output_items`` reason
         # rather than chaining off a baseline we cannot prove.
-        if full_now[:base_len] == pending and base_len <= len(full_now):
-            tail = full_now[base_len:]
-            # Drop trailing SYNTHESIZED orphan tool-result placeholders from the
-            # baseline. When the assistant turn ends on an unanswered
-            # ``function_call``, ``to_responses_input`` injects a placeholder
-            # ``function_call_output`` (issue #170 wire guard). That placeholder is
-            # NOT what the next tool-result continuation actually sends (the real
-            # output replaces it), so keeping it in the baseline guarantees a
-            # ``prefix_mismatch`` and forces ``ws_full`` on every tool loop. Trim
-            # the trailing placeholder(s) so the real continuation strictly extends
-            # the baseline and stays ``ws_incremental``.
-            while tail and _ws_is_synthesized_orphan_output(tail[-1]):
-                tail = tail[:-1]
-            last.items_added = tail
+        if full_now[:base_len] == pending_real and base_len <= len(full_now):
+            last.items_added = full_now[base_len:]
         else:
             last.items_added = []
         self._ws_pending_baseline_input = None
@@ -2825,9 +2905,12 @@ class CodexResponsesSession(OpenAIResponsesSession):
         """Start a fresh websocket response-id epoch.
 
         The Codex backend cannot delete already-accepted ``previous_response_id``
-        state. Periodically forcing a full request from the current local history,
-        while clearing the frozen tool-output map and old response id, prevents
-        stale latest-meta bytes from living forever in the remote chain.
+        state. Forcing a full request from the current local history, while
+        clearing the frozen tool-output map and old response id, rebases the remote
+        chain on the rewritten local history. This is triggered by explicit
+        context/history-rewrite actions (``summarize``) — and, only if an operator
+        opts in via ``ws_epoch_reset_turns``/the env var, by ``turn_count``. The
+        runtime no longer schedules a periodic turn-count reset by default.
         """
 
         self._close_ws_transport()
@@ -3068,17 +3151,25 @@ class CodexResponsesSession(OpenAIResponsesSession):
             return comment
 
         ledger = self._ws_cache_ledger_comment()
-        comment.update(
-            {
-                "epoch_reset_turns": self._ws_epoch_reset_turn_limit,
-                "turns_since_epoch_reset": self._ws_turns_since_epoch_reset,
-                "next_reset_in": max(
-                    self._ws_epoch_reset_turn_limit - self._ws_turns_since_epoch_reset,
-                    0,
-                ),
-                "cache_ledger": ledger,
-            }
-        )
+        comment["cache_ledger"] = ledger
+        # The mandatory turn-count epoch reset is cancelled by default
+        # (``_ws_epoch_reset_turn_limit <= 0`` / disabled). When disabled, the
+        # resident meta OMITS the periodic-countdown fields entirely so it never
+        # implies a forced reset that the runtime won't perform. They reappear only
+        # when an operator has explicitly opted back in via ``ws_epoch_reset_turns``
+        # / the env var, in which case they describe a real countdown.
+        if self._ws_epoch_reset_turn_limit > 0:
+            comment.update(
+                {
+                    "epoch_reset_turns": self._ws_epoch_reset_turn_limit,
+                    "turns_since_epoch_reset": self._ws_turns_since_epoch_reset,
+                    "next_reset_in": max(
+                        self._ws_epoch_reset_turn_limit
+                        - self._ws_turns_since_epoch_reset,
+                        0,
+                    ),
+                }
+            )
         if isinstance(ledger, dict):
             summary = ledger.get("summary")
             if isinstance(summary, dict):

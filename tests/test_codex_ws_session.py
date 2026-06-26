@@ -781,6 +781,79 @@ def test_rest_summarize_forces_next_full_epoch_reset():
     assert third.usage.extra["codex_ws_delta_reason"] == "epoch_reset"
 
 
+class _MultiToolCallRestResponses:
+    """``responses.create`` stub: turn 1 emits TWO parallel function_calls; later
+    turns emit text. Mirrors a model that fans out several tool calls at once."""
+
+    def __init__(self):
+        self.kwargs: list[dict] = []
+        self._counter = 0
+
+    def create(self, **kwargs):
+        self.kwargs.append(kwargs)
+        self._counter += 1
+        rid = f"resp_rest_{self._counter}"
+
+        def _gen():
+            if self._counter == 1:
+                for cid in ("call_a", "call_b"):
+                    yield Event(
+                        "response.output_item.added",
+                        item=_ToolCallItem(call_id=cid),
+                    )
+                    yield Event(
+                        "response.function_call_arguments.delta", delta='{"a": 1}'
+                    )
+                    yield Event(
+                        "response.output_item.done",
+                        item=_ToolCallItem(call_id=cid),
+                    )
+            else:
+                yield Event("response.output_text.delta", delta="done")
+            yield _completed(rid)
+
+        return _gen()
+
+
+class _MultiToolCallRestClient:
+    def __init__(self):
+        self.responses = _MultiToolCallRestResponses()
+
+
+def test_rest_parallel_multi_tool_result_stays_incremental():
+    """Regression for the ``prefix_mismatch`` ``function_call_output`` vs
+    ``function_call`` full-rate: an assistant turn that emits SEVERAL parallel
+    ``function_call``s, answered together next turn, must stay ``rest_incremental``.
+
+    The wire-layer guard ``_pair_responses_orphan_function_calls`` injects an
+    orphan-output placeholder for each unanswered call. Before the fix it
+    interleaved that placeholder right after each ``function_call`` while
+    ``to_responses_input`` groups all calls then all real outputs, so the
+    placeholder positions drifted relative to where the real outputs land — the
+    strict prefix broke and forced ``rest_full`` with the logged signature
+    ``mismatch_prev_type=function_call_output`` / ``mismatch_cur_type=function_call``.
+    The fix appends placeholders contiguously at the tail and strips them from the
+    recorded baseline, so the real tool results strictly extend the baseline.
+    """
+    from lingtai_kernel.llm.interface import ToolResultBlock
+
+    client = _MultiToolCallRestClient()
+    session = _make_rest_session(client)
+
+    first = session.send("call two tools")  # turn 1: emits call_a + call_b
+    assert first.usage.extra["codex_request_mode"] == "rest_full"
+
+    # Answer both parallel calls together — a strict additive extension of the
+    # baseline. With placeholders interleaved (pre-fix) this collapsed to
+    # rest_full; with tail placement + baseline-strip it stays incremental.
+    second = session.send([
+        ToolResultBlock(id="call_a", name="do_x", content={"ok": "a"}),
+        ToolResultBlock(id="call_b", name="do_x", content={"ok": "b"}),
+    ])
+    assert second.usage.extra["codex_request_mode"] == "rest_incremental"
+    assert second.usage.extra["codex_ws_delta_reason"] == "ok"
+
+
 def test_tool_result_continuation_stays_incremental():
     """A tool-result continuation (the assistant ended on an unanswered
     ``function_call``) must NOT reset to ``ws_full``. The converter injects an
@@ -992,8 +1065,13 @@ def test_codex_adapter_comment_explains_epoch_reset_and_cache_ledger():
     assert comment["adapter"] == "codex"
     assert comment["ws_enabled"] is True
     assert comment["feature"] == "responses_websocket_epoch_reset"
-    assert comment["epoch_reset_turns"] == 20
-    assert comment["turns_since_epoch_reset"] == 0
+    # The routine turn-count epoch reset is cancelled: the default limit is 0
+    # (disabled), so no full is forced by turn count. The resident meta omits the
+    # periodic-countdown fields entirely so it never implies a reset that won't
+    # happen; they reappear only when an operator explicitly opts back in.
+    assert "epoch_reset_turns" not in comment
+    assert "turns_since_epoch_reset" not in comment
+    assert "next_reset_in" not in comment
     assert comment["last_full_api_calls_ago"] is None
     assert comment["last_full_reason"] == "not_recorded"
     assert comment["last_ws_full_api_calls_ago"] is None
@@ -1016,7 +1094,17 @@ def test_codex_adapter_comment_explains_epoch_reset_and_cache_ledger():
     assert static["adapter"] == "codex"
     assert static["feature"] == "responses_websocket_epoch_reset"
     assert ">=20 API calls" in static["summarize_note"]
-    assert "Can wait until 150k token context" in static["context_budget_note"]
+    assert "roughly 150k token context" in static["context_budget_note"]
+    assert "above roughly 100k" in static["context_budget_note"]
+    assert "investment, not a fixed countdown" in static["summarize_economy_note"]
+    assert "cache miss with margin" in static["summarize_economy_note"]
+    assert "prefer daemon/file-based exploration" in static["long_context_strategy"]
+    assert "Avoid ingesting large raw outputs" in static["long_context_strategy"]
+    assert "dismiss-only turns" in static["notification_dismiss_note"]
+    assert "dismiss itself causing a reset" in static["notification_dismiss_note"]
+    assert "FROZEN" in static["system_prompt_update_note"]
+    assert "update_system_prompt is a no-op" in static["system_prompt_update_note"]
+    assert "molt / refresh / restart / bootstrap" in static["system_prompt_update_note"]
 
     ledger = comment["cache_ledger"]
     assert ledger["window_api_calls"] == 20
@@ -1054,8 +1142,43 @@ def test_codex_adapter_static_comment_available_before_chat_creation():
     assert comment["adapter"] == "codex"
     assert comment["feature"] == "responses_rest_epoch_reset"
     assert ">=20 API calls" in comment["summarize_note"]
-    assert "Can wait until 150k token context" in comment["context_budget_note"]
-    assert "if summarize cannot bring context under 150k, consider molt" in comment["context_budget_note"]
+    assert "roughly 150k token context" in comment["context_budget_note"]
+    assert "above roughly 100k" in comment["context_budget_note"]
+    assert "investment, not a fixed countdown" in comment["summarize_economy_note"]
+    assert "current/projected context pressure risks overflow" in comment["summarize_economy_note"]
+    assert "consider molting" in comment["summarize_economy_note"]
+    assert "prefer daemon/file-based exploration" in comment["long_context_strategy"]
+    assert "main Codex context" in comment["long_context_strategy"]
+    assert "does not compact history" in comment["notification_dismiss_note"]
+    assert "coalesce dismissals with useful work" in comment["notification_dismiss_note"]
+    assert "FROZEN" in comment["system_prompt_update_note"]
+    assert "take effect immediately" in comment["system_prompt_update_note"]
+    assert "fresh epoch / cache cost" in comment["system_prompt_update_note"]
+
+
+def test_codex_update_system_prompt_is_no_op_and_keeps_instructions_frozen():
+    """em-7: ``update_system_prompt`` is a no-op on the Codex/Responses path, so a
+    system-prompt change does NOT mutate ``instructions`` mid-session — it stays
+    frozen until a new session is built (molt/refresh/restart/bootstrap). This
+    means a pad/system-prompt edit preserves the input-prefix continuation and
+    cache rather than forcing a fresh epoch."""
+    client = RealisticRestClient()
+    session = _make_rest_session(client)
+
+    assert session._instructions == "system prompt"
+    first = session.send("hello")
+    assert first.usage.extra["codex_request_mode"] == "rest_full"
+
+    # A mid-session system-prompt update must NOT change the wire instructions.
+    session.update_system_prompt("a brand new and very different system prompt")
+    assert session._instructions == "system prompt"
+
+    second = session.send("again")
+    # instructions field is unchanged across turns, so the strict-extension holds
+    # and the turn stays incremental (no instruction-driven epoch reset).
+    assert client.responses.kwargs[1]["instructions"] == "system prompt"
+    assert second.usage.extra["codex_request_mode"] == "rest_incremental"
+
 
 def test_codex_adapter_comment_reports_compact_cache_ledger():
     session = _make_session(FakeWsTransport())
@@ -1150,8 +1273,12 @@ def test_codex_adapter_comment_is_rest_continuation_when_ws_disabled():
     assert comment["ws_enabled"] is False
     assert comment["continuation_enabled"] is True
     assert comment["feature"] == "responses_rest_epoch_reset"
-    # The continuation comment carries the epoch-reset / cache-ledger machinery.
-    assert "turns_since_epoch_reset" in comment
+    # The continuation comment carries the cache-ledger machinery, but with the
+    # routine turn-count reset cancelled (default 0) it omits the periodic-reset
+    # countdown fields so the resident meta never implies a forced reset.
+    assert "turns_since_epoch_reset" not in comment
+    assert "epoch_reset_turns" not in comment
+    assert "next_reset_in" not in comment
     assert "cache_ledger" in comment
     assert "maintenance_hint" in comment
     assert "cache_note" in comment
@@ -1212,11 +1339,74 @@ def test_notification_dismissed_keeps_incremental_ws_chain():
     assert t.sent_frames[2]["previous_response_id"] == "resp_ws_2"
 
 
-def test_ws_epoch_reset_default_limit_refreshes_for_existing_sessions(monkeypatch):
+def test_rest_notification_dismissed_is_noop_and_keeps_incremental():
+    """On the production REST transport, a notification dismiss must be a no-op:
+    it must NOT open a fresh full epoch, leave the in-memory baseline untouched,
+    and the next request must stay ``rest_incremental``. Pins the intended
+    behavior (``on_notification_dismissed`` is a deliberate no-op for Codex)
+    against accidental re-arming of the dismiss → fresh-epoch footgun.
+    """
+    client = RealisticRestClient()
+    session = _make_rest_session(client)
+
+    first = session.send("one")
+    second = session.send("two")
+    baseline_before = session._ws_session.last_response
+
+    session.on_notification_dismissed("system")
+    # Dismiss must not rotate the baseline or queue an epoch reset.
+    assert session._ws_session.last_response is baseline_before
+    assert session._ws_epoch_reset_reason_pending is None
+
+    third = session.send("three")
+
+    assert first.usage.extra["codex_request_mode"] == "rest_full"
+    assert second.usage.extra["codex_request_mode"] == "rest_incremental"
+    assert third.usage.extra["codex_request_mode"] == "rest_incremental"
+    assert third.usage.extra["codex_ws_delta_reason"] == "ok"
+    assert "codex_ws_epoch_reset_reason" not in third.usage.extra
+
+
+def test_ws_epoch_reset_disabled_by_default_no_turn_count_full(monkeypatch):
+    """The routine turn-count epoch reset is cancelled.
+
+    With no env override and no explicit kwarg, the default limit is 0
+    (disabled). No matter how many turns elapse, the continuation chain is never
+    broken by turn count alone — only summarize / prefix-mismatch / no-baseline
+    open a fresh full epoch. This is Jason's decision: no frequent turn-count
+    maintenance full.
+    """
+
+    monkeypatch.delenv("LINGTAI_CODEX_WS_EPOCH_RESET_TURNS", raising=False)
     t = FakeWsTransport()
     session = _make_session(t)
-    # Simulate a live session object created before the default changed.
-    session._ws_epoch_reset_turn_limit = 10
+
+    assert session._ws_epoch_reset_turn_limit == 0
+
+    responses = [session.send(f"turn {i}") for i in range(25)]
+
+    # First is the bootstrap full (no baseline); every subsequent turn stays
+    # incremental — no turn_count epoch reset is ever forced.
+    assert responses[0].usage.extra["codex_request_mode"] == "ws_full"
+    assert all(
+        r.usage.extra["codex_request_mode"] == "ws_incremental" for r in responses[1:]
+    )
+    assert all(
+        r.usage.extra.get("codex_ws_epoch_reset_reason") != "turn_count"
+        for r in responses
+    )
+
+
+def test_ws_epoch_reset_env_override_is_conservative_safety_only(monkeypatch):
+    """A turn-count limit can still be opted into via the env escape hatch.
+
+    This is a conservative operator-only safety valve, NOT the routine summarize
+    cadence. Existing live sessions pick up an env-set limit on the next send.
+    """
+    t = FakeWsTransport()
+    session = _make_session(t)
+    # Simulate a live session object with the default (disabled) limit.
+    session._ws_epoch_reset_turn_limit = 0
     session._ws_epoch_reset_turns_explicit = False
     session._ws_turns_since_epoch_reset = 5
     monkeypatch.setenv("LINGTAI_CODEX_WS_EPOCH_RESET_TURNS", "5")
@@ -1240,10 +1430,15 @@ def test_ws_epoch_reset_explicit_limit_is_not_refreshed(monkeypatch):
 
 
 def test_ws_epoch_reset_forces_full_after_configured_successes():
-    """Periodic epoch reset breaks the response-id chain after N WS successes.
+    """An EXPLICITLY opted-in turn-count limit still breaks the chain after N
+    WS successes.
 
-    The reset intentionally pays one ``ws_full`` request, clears the frozen output
-    map/baseline/transport, and then starts a fresh incremental chain.
+    The routine turn-count reset is cancelled (default 0 / disabled). This
+    conservative safety valve is reachable only by passing an explicit
+    ``ws_epoch_reset_turns`` (or the env override); when set, the reset
+    intentionally pays one ``ws_full`` request, clears the frozen output
+    map/baseline/transport, and then starts a fresh incremental chain. This is
+    NOT the normal summarize cadence.
     """
 
     t = FakeWsTransport()
@@ -1266,6 +1461,27 @@ def test_ws_epoch_reset_forces_full_after_configured_successes():
 
     assert fourth.usage.extra["codex_request_mode"] == "ws_incremental"
     assert t.sent_frames[3]["previous_response_id"] == "resp_ws_3"
+
+
+def test_ws_epoch_reset_countdown_fields_reappear_only_when_opted_in():
+    """The resident-meta countdown fields are surfaced only for an opted-in limit.
+
+    Disabled (default 0): the fields are omitted so the meta never implies a
+    forced reset. Opted in (explicit ``ws_epoch_reset_turns``): they reappear and
+    describe the real countdown — the conservative safety valve, not the normal
+    cadence.
+    """
+    disabled = _make_session(FakeWsTransport())
+    disabled_comment = disabled.dynamic_adapter_comment()
+    assert "epoch_reset_turns" not in disabled_comment
+    assert "turns_since_epoch_reset" not in disabled_comment
+    assert "next_reset_in" not in disabled_comment
+
+    opted_in = _make_session(FakeWsTransport(), ws_epoch_reset_turns=50)
+    opted_in_comment = opted_in.dynamic_adapter_comment()
+    assert opted_in_comment["epoch_reset_turns"] == 50
+    assert opted_in_comment["turns_since_epoch_reset"] == 0
+    assert opted_in_comment["next_reset_in"] == 50
 
 
 def test_ws_epoch_reset_clears_frozen_outputs_before_full_replay():

@@ -11,7 +11,7 @@ description: >
   maintenance. This is a nested skill-reference under `system-manual`, not a
   standalone catalog skill; its folder may carry scripts/assets as procedure
   guidance grows.
-version: 1.1.0
+version: 1.2.0
 tags: [lingtai, system-manual, procedures, progressive-disclosure, responsiveness, deliverables, issue-reporting]
 ---
 
@@ -49,11 +49,26 @@ not bloat the resident prompt with one-off details.
 
 Progressive disclosure applies to tool results as much as to manuals. A raw tool
 result is useful while you inspect it; after you have consumed it, the better
-active-context form is an index-style summary. Runtime `_meta.guidance` gives
-the high-attention reminder when summarization is timely. For the full procedure
-— urgent large-result handling, idle cleanup sweeps, quality checklist,
-original-result recovery, and summarize-vs-molt boundaries — read
-`reference/summarize-manual/SKILL.md`.
+active-context form is an index-style summary. Summarize deliberately rather than
+on every large result: weigh context pressure, how recoverable the result is from
+logs, and future reuse/token savings, and batch already-digested results instead
+of discharging each immediately. If an adapter/provider comment is present, follow
+its adapter-specific summarize rules on top of these general ones.
+
+The first economy move is to avoid pulling bulky raw output into main context at
+all. Bulky, mechanical, or repetitive work — full test suites, large log scans,
+large diffs, issue sweeps, batch edits/validation — should usually be delegated to
+a daemon (`claude-p` or an appropriate daemon body): frame the task, give exact
+paths/commands and the expected artifacts, then review the daemon's concise report
+instead of ingesting noisy output you would only have to summarize later. Use
+daemons to keep the raw bulk out of main context; use summarize for the bulk that
+already landed there. See `## 3. Use the right body` for the full daemon workflow
+methodology.
+
+Runtime `_meta.guidance` gives the high-attention reminder when summarization is
+timely. For the full procedure — urgent large-result handling, idle cleanup
+sweeps, quality checklist, original-result recovery, and summarize-vs-molt
+boundaries — read `reference/summarize-manual/SKILL.md`.
 
 ## 2. Action and responsiveness
 
