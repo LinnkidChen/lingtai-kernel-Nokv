@@ -247,6 +247,111 @@ def test_mcp_section_wrong_type_rejected():
         validate_init(data)
 
 
+def test_manifest_nokv_config_valid_disabled_shape_has_no_warning():
+    data = _valid_init()
+    data["manifest"]["nokv"] = {
+        "enabled": False,
+        "endpoint": None,
+        "default_namespace": None,
+        "uri_prefixes": [],
+    }
+    warnings = validate_init(data)
+    assert not any("manifest.nokv" in w for w in warnings)
+
+
+def test_manifest_nokv_config_valid_enabled_shape_has_no_warning():
+    data = _valid_init()
+    data["manifest"]["nokv"] = {
+        "enabled": True,
+        "endpoint": "http://127.0.0.1:7373",
+        "default_namespace": "/lingtai/projects/demo",
+        "uri_prefixes": ["nokv://"],
+    }
+    warnings = validate_init(data)
+    assert not any("manifest.nokv" in w for w in warnings)
+
+
+def test_manifest_nokv_config_wrong_type_rejected():
+    data = _valid_init()
+    data["manifest"]["nokv"] = ["nokv://"]
+    with pytest.raises(ValueError, match=r"manifest\.nokv"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("enabled", "yes"),
+        ("endpoint", 7373),
+        ("default_namespace", 42),
+        ("uri_prefixes", "nokv://"),
+    ],
+)
+def test_manifest_nokv_config_field_type_errors_include_path(field, value):
+    data = _valid_init()
+    data["manifest"]["nokv"] = {
+        "enabled": False,
+        "endpoint": None,
+        "default_namespace": None,
+        "uri_prefixes": [],
+    }
+    data["manifest"]["nokv"][field] = value
+    with pytest.raises(ValueError, match=rf"manifest\.nokv\.{field}"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize(
+    ("prefixes", "index"),
+    [
+        (["nokv://", 42], 1),
+        ([""], 0),
+        (["/tmp"], 0),
+        (["http://127.0.0.1:7373"], 0),
+        (["file:///tmp/lingtai"], 0),
+    ],
+)
+def test_manifest_nokv_config_uri_prefix_entries_rejected(prefixes, index):
+    data = _valid_init()
+    data["manifest"]["nokv"] = {
+        "enabled": False,
+        "endpoint": None,
+        "default_namespace": None,
+        "uri_prefixes": prefixes,
+    }
+    with pytest.raises(ValueError, match=rf"manifest\.nokv\.uri_prefixes\[{index}\]"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize("include_uri_prefixes", [False, True])
+def test_manifest_nokv_config_enabled_requires_uri_prefix(include_uri_prefixes):
+    data = _valid_init()
+    data["manifest"]["nokv"] = {
+        "enabled": True,
+        "endpoint": "http://127.0.0.1:7373",
+        "default_namespace": "/lingtai/projects/demo",
+    }
+    if include_uri_prefixes:
+        data["manifest"]["nokv"]["uri_prefixes"] = []
+    with pytest.raises(
+        ValueError,
+        match=r"manifest\.nokv\.uri_prefixes.*enabled NoKV needs at least one URI prefix",
+    ):
+        validate_init(data)
+
+
+def test_manifest_nokv_config_unknown_field_warns():
+    data = _valid_init()
+    data["manifest"]["nokv"] = {
+        "enabled": False,
+        "endpoint": None,
+        "default_namespace": None,
+        "uri_prefixes": [],
+        "extra_key": "ignored",
+    }
+    warnings = validate_init(data)
+    assert "unknown field in manifest.nokv: extra_key" in warnings
+
+
 def test_time_awareness_field_valid_bool():
     from lingtai.init_schema import validate_init
 

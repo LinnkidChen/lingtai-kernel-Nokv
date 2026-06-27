@@ -75,6 +75,9 @@ MANIFEST_OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "timezone_awareness": bool,
     "pseudo_agent_subscriptions": list,
     "preset": dict,
+    # Schema-only boundary for future explicit nokv:// routing. This does not
+    # import NoKV or change local FileIO behavior.
+    "nokv": dict,
     # Large-result notification threshold.  When a tool result's serialized
     # length exceeds this value it becomes a pending large-result case; the
     # system-channel notification fires only once the combined length of all
@@ -168,6 +171,10 @@ def validate_init(data: dict) -> list[str]:
     manifest = data["manifest"]
     _require_keys(manifest, MANIFEST_REQUIRED, prefix="manifest")
     _optional_keys(manifest, MANIFEST_OPTIONAL, prefix="manifest")
+
+    nokv = manifest.get("nokv")
+    if nokv is not None:
+        _validate_nokv_config(nokv, warnings)
 
     # Validate manifest.preset umbrella if present.
     #
@@ -389,3 +396,34 @@ def _check_type(
         raise ValueError(
             f"{path}: expected {type_str}, got {type(value).__name__}"
         )
+
+
+def _validate_nokv_config(nokv: dict, warnings: list[str]) -> None:
+    """Validate the optional schema-only manifest.nokv config block."""
+    _optional_keys(nokv, {
+        "enabled": bool,
+        "endpoint": (str, type(None)),
+        "default_namespace": (str, type(None)),
+        "uri_prefixes": list,
+    }, prefix="manifest.nokv")
+
+    uri_prefixes = nokv.get("uri_prefixes", [])
+    for i, prefix in enumerate(uri_prefixes):
+        path = f"manifest.nokv.uri_prefixes[{i}]"
+        if not isinstance(prefix, str):
+            raise ValueError(
+                f"{path}: expected non-empty URI-style str, got {type(prefix).__name__}"
+            )
+        if not prefix:
+            raise ValueError(f"{path}: expected non-empty URI-style str")
+        if not prefix.startswith("nokv://"):
+            raise ValueError(f"{path}: expected nokv:// URI prefix")
+
+    if nokv.get("enabled") is True and not uri_prefixes:
+        raise ValueError(
+            "manifest.nokv.uri_prefixes: enabled NoKV needs at least one URI prefix"
+        )
+
+    for key in nokv:
+        if key not in {"enabled", "endpoint", "default_namespace", "uri_prefixes"}:
+            warnings.append(f"unknown field in manifest.nokv: {key}")
