@@ -19,7 +19,7 @@ OpenAI adapter — wraps the `openai` SDK for Chat Completions and Responses API
 | `OpenAIChatSession` | 492–1003 | Chat Completions session with context overflow auto-recovery; sends optional `prompt_cache_key` |
 | `OpenAIResponsesSession` | 1006–1204 | Responses API session with server-side `previous_response_id` chaining, optional `context_management` compaction, and optional `prompt_cache_key` |
 | `OpenAIAdapter` | 1207–1520 | `LLMAdapter` implementation; dispatches to Completions or Responses path; receives injected `compact_threshold`; derives the default `prompt_cache_key` via `_default_prompt_cache_key` / `_resolve_prompt_cache_key` |
-| `CodexResponsesSession` | `adapter.py:1641` | Stateless Responses session for ChatGPT-backed Codex: full-history replay, encrypted reasoning include, cache-affinity headers, honest client/account identity, and honest Codex metadata envelope. |
+| `CodexResponsesSession` | `adapter.py:1641` | Responses session for ChatGPT-backed Codex running the `full`/`incremental` additive continuation state machine over a selectable transport (REST default, WebSocket opt-in): `store=false` always, encrypted reasoning include, cache-affinity headers, honest client/account identity, and honest Codex metadata envelope. |
 | `CodexOpenAIAdapter` | `adapter.py:2017` | Codex provider specialization: forces Responses mode, derives stable per-agent cache/session ids plus a LingTai installation id from the configured anchor, and wires account/metadata hints into Codex sessions. |
 
 ### adapter.py helpers
@@ -27,7 +27,7 @@ OpenAI adapter — wraps the `openai` SDK for Chat Completions and Responses API
 | Function | Lines | Role |
 |----------|-------|------|
 | `_base_url_namespace()` | 102–116 | Stable namespace token for an OpenAI-compatible `base_url` (URL host, or short hash fallback) used in the default `prompt_cache_key` |
-| `_codex_session_id()` | ~80–94 | Derive the stable 8-char Codex cache-affinity id (issue #378): `sha256(anchor).hexdigest()[:8]`, lowercase hex, where `anchor` MUST be a per-agent identity (the resolved `init.json` path). The same value is used byte-identically for `session_id`, `thread_id`, and the default `prompt_cache_key` on the root/main path. PURE hash — no time/epoch — so it is stable across restarts |
+| `_codex_session_id()` | ~106–122 | Derive the 8-char Codex cache-affinity id (issue #378): `sha256(f"{anchor}\0{molt_count}").hexdigest()[:8]`, lowercase hex, where `anchor` MUST be a per-agent identity (the resolved `init.json` path) and `molt_count` is the agent's current molt count. The same value is used byte-identically for `session_id`, `thread_id`, and the default `prompt_cache_key` on the root/main path. No time/epoch — stable across restarts WITHIN a molt segment, and intentionally changes at each molt boundary |
 | `_codex_installation_id()` | `adapter.py:154` | Derives a UUID-shaped, non-secret LingTai installation id for Codex `client_metadata` from the same local anchor/id; never reuses `~/.codex/installation_id`. |
 | `_codex_identity_headers()` | ~150–205 | Builds Codex client identity headers (`originator`, `User-Agent`): default requests identify as LingTai, while the official Codex CLI-shaped identity remains an explicit local diagnostic opt-in. | `adapter.py:140`, `adapter.py:153`, `adapter.py:178`, `adapter.py:214` |
 | `_validate_compact_threshold()` | 69–83 | Validates/normalizes OpenAI Responses auto-compaction threshold; positive `int` or explicit `None` (disable) only |
@@ -73,40 +73,77 @@ Both paths return sessions wrapped via `_wrap_with_gate()` for rate limiting.
 3. Call `client.responses.create(**kwargs)`
 4. Store `response_id` for next turn
 
-### Codex stateless flow (`CodexResponsesSession.send_stream`, line 1266)
+### Codex continuation flow (`CodexResponsesSession.send_stream`)
 
-1. Record message into canonical `ChatInterface`
-2. `to_responses_input(interface)` — replay full conversation as input items
-3. Force `stream=True`, `store=False`; omit `previous_response_id`; send the current `prompt_cache_key`
-4. After success: record assistant response into interface for next replay
+Two orthogonal axes drive each Codex turn:
+
+- **Transfer mode** — `full` vs `incremental` (the strict additive
+  `previous_response_id` state machine, `_codex_plan_continuation`). Transport-independent.
+- **Transport** — `rest` (normal runtime, hardcoded) vs `websocket`. Selects how
+  the planned request is sent, never *whether* incremental continuation is used.
+
+**Transport selection:** REST is **hardcoded** for normal runtime
+(`_CODEX_TRANSPORT_DEFAULT = "rest"`). There is intentionally **no environment
+variable** that selects the transport — an inherited `LINGTAI_CODEX_WS` or
+`LINGTAI_CODEX_TRANSPORT` is ignored and cannot flip the runtime to WebSocket
+(live testing confirmed REST prompt-prefix caching is sufficient). The WebSocket
+transport code is retained for tests / internal / future use and is reachable
+**only** via an explicit `transport="websocket"` (or legacy `ws_enabled=True`)
+constructor kwarg.
+
+Flow:
+
+1. Record message into canonical `ChatInterface`.
+2. `_frozen_responses_input(interface)` — the full conversation as input items
+   (with per-`call_id` output freezing for stable replay).
+3. Run the shared `_codex_plan_continuation` planner: first turn / prefix mismatch
+   / epoch reset → **full**; strict additive continuation → **incremental**.
+4. Send via the selected transport:
+   - REST `client.responses.create(...)` (default): send the full converted input
+     in both modes. REST `incremental` means unchanged prefix/cache epoch, not
+     wire delta, and never sends `previous_response_id`.
+   - WebSocket (`codex_ws`): `full` sends the full input; `incremental` sends the
+     strict-additive delta plus `previous_response_id`.
+5. After success: record the assistant response into the interface and recompute
+   the converter-stable delta baseline (`_ws_record_baseline_from_interface`) so the
+   next turn can strict-prefix-match and stay incremental.
+**Usage metadata axes:** `UsageMetadata.extra` carries `codex_transport`
+(`rest`/`websocket`), `codex_transfer_mode` (`full`/`incremental`), and the
+transport-qualified `codex_request_mode` (`rest_full` / `rest_incremental` /
+`ws_full` / `ws_incremental` / `rest_full_fallback`), plus the safe delta-decision
+diagnostic (`codex_ws_delta_reason` and counts — never prompt/secret content). The
+WS-named `codex_ws_*` diagnostic keys are reused on REST (transport-neutral
+metadata); `codex_request_mode` never reads `ws_*` on a REST request.
 
 ### Prompt cache key (`prompt_cache_key`)
 
 **Default-on for every OpenAI-compatible path.** Both `OpenAIChatSession` and `OpenAIResponsesSession` accept an optional `prompt_cache_key` and, when set, add it to the request kwargs on all send paths (Chat Completions `send` / `send_stream`; Responses `send` / `send_stream`; Codex `send_stream`). A bare directly-constructed session leaves it `None` (opt-in) — the *adapter* supplies the namespaced default:
 
 - `OpenAIAdapter._default_prompt_cache_key(model)` derives the namespace from identity: official OpenAI (no `base_url`) → `lingtai-openai:{model}:v1`; any custom/compatible `base_url` → `lingtai-openai-compat:{host}:{model}:v1` (host from `_base_url_namespace`, hash fallback). Distinct endpoints/models never share a cache slot.
-- Provider subclasses with a fixed identity override it: DeepSeek → `lingtai-deepseek:{model}:v1`, Zhipu/GLM → `lingtai-zhipu:{model}:v1`, MiMo → `lingtai-mimo:{model}:v1`. **Codex is special:** on the normal/root path `_default_prompt_cache_key` returns the SAME 8-char agent-path hash as the `session_id`/`thread_id` cache-affinity headers (underscore keys, matching the Codex backend literally — a hyphenated spelling loses cache affinity; all three byte-identical); it falls back to `lingtai-codex:{model}:v1` only on the bare/no-anchor path. The compat probe (`reports/prompt-cache-key-openai-compat-probe-*.json`) confirmed DeepSeek/Zhipu/MiMo Chat Completions accept the field.
+- Provider subclasses with a fixed identity override it: DeepSeek → `lingtai-deepseek:{model}:v1`, Zhipu/GLM → `lingtai-zhipu:{model}:v1`, MiMo → `lingtai-mimo:{model}:v1`. **Codex is special:** on the normal/root path `_default_prompt_cache_key` returns the SAME 8-char (agent-path, molt-count) hash as the `session_id`/`thread_id` cache-affinity headers (underscore keys, matching the Codex backend literally — a hyphenated spelling loses cache affinity; all three byte-identical); it falls back to `lingtai-codex:{model}:v1` only on the bare/no-anchor path. The compat probe (`reports/prompt-cache-key-openai-compat-probe-*.json`) confirmed DeepSeek/Zhipu/MiMo Chat Completions accept the field.
 - `_resolve_prompt_cache_key(model)` applies the adapter's policy from the constructor kwarg `prompt_cache_key`: `None` (default) → auto-derive; an explicit string → override for every session; `False` → disable (never sent). Both `_create_completions_session` and `_create_responses_session` (and the Codex variant) pass `_resolve_prompt_cache_key(model)` into the session.
 
 `prompt_cache_retention` is deliberately never sent — Codex rejects it (`Unsupported parameter`) and the whole OpenAI-compatible surface is kept uniform — and no Anthropic-style `cache_control` is emitted (Codex rejects `Unknown parameter`). MiniMax is Anthropic-compatible in this repo and is unaffected.
 
 ### Codex REST cache-affinity ids (`session_id` / `thread_id` / `prompt_cache_key`)
 
-**Codex-only.** The three cache-affinity values are a **single stable per-agent id**, byte-identical and NEVER changed for the life of the agent's identity:
+**Codex-only.** The three cache-affinity values are a **single per-agent id**, byte-identical, stable within a molt segment and refreshed at each molt boundary:
 
 ```
-prompt_cache_key == session_id == thread_id == <stable per-agent id>
+prompt_cache_key == session_id == thread_id == <per-agent (anchor, molt) id>
 ```
 
-`CodexResponsesSession.__init__` **normalizes** whatever candidates it receives (`prompt_cache_key`, `session_id`, `thread_id`) into one id and uses it byte-identically for all three. Priority is `prompt_cache_key` > `session_id` > `thread_id` (the explicit request-body cache-affinity key wins). This closes the leak where an explicit override or a directly-constructed session could send three different values.
+`CodexResponsesSession.__init__` **normalizes** whatever candidates it receives (`prompt_cache_key`, `session_id`, `thread_id`) into one id and uses it byte-identically for all three. Priority is `prompt_cache_key` > `session_id` > `thread_id` (the explicit request-body cache-affinity key wins). This closes the leak where explicit request-body/cache-affinity inputs or a directly-constructed session could send three different values.
 
-**The id is a PURE deterministic hash of the agent path — no time, no epoch, no rotation.** It is `_codex_session_id(anchor) = sha256(anchor).hexdigest()[:8]`, where `anchor` is the per-agent durable identity (the resolved `init.json` path). The same agent path always yields the same id across restarts / refresh / molt / clear, so the agent keeps routing to the **same sticky-warm backend cache slot**. (Empirically the backend routes the prompt cache to a replica off a *stable* session id; changing the id re-rolls the routing and discards the warm slot — so we never change it. Earlier designs epoch-stamped the id on rebuild and rotated it on "stalled cache" dips; both were removed 2026-06 as counterproductive, along with the `codex-cache-key` request header.)
+**The id is a deterministic hash of the agent path AND the current molt count — no time, no epoch, no rotation within a molt, no operator override.** It is `_codex_session_id(anchor, molt_count) = sha256(f"{anchor}\0{molt_count}").hexdigest()[:8]`, where `anchor` is the per-agent durable identity (the resolved `init.json` path) and `molt_count` is read live from `<working_dir>/.agent.json`. Within a molt segment the same agent yields the same id across restarts / refresh / clear, so it keeps routing to the **same sticky-warm backend cache slot**; at each molt boundary the id intentionally changes so the molt starts on a fresh slot. **Molt does NOT rebuild the adapter**, so the id is (re)derived at request time from the live `molt_count` — never cached once at construction (`_resolve_codex_ids` / `_default_prompt_cache_key` both call `_current_codex_id()`, which reads `_current_molt_count()` afresh). (Empirically the backend routes the prompt cache to a replica off a stable session id; churning it *within* a molt re-rolls the routing and discards the warm slot — so the only intentional id change is the molt boundary. Earlier designs epoch-stamped the id on rebuild and rotated it on "stalled cache" dips, and a now-removed operator-level fixed `codex_session_id` override could pin the id; all were removed as counterproductive, along with the `codex-cache-key` request header.)
 
-The REST `/backend-api/codex/responses` endpoint does **not** accept `previous_response_id` (`Unsupported parameter`), so the cache-affinity lever — like the official Codex client — is stable HTTP headers (`session_id` / `thread_id`, underscore spelling to match Codex CLI), sent via the SDK's per-request `extra_headers` (never request-body fields), plus the request-body `prompt_cache_key`.
+Stable HTTP headers (`session_id` / `thread_id`, underscore spelling to match Codex CLI, sent via the SDK's per-request `extra_headers` — never request-body fields) plus the request-body `prompt_cache_key` are the cache-affinity lever and are independent of the transfer mode. They ride on **every** request regardless of full vs incremental.
+
+> **REST incremental caveat.** REST `incremental` is not a wire-delta mode. It still sends the full converted context, but labels the request as an unchanged-prefix/cache-epoch continuation so diagnostics and cache-ledger logic can distinguish it from an epoch rebuild. WebSocket remains the only Codex transport that sends delta input plus `previous_response_id`.
 
 - **Header carve-out (NON-NEGOTIABLE).** `session_id` / `thread_id` route the backend cache slot and MUST be per-agent. Headers are emitted **only when an explicit `session_id`/`thread_id` was supplied** (`has_header_identity`); a *lone* `prompt_cache_key` — the model-only fallback `lingtai-codex:{model}:v1`, shared by every agent on a model — stays a **body-only** cache key and promotes **no** headers. Promoting it would collapse all agents onto one session/thread, which is exactly the bug the per-agent design exists to avoid. So `_cache_affinity_headers()` emits headers iff the session was given header identity; a bare/test session with no ids sends neither. The adapter has no per-agent identity of its own, so the host wiring passes the agent path down by default (see below).
-- **Default wiring (the normal path — not opt-in, not opt-out).** For a Codex agent, `service.build_provider_defaults_from_manifest_llm(llm, ..., working_dir=...)` injects `codex_session_anchor = str((working_dir / "init.json").resolve())` (the agent path / durable identity anchor). The adapter hashes it into the id and uses it for all three values via `_resolve_codex_ids` (returns `(id, id)` — the thread tracks the session id exactly) and `_default_prompt_cache_key` (returns the same `id`). The default wiring does **not** read the token ledger, molt time, or any clock, so the same `working_dir` always yields the same id.
-- The `codex_session_id` / `codex_session_anchor` / `codex_thread_salt` keys remain settable on the manifest `llm` block (allowlisted in `../service.py` `_PROVIDER_DEFAULTS_PASS_THROUGH_KEYS`) as an **internal override / testing escape hatch** — an explicit `codex_session_id` is used verbatim for all three; `codex_thread_salt` survives as a legacy pass-through but no longer derives a separate thread id. `_resolve_codex_ids(model)` returns `(None, None)` only when no anchor/id was passed down at all (the bare/test path).
+- **Default wiring (the normal path — not opt-in, not opt-out).** For a Codex agent, `service.build_provider_defaults_from_manifest_llm(llm, ..., working_dir=...)` injects `codex_session_anchor = str((working_dir / "init.json").resolve())` (the agent path / durable identity anchor). The adapter hashes it together with the live `molt_count` into the id and uses it for all three values via `_resolve_codex_ids` (returns `(id, id)` — the thread tracks the session id exactly) and `_default_prompt_cache_key` (returns the same `id`), both computed fresh per request through `_current_codex_id()`. The default wiring does **not** read the token ledger, molt time, or any clock — only the agent path and the current `molt_count` — so the same `(working_dir, molt_count)` always yields the same id and a molt advances it.
+- The `codex_session_anchor` / `codex_thread_salt` keys remain settable on the manifest `llm` block (allowlisted in `../service.py` `_PROVIDER_DEFAULTS_PASS_THROUGH_KEYS`) as an **internal override / testing escape hatch** — `codex_session_anchor` overrides the auto-injected agent path; `codex_thread_salt` survives as a legacy pass-through but no longer derives a separate thread id. There is no operator-level fixed-id override. `_resolve_codex_ids(model)` returns `(None, None)` only when no anchor was passed down at all (the bare/test path).
 - **Token-ledger dump.** `CodexResponsesSession._usage_extra` copies the `session_id` / `thread_id` / `prompt_cache_key` for the request into `UsageMetadata.extra` as `codex_session_id` / `codex_thread_id` / `codex_prompt_cache_key`. Because of the normalization above these three are the **same value** — the ledger never records mismatched affinity ids. `BaseAgent._save_chat_history()` merges all non-None usage extra fields into `logs/token_ledger.jsonl`, so the ids sit beside input/output/thinking/cached token counts. The values are short, non-secret derived affinity ids — no request body, messages, or OAuth secret ride along. A body-only/bare session contributes only the fields whose levers were actually sent.
 
 ### Codex client-identity headers (`originator` / `User-Agent`)
@@ -131,7 +168,7 @@ When a Codex session has a stable LingTai session/thread identity, `CodexRespons
 - **`OpenAIChatSession._request_timeout`** — per-request HTTP timeout set by caller before dispatch (line 319). Prevents race between watchdog and SDK.
 - **`OpenAIResponsesSession._response_id`** — server-side session chain pointer. Updated after each `send()` / streamed response.
 - **`CodexResponsesSession._response_id`** — transient debug aid only; never threaded into next request (line 1538).
-- **`CodexResponsesSession._current_id`** — the single stable per-agent affinity id (a pure hash of the agent path), used byte-identically for `_prompt_cache_key` / `_session_id` / `_thread_id`. Set once at construction and never changed (no rotation, no epoch, no clock).
+- **`CodexResponsesSession._current_id`** — the single per-agent affinity id (the hash of the agent path + current molt count) handed to this session, used byte-identically for `_prompt_cache_key` / `_session_id` / `_thread_id`. Set once per session at construction — a NEW session is built for each `create_chat`, and the adapter resolves the molt-current id at that point, so a molt-advanced id reaches the next session without any in-session mutation (no rotation, no epoch, no clock).
 - **Codex Responses trace** — opt-in diagnostics write JSONL metadata to `logs/codex_responses_trace.jsonl` when `LINGTAI_CODEX_RESPONSES_TRACE=1` (override path with `LINGTAI_CODEX_RESPONSES_TRACE_PATH`). Default off; stores event/item shapes, lengths/hashes, usage, and accumulator counts, not raw content.
 - **`OpenAIAdapter._client`** — shared `openai.OpenAI` instance. `_client_kwargs` stored for session `reset()`.
 - **`OpenAIAdapter._session_class`** — class var, subclasses override (e.g. DeepSeek and MiMo inject `reasoning_content` round-trip fallbacks).
@@ -158,13 +195,25 @@ When a Codex session has a stable LingTai session/thread identity, `CodexRespons
 
 `_pair_orphan_tool_calls()` (line 376) scans the serialized message list for `assistant.tool_calls` without matching `role=tool` messages. Synthesizes placeholder tool results with `[synthesized placeholder — real result was not in context at send time]`. Logs warnings for investigation. Does NOT mutate canonical interface.
 
-The Codex / Responses path has the same invariant: `to_responses_input` ends with `_pair_responses_orphan_function_calls` (`interface_converters.py:184-227`) which appends a synthesized `function_call_output` for any `function_call` without a matching output anywhere in the items list. Same placeholder string, same non-mutating semantics. Without this guard the provider returns `400 No tool output found for function call …` when a continuation request is built from a half-committed tool loop (issue #170).
+The Codex / Responses path has the same invariant: `to_responses_input` ends with `_pair_responses_orphan_function_calls` (`../interface_converters.py:190-250`) which synthesizes a `function_call_output` for any `function_call` without a matching output anywhere in the items list. Same placeholder string, same non-mutating semantics. Without this guard the provider returns `400 No tool output found for function call …` when a continuation request is built from a half-committed tool loop (issue #170).
+
+**Placeholders go at the TAIL, not interleaved.** The guard appends its synthesized placeholders as one contiguous block at the end of the items list, in `function_call` order — it does **not** insert each placeholder immediately after its call. This is a continuation-stability fix: `to_responses_input` always emits an assistant entry's `function_call`s contiguously and all real `function_call_output`s afterwards, so interleaving a placeholder right after each call made placeholder positions drift relative to where the real outputs land. A multi-call turn resolving incrementally then broke the Codex strict-prefix continuation and forced a `*_full` request every turn — the logged `prefix_mismatch` with `mismatch_prev_type=function_call_output` vs `mismatch_cur_type=function_call`. The baseline recorder reinforces this: `_ws_record_baseline_from_interface` strips **all** synthesized placeholders (not just trailing ones) from the recorded baseline via `_strip_synthesized_orphan_outputs` (`adapter.py:512-540`), so the real, position-stable items are the only load-bearing prefix and the real tool result strictly extends the baseline. Fix applies to BOTH transports (shared converter + shared baseline recorder).
+
+### System prompt is `instructions`, frozen per session (Responses/Codex)
+
+On the Responses/Codex path the system prompt is **not** an `input` item — it rides in the top-level `instructions` kwarg. `to_responses_input` deliberately skips system entries (`../interface_converters.py:280-281`, documented `../interface_converters.py:256-257`); the prompt is carried separately as `instructions`.
+
+That `instructions` value is **frozen at session construction**: `OpenAIResponsesSession.__init__` captures `self._instructions = instructions` (`adapter.py:1711`) and every send replays that same frozen value (`adapter.py:1785-1786`, `adapter.py:1818-1819`; Codex `adapter.py:3367-3368`). There is no re-read from the interface.
+
+In-flight Responses/Codex sessions therefore have a **no-op `update_system_prompt`**: the base `ChatSession.update_system_prompt` is a default no-op (`lingtai_kernel/llm/base.py:289-293`), and only `OpenAIChatSession` overrides it to mutate the interface (`adapter.py:1429-1431`). `OpenAIResponsesSession` and `CodexResponsesSession` do **not** override it, so it stays inert on those paths.
+
+**Behavior-code contract:** a pad / system-prompt edit mid-session changes nothing on the wire — it does **not** break the current input-prefix continuation or cache, so the warm continuation is preserved. A changed system prompt takes effect only when a **new** session is constructed (molt / refresh / restart / bootstrap), since `instructions` is re-resolved from the live system prompt at that point (`_create_responses_session` / Codex create path pass `instructions=system_prompt`, e.g. `adapter.py:2063`, `adapter.py:4009`). This is the contract surfaced to the agent by `_CODEX_SYSTEM_PROMPT_UPDATE_NOTE` (`adapter.py:2237-2245`) via the static adapter comment (`system_prompt_update_note`, `adapter.py:2279`, `adapter.py:2312`).
 
 ### Streaming
 
 - **CC streaming** (`send_stream`, line 622) — `stream=True, stream_options={include_usage: True}`. Uses `StreamingAccumulator` for text + tool deltas. Reasoning deltas captured from `delta.reasoning` or `delta.reasoning_content` (OpenRouter compatibility, lines 726-733). Overflow recovery wraps the stream open + first chunk (lines 668-690).
 - **Responses streaming** (`send_stream`, line 891) — event types: `response.reasoning_summary_text.delta/done` (summary thoughts only), `response.output_text.delta`, `response.function_call_arguments.delta`, `response.output_item.added/done`, `response.completed`.
-- **Codex streaming** — forces `stream=True` even on `send()` (line 1372). Full interface replay per request; captured summary thoughts are persisted as ThinkingBlocks so `to_responses_input` replays reasoning items before function calls. Optional diagnostics (`LINGTAI_CODEX_RESPONSES_TRACE=1`) append safe per-event metadata to `logs/codex_responses_trace.jsonl` without changing accumulator/persistence behavior.
+- **Codex streaming** — forces `stream=True` even on `send()`. Runs the `full`/`incremental` planner per request over the selected transport (REST default / WebSocket opt-in): REST carries the whole converted interface in both modes; WebSocket carries the whole interface for `full` and delta + `previous_response_id` for `incremental`. Captured summary thoughts are persisted as ThinkingBlocks so `to_responses_input` replays reasoning items before function calls. Optional diagnostics (`LINGTAI_CODEX_RESPONSES_TRACE=1`) append safe per-event metadata to `logs/codex_responses_trace.jsonl` without changing accumulator/persistence behavior.
 
 ### Authentication paths
 

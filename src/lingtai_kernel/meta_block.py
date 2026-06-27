@@ -13,9 +13,11 @@ the result dict:
 - ``_meta.tool_meta`` — permanent per-result identity facts, written once by
   ``ToolExecutor._attach_tool_block`` and never moved.
 - ``_meta.agent_meta`` — latest-result-only agent/current-state snapshot.
-- ``_meta.guidance`` — latest-result-only kernel guidance.  Guidance is an
-  ordered, system-prompt-like appendix; ``meta_readme`` is one section within
-  ``guidance.sections`` rather than a sibling key.
+- ``_meta.guidance`` — latest-result-only lightweight ref/hook pointing at the
+  resident ``meta_guidance`` system-prompt section (built by
+  ``build_meta_guidance``), where the full kernel guidance sections, the
+  ``_meta`` readme, and any static adapter runtime rules now live.  The full
+  ordered appendix is no longer re-stamped on every tail result.
 - ``_meta.notifications`` / ``_meta.notification_guidance`` — latest-result-only
   channel-owned notification payloads plus kernel safety framing.
 
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import json as _json
 import time as _time
+from collections.abc import Mapping
 from importlib import resources as _resources
 
 from .config import (
@@ -164,6 +167,7 @@ def formal_tool_result_preview(content, limit: int = 200) -> str:
     return _visible_content_text(formal_tool_result_content(content))[:limit]
 
 
+
 def _is_tool_result_block(block) -> bool:
     """Best-effort duck-typing for ToolResultBlock without a hard import cycle."""
     return block.__class__.__name__ == "ToolResultBlock" and hasattr(block, "content")
@@ -197,20 +201,129 @@ def adapter_comment(agent):
         return None
 
 
+def static_adapter_comment(agent):
+    """Return the adapter's static/rule-like runtime note (no dynamic state).
+
+    The static comment is the durable explanation of how the active adapter's
+    continuation/caching/summarize machinery behaves; it does not change turn to
+    turn.  It is rendered once into the resident ``meta_guidance`` system-prompt
+    section rather than re-stamped onto every tail ``_meta``.  Adapters expose it
+    via a ``static_adapter_comment`` method; adapters without one simply
+    contribute nothing to ``meta_guidance``.  Prefer the service/adapter-level
+    hook because the first prompt build happens before a ChatSession exists; the
+    chat-level hook remains as a compatibility fallback.
+    """
+    service = getattr(agent, "service", None)
+    comment_fn = getattr(service, "static_adapter_comment", None)
+    if callable(comment_fn):
+        try:
+            comment = comment_fn()
+        except Exception:
+            comment = None
+        if comment:
+            return comment
+
+    session = getattr(agent, "_session", None)
+    chat = getattr(session, "chat", None)
+    comment_fn = getattr(chat, "static_adapter_comment", None)
+    if not callable(comment_fn):
+        return None
+    try:
+        return comment_fn()
+    except Exception:
+        return None
+
+
+def dynamic_adapter_comment(agent: AgentState) -> Mapping[str, Any] | None:
+    """Return adapter-owned dynamic tail state for ``_meta.agent_meta``.
+
+    Adapters that can separate static guidance from dynamic runtime state should
+    implement ``dynamic_adapter_comment``.  For legacy adapters, fall back to the
+    combined ``adapter_comment`` payload; the generic tail slimmer will only
+    trim oversized structures, not guess adapter-specific static keys.
+    """
+    session = getattr(agent, "_session", None)
+    chat = getattr(session, "chat", None)
+    comment_fn = getattr(chat, "dynamic_adapter_comment", None)
+    if callable(comment_fn):
+        try:
+            comment = comment_fn()
+        except Exception:
+            logger.debug("llm_dynamic_adapter_comment_failed", exc_info=True)
+            comment = None
+        if comment:
+            if not isinstance(comment, Mapping):
+                return {"note": str(comment)}
+            return dict(comment)
+    return adapter_comment(agent)
+
+
+def slim_adapter_comment_for_tail(
+    comment: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Trim dynamic adapter tail payload without guessing static keys.
+
+    Static-vs-dynamic partitioning is owned by the adapter via
+    ``static_adapter_comment`` / ``dynamic_adapter_comment``.  The kernel only
+    removes verbose dynamic structures that are too heavy for every-turn tail
+    metadata and adds a hook back to the resident ``meta_guidance`` section.
+    """
+    if not comment:
+        return None
+    if not isinstance(comment, Mapping):
+        return {"note": str(comment)}
+
+    slim: dict[str, Any] = dict(comment)
+    ledger = slim.pop("cache_ledger", None)
+    if isinstance(ledger, Mapping):
+        summary = ledger.get("summary")
+        if isinstance(summary, Mapping) and "cache_ledger_summary" not in slim:
+            slim["cache_ledger_summary"] = dict(summary)
+        last_full = ledger.get("last_full")
+        if isinstance(last_full, Mapping):
+            slim.setdefault("last_full_api_calls_ago", last_full.get("api_calls_ago"))
+            slim.setdefault("last_full_reason", last_full.get("reason"))
+        last_ws_full = ledger.get("last_ws_full")
+        if isinstance(last_ws_full, Mapping):
+            slim.setdefault(
+                "last_ws_full_api_calls_ago",
+                last_ws_full.get("api_calls_ago"),
+            )
+            slim.setdefault("last_ws_full_reason", last_ws_full.get("reason"))
+
+    hint = slim.get("maintenance_hint")
+    if isinstance(hint, Mapping):
+        compact_hint = dict(hint)
+        compact_hint.pop("reason", None)
+        if compact_hint:
+            slim["maintenance_hint"] = compact_hint
+        else:
+            slim.pop("maintenance_hint", None)
+
+    return slim or None
+
+
 TOOL_RESULT_CHARS_TOP_N = 10
-TOOL_RESULT_CHARS_PREVIEW_LEN = 200
+TOOL_RESULT_CHARS_MIN_TOP_CHARS = 1000
 TOOL_RESULT_CHARS_README = (
-    "listing top 10 tool results by char count with a first-200-char preview; "
-    "no need to summarize this helper (it appears only on the latest tool "
-    "result _meta and older copies are stripped); proactively summarize "
-    "prior tool results that are useless, already digested, irrelevant, "
-    "obsolete, or no longer needed in full, using the listed result "
-    "ids/previews"
+    "listing top 10 tool results over 1000 chars by char count "
+    "(id, tool_name, chars; no preview); no need to summarize this helper "
+    "(it appears only on the latest tool result _meta and older copies are "
+    "stripped); these are summarize candidates, not a directive to summarize "
+    "every entry: prefer summarizing prior results that are already "
+    "consumed/digested and useless, irrelevant, obsolete, or no longer needed "
+    "in full, weighing context pressure, recoverability from logs, and future "
+    "reuse/token savings, and batch them by the listed ids/tool names; if an "
+    "adapter comment is present, follow its adapter-specific summarize rules too"
 )
 
 
 def _tool_result_id(block) -> str:
     return str(getattr(block, "id", None) or getattr(block, "tool_call_id", None) or "")
+
+
+def _tool_result_name(block) -> str:
+    return str(getattr(block, "name", None) or getattr(block, "tool_name", None) or "")
 
 
 def current_tool_result_chars(agent, extra_results=()) -> dict:
@@ -233,15 +346,14 @@ def current_tool_result_chars(agent, extra_results=()) -> dict:
         content = getattr(block, "content", "")
         chars = formal_tool_result_visible_len(content)
         total += chars
-        top.append(
-            {
-                "id": _tool_result_id(block),
-                "chars": chars,
-                "preview": formal_tool_result_preview(
-                    content, TOOL_RESULT_CHARS_PREVIEW_LEN
-                ),
-            }
-        )
+        if chars > TOOL_RESULT_CHARS_MIN_TOP_CHARS:
+            top.append(
+                {
+                    "id": _tool_result_id(block),
+                    "tool_name": _tool_result_name(block),
+                    "chars": chars,
+                }
+            )
 
     for block in _iter_history_tool_result_blocks(agent) or ():
         visit(block)
@@ -252,7 +364,6 @@ def current_tool_result_chars(agent, extra_results=()) -> dict:
 
     top.sort(key=lambda item: item["chars"], reverse=True)
     return {
-        "_readme": TOOL_RESULT_CHARS_README,
         "total_chars": total,
         "top_results": top[:TOOL_RESULT_CHARS_TOP_N],
     }
@@ -273,12 +384,14 @@ def _meta_block(result: dict) -> dict:
 
 
 def build_meta_readme() -> dict:
-    """Self-describing readme for the four ``_meta`` blocks.
+    """Self-describing readme for the five ``_meta`` blocks.
 
-    Latest-only: this rides inside ``_meta.guidance`` on the freshest tool
-    result, never repeated in every ``tool_meta`` (that would be expensive).
-    Each entry states what the block is for and whether it is per-result or
-    latest-only — no policy, just structural orientation.
+    This readme is rendered once into the resident ``meta_guidance``
+    system-prompt section (via :func:`build_meta_guidance`), not stamped onto
+    every tool result; the tail ``_meta.guidance`` carries only a lightweight
+    ref back to that section.  Each entry states what the block is for and
+    whether it is per-result or latest-only — no policy, just structural
+    orientation.
     """
     return {
         TOOL_META_KEY: (
@@ -290,15 +403,18 @@ def build_meta_readme() -> dict:
             "active_turn_tool_calls, current_tool_result_chars, optional "
             "adapter_comment). Latest tool result only; older copies are "
             "stripped as newer results arrive. current_tool_result_chars is "
-            "a dict with total_chars and the top 10 tool results (each with "
-            "a first-200-char preview) that are proactive summarization "
-            "candidates. adapter_comment is a small provider/adapter-authored "
-            "note about model-facing runtime state when the active adapter "
-            "has one."
+            "a compact dict with total_chars and top_results "
+            "(id, tool_name, chars; no preview) for proactive "
+            "summarization candidates. adapter_comment is a small "
+            "provider/adapter-authored note carrying only dynamic per-turn "
+            "runtime scalars; the adapter's static "
+            "rules live in the system-prompt section meta_guidance."
         ),
         GUIDANCE_KEY: (
-            "Kernel guidance sections, including the meta_readme section. "
-            "Latest tool result only."
+            "Lightweight ref/hook to the resident system-prompt section "
+            "meta_guidance, where the full kernel guidance sections, this "
+            "_meta envelope readme, and any static adapter runtime rules live. "
+            "Latest tool result only; carries no full guidance body."
         ),
         NOTIFICATION_GUIDANCE_KEY: (
             "Kernel safety framing for channel notification handling. Latest "
@@ -356,14 +472,15 @@ META_README_SECTION_ID = "meta_readme"
 def build_meta_readme_section() -> Dict[str, str]:
     """Return the guidance section that explains the `_meta` envelope.
 
-    Guidance is consumed like a system prompt appended at the end of context, so
-    every guidance explanation must be an ordered section.  In particular,
-    `meta_readme` must not be reintroduced as a sibling of `sections`.
+    This readme is one ordered section among the kernel guidance sections; both
+    are rendered into the resident ``meta_guidance`` system-prompt section (see
+    :func:`build_meta_guidance`).  The tail ``_meta.guidance`` on tool results is
+    only a lightweight ref back to that section, never the full body.
     """
     readme = build_meta_readme()
     body_lines = [
         "This section explains the `_meta` envelope carried on tool results.",
-        "`_meta.guidance` is an ordered, system-prompt-like appendix rendered at the end of context; `meta_readme` therefore lives here as a section, not as a sibling key beside `sections`.",
+        "These explanations are resident here in the `meta_guidance` system-prompt section; the tail `_meta.guidance` on each tool result carries only a lightweight ref back to this section, not the full body.",
         "",
     ]
     body_lines.extend(f"- `{key}`: {value}" for key, value in readme.items())
@@ -395,6 +512,91 @@ def build_guidance_with_meta_readme(base_guidance: Dict[str, Any] | None = None)
     sections.append(build_meta_readme_section())
     guidance["sections"] = sections
     return guidance
+
+# ---------------------------------------------------------------------------
+# meta_guidance — resident system-prompt section.
+#
+# The static, rule-like content that used to ride in every tail
+# ``_meta.guidance`` (the runtime guidance sections + the ``_meta`` readme) and
+# in the adapter's ``adapter_comment`` (the long full-epoch/summarize prose) is
+# rendered once here and appended as the final, always-resident system-prompt
+# section named ``meta_guidance``.  The tail ``_meta`` then carries only a
+# lightweight ref pointing back at this section.
+# ---------------------------------------------------------------------------
+
+META_GUIDANCE_SECTION_ID = "meta_guidance"
+
+
+def build_meta_guidance_ref() -> dict:
+    """Return the lightweight ``_meta.guidance`` hook for the latest tool result."""
+    return {"ref": META_GUIDANCE_SECTION_ID}
+
+def _render_guidance_sections_markdown(guidance: dict) -> list[str]:
+    """Render guidance.sections (incl. meta_readme) as Markdown subsections."""
+    lines: list[str] = []
+    for section in (guidance or {}).get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        title = section.get("title") or section.get("id") or ""
+        body = section.get("body") or ""
+        if title:
+            lines.append(f"### {title}")
+        if body:
+            lines.append(body)
+        lines.append("")
+    return lines
+
+
+def _render_adapter_comment_markdown(comment: dict) -> list[str]:
+    """Render a static adapter_comment dict as a Markdown subsection."""
+    if not isinstance(comment, dict) or not comment:
+        return []
+    adapter = comment.get("adapter") or "adapter"
+    lines = [f"### {adapter} runtime rules"]
+    for key, value in comment.items():
+        if key == "adapter":
+            continue
+        if isinstance(value, str) and value:
+            lines.append(f"- `{key}`: {value}")
+    lines.append("")
+    return lines
+
+
+def build_meta_guidance(agent) -> str:
+    """Render the resident ``meta_guidance`` system-prompt section body.
+
+    Combines the static, rule-like material that previously rode on every tail
+    ``_meta``:
+
+      * the runtime guidance sections from ``guidance.json`` (e.g. summarize/molt
+        best practice);
+      * the ``_meta`` envelope readme (which blocks exist and whether each is
+        per-result or latest-only);
+      * the active adapter's *static* runtime rules (from
+        :func:`static_adapter_comment`), if any.
+
+    Dynamic per-result state (tool_meta, current_time/context/stamina,
+    notifications, current_tool_result_chars, adapter epoch counters, cache
+    ledger summary, …) is deliberately NOT rendered here — it stays in the tail
+    ``_meta`` so this section can remain a stable, cache-friendly prefix.
+
+    Returns the Markdown body (no ``## meta_guidance`` header — the prompt
+    manager adds the section header).  Returns ``""`` only if nothing renders.
+    """
+    guidance = build_guidance_with_meta_readme()
+    lines: list[str] = [
+        "Resident kernel guidance for reading runtime metadata. This is the "
+        "static, rule-like material; dynamic per-turn state stays in the tail "
+        "`_meta` block on tool results (which points back here via "
+        "`_meta.guidance.ref`).",
+        "",
+    ]
+    lines.extend(_render_guidance_sections_markdown(guidance))
+    static_comment = static_adapter_comment(agent)
+    lines.extend(_render_adapter_comment_markdown(static_comment))
+    body = "\n".join(lines).strip()
+    return body
+
 
 def validate_runtime_guidance(data) -> dict:
     """Validate the guidance payload shape, returning it unchanged on success.
@@ -471,63 +673,35 @@ def build_runtime_guidance() -> dict:
 
 
 def build_molt_context(agent, usage: float) -> dict | None:
-    """Return `_meta.agent_meta.context.molt` for context pressure, if needed.
-
-    Molt pressure is agent state, not a dismissible notification. Keep the
-    payload short and progressively disclosed: enough stage/action text for the
-    model to act, plus pointers to the detailed molt procedure.
-    """
-    if "psyche" not in getattr(agent, "_intrinsics", {}):
+    """Return compact `_meta.agent_meta.context.molt` pressure guidance."""
+    if "psyche" not in getattr(agent, "_intrinsics", set()):
         return None
-    if usage < 0:
+    try:
+        pressure = float(usage)
+    except Exception:
         return None
-    # Thresholds are kernel-owned constants.  Legacy config/init fields
-    # (molt_notice/molt_pressure/molt_urgency) are tolerated elsewhere for
-    # backward compatibility but must not affect runtime pressure stages.
-    notice = MOLT_NOTICE_THRESHOLD
-    strong = MOLT_PRESSURE_THRESHOLD
-    immediate = MOLT_URGENCY_THRESHOLD
-    if usage < notice:
+    if pressure < MOLT_NOTICE_THRESHOLD:
         return None
 
-    if usage >= immediate:
+    if pressure >= MOLT_URGENCY_THRESHOLD:
+        level = "immediate"
         stage = "immediate"
-        level = "critical"
-        default_message = (
-            "Context is above 90%; act now. If system(action=\"summarize\") can quickly "
-            "lower pressure, do it immediately; otherwise molt now. Shorter context "
-            "costs less. Temporary spikes are not the issue."
-        )
-    elif usage >= strong:
-        stage = "strong"
+        action = "tend_stores_then_molt_now"
+    elif pressure >= MOLT_PRESSURE_THRESHOLD:
         level = "warning"
-        default_message = (
-            "Context is above 70%; use system(action=\"summarize\") first if it lowers "
-            "pressure, else molt soon. If idle with no pending work, molt now — "
-            "shorter context costs less. Ignore temporary spikes."
-        )
+        stage = "strong"
+        action = "summarize_noisy_results_and_prepare_molt"
     else:
-        stage = "consider"
         level = "notice"
-        default_message = (
-            "Context is above 50%; if idle with no pending work, molt now proactively — "
-            "shorter context costs less. Else use system(action=\"summarize\") first if "
-            "it lowers pressure. Ignore temporary spikes."
-        )
+        stage = "consider"
+        action = "molt_if_idle_or_summarize_first"
 
     return {
-        "usage": usage,
-        "pressure": usage,
+        "usage": round(pressure, 5),
         "level": level,
         "stage": stage,
-        "message": default_message,
-        "procedure_ref": "procedures.md#performing-a-molt",
+        "action": action,
         "manual": "psyche-manual",
-        "thresholds": {
-            "consider": notice,
-            "strong": strong,
-            "immediate": immediate,
-        },
     }
 
 def build_meta(agent) -> dict:
@@ -547,7 +721,7 @@ def build_meta(agent) -> dict:
                 "molt": dict,                # optional pressure stage/action; present at >=50%
             },
             "stamina_left_seconds": float,   # session time remaining; -1 if unstarted
-            "current_tool_result_chars": dict, # total + top 10 formal tool results w/ preview
+            "current_tool_result_chars": dict, # total + top formal tool results >1000 chars
         }
 
     Sentinel handling: when token decomposition has not yet run, the
@@ -655,9 +829,11 @@ def build_meta(agent) -> dict:
 
     meta["current_tool_result_chars"] = current_tool_result_chars(agent)
 
-    comment = adapter_comment(agent)
+    comment = dynamic_adapter_comment(agent)
     if comment:
-        meta["adapter_comment"] = comment
+        # Only the slim dynamic view rides on the tail; the static adapter rules
+        # are resident in the ``meta_guidance`` system-prompt section.
+        meta["adapter_comment"] = slim_adapter_comment_for_tail(comment)
 
     # Notifications are deliberately NOT included here. Active-state
     # notification payload is a moving single-slot block that lives on the
@@ -776,8 +952,9 @@ def build_synthetic_meta_envelope(
       * ``tool_meta``            — synthetic identity (see
         :func:`build_synthetic_tool_meta`)
       * ``agent_meta``           — current ``build_meta`` snapshot
-      * ``guidance``             — packaged ``guidance.json`` plus a
-        ``meta_readme`` section in ``guidance.sections``
+      * ``guidance``             — lightweight ref to the resident
+        ``meta_guidance`` system-prompt section (see
+        :func:`build_meta_guidance_ref`)
       * ``notifications`` +
         ``notification_guidance``— from ``notification_payload`` (the dict
         returned by :func:`build_notification_payload`)
@@ -792,12 +969,10 @@ def build_synthetic_meta_envelope(
     except (AttributeError, TypeError):
         agent_meta = {}
 
-    guidance = build_guidance_with_meta_readme()
-
     envelope: dict = {
         TOOL_META_KEY: build_synthetic_tool_meta(call_id),
         AGENT_META_KEY: agent_meta,
-        GUIDANCE_KEY: guidance,
+        GUIDANCE_KEY: build_meta_guidance_ref(),
     }
     # notifications + notification_guidance from the canonical payload.
     envelope.update(notification_payload)
@@ -1167,18 +1342,20 @@ def attach_active_runtime(
     agent_meta["current_tool_result_chars"] = current_tool_result_chars(
         agent, extra_results=tool_results
     )
-    comment = adapter_comment(agent)
+    # The adapter_comment carries both dynamic per-turn scalars and static
+    # rule-like prose plus a long cache ledger.  The static content is resident
+    # in the ``meta_guidance`` system-prompt section, so the tail keeps only the
+    # slim dynamic view plus a ref back to that section.
+    comment = dynamic_adapter_comment(agent)
     if comment:
-        agent_meta["adapter_comment"] = comment
+        agent_meta["adapter_comment"] = slim_adapter_comment_for_tail(comment)
 
-    # Guidance is prompt-like ordered material.  Keep the `_meta` readme as a
-    # section so consumers can render one coherent guidance block instead of a
-    # mixed object with sibling control fields.
-    guidance = build_guidance_with_meta_readme()
-
+    # Guidance is resident in the ``meta_guidance`` system-prompt section; the
+    # tail only carries a lightweight ref/hook rather than re-stamping the whole
+    # ordered appendix (sections + the ``_meta`` readme) on every result.
     meta = _meta_block(target)
     meta[AGENT_META_KEY] = agent_meta
-    meta[GUIDANCE_KEY] = guidance
+    meta[GUIDANCE_KEY] = build_meta_guidance_ref()
     return target
 
 

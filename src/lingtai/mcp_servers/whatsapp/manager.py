@@ -15,6 +15,7 @@ from uuid import uuid4
 from .client import WhatsAppClient
 from .redaction import redact_account
 from .webhook import extract_events
+from .. import _skill
 
 
 def _load_notification_header_template() -> str:
@@ -22,6 +23,12 @@ def _load_notification_header_template() -> str:
 
 
 _NOTIFICATION_HEADER_TEMPLATE = _load_notification_header_template()
+
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter name/description are
+# injected into the tool schema as a progressive-disclosure catalog entry.
+_SKILL_NAME = "whatsapp-mcp-manual"
+_SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH = _skill.load_skill(__package__)
 
 _CS_WINDOW_NOTE = (
     "WhatsApp Cloud API allows free-form business replies only inside the "
@@ -31,7 +38,7 @@ _CS_WINDOW_NOTE = (
 
 ACTIONS = [
     "send", "check", "read", "reply", "search", "react", "contacts", "add_contact",
-    "remove_contact", "templates", "accounts", "status",
+    "remove_contact", "templates", "accounts", "status", "manual",
 ]
 
 DESCRIPTION = "WhatsApp Cloud API client for LingTai. Official Meta API only; no WhatsApp Web bridge."
@@ -39,7 +46,11 @@ DESCRIPTION = "WhatsApp Cloud API client for LingTai. Official Meta API only; no
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ACTIONS},
+        "action": {
+            "type": "string",
+            "enum": ACTIONS,
+            "description": _skill.manual_action_description(_SKILL_FRONTMATTER, _SKILL_NAME),
+        },
         "account": {"type": "string"},
         "to": {"type": "string", "description": "WhatsApp wa_id recipient"},
         "wa_id": {"type": "string"},
@@ -159,6 +170,18 @@ class WhatsAppManager:
             return getattr(self, f"_{action}")(args)
         except Exception as e:
             return {"status": "error", "error": str(e), "error_type": type(e).__name__}
+
+    def _manual(self, args: dict[str, Any]) -> dict[str, Any]:
+        # The manual lives in this package's bundled SKILL.md (standard skill
+        # format: YAML frontmatter + markdown body), loaded at import time.
+        # action='manual' returns the full skill markdown plus parsed metadata
+        # and the resolved path; the frontmatter is also injected into the
+        # schema's 'action' description as a catalog entry. Bundled
+        # asset/reference sidecars, if any, are documented inside SKILL.md and
+        # are not returned as structured tool fields.
+        return _skill.manual_payload(
+            _SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH, _SKILL_NAME
+        )
 
     def _client(self, alias: str) -> WhatsAppClient:
         a = self.accounts[alias]

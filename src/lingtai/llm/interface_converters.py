@@ -191,11 +191,13 @@ def _pair_responses_orphan_function_calls(items: list[dict]) -> list[dict]:
     """Wire-layer guard for the Responses API input list.
 
     Walks the list and, for any ``function_call`` item whose ``call_id``
-    is not followed by a matching ``function_call_output`` item (in any
-    later position, not just immediately after), inserts a synthesized
-    ``function_call_output`` placeholder immediately after the
-    ``function_call``. The canonical interface is not mutated — this
-    repair is local to the serialization and re-runs on the next send.
+    has no matching ``function_call_output`` item (in any position),
+    appends a synthesized ``function_call_output`` placeholder at the END
+    of the list. The placeholders are emitted as one contiguous tail block,
+    in ``function_call`` order, so the serialization stays stable across
+    continuation turns (see the in-body comment for why tail placement beats
+    interleaving). The canonical interface is not mutated — this repair is
+    local to the serialization and re-runs on the next send.
 
     Mirrors :func:`lingtai.llm.openai.adapter.OpenAIChatSession._pair_orphan_tool_calls`
     which provides the same guarantee for OpenAI Chat Completions. The
@@ -215,13 +217,27 @@ def _pair_responses_orphan_function_calls(items: list[dict]) -> list[dict]:
         for it in items
         if it.get("type") == "function_call_output" and it.get("call_id")
     }
-    patched: list[dict] = []
+    # Append synthesized placeholders at the END of the list, after every real
+    # item, rather than interleaving each one immediately after its
+    # ``function_call``. The Responses API does not require adjacency, so the tail
+    # position is equally valid — and it keeps the serialization STABLE across
+    # continuation turns. ``to_responses_input`` already emits all of an assistant
+    # entry's ``function_call``s contiguously and all real
+    # ``function_call_output``s afterwards, so when a multi-call turn resolves
+    # incrementally the real outputs land in a fixed order. Interleaving each
+    # placeholder right after its call instead made the placeholder positions
+    # drift relative to where the real outputs eventually appear, which broke the
+    # Codex strict-prefix continuation and forced a ``*_full`` request every turn
+    # (the observed ``prefix_mismatch`` with ``function_call_output`` vs
+    # ``function_call``). Placing placeholders contiguously at the tail lets the
+    # baseline recorder strip them as one block and keeps the real prefix stable.
+    patched: list[dict] = list(items)
+    seen: set[str] = set(output_ids)
     for item in items:
-        patched.append(item)
         if item.get("type") != "function_call":
             continue
         call_id = item.get("call_id")
-        if not call_id or call_id in output_ids:
+        if not call_id or call_id in seen:
             continue
         patched.append(
             {
@@ -230,7 +246,7 @@ def _pair_responses_orphan_function_calls(items: list[dict]) -> list[dict]:
                 "output": _RESPONSES_ORPHAN_OUTPUT_PLACEHOLDER,
             }
         )
-        output_ids.add(call_id)
+        seen.add(call_id)
     return patched
 
 

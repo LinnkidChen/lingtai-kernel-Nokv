@@ -24,7 +24,6 @@ from uuid import uuid4
 
 import logging
 import threading
-import time
 
 if TYPE_CHECKING:
     from .service import TelegramService
@@ -38,7 +37,109 @@ def _load_notification_header_template() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter is parsed and the
+# name/description are injected into the tool schema as a progressive-disclosure
+# catalog entry, while the full body stays behind action='manual'.
+# ---------------------------------------------------------------------------
+
+_SKILL_FILENAME = "SKILL.md"
+
+
+def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Split a SKILL.md into (frontmatter dict, body markdown).
+
+    Tiny dependency-free parser for the leading ``---`` YAML block. Handles the
+    flat ``key: value`` and ``key: |``/``key: >`` block-scalar forms used by our
+    skill frontmatter; it does not attempt to be a general YAML parser. Returns
+    an empty mapping and the original text when no frontmatter is present.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.splitlines(keepends=True)
+    # lines[0] is the opening '---'; find the closing fence.
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\n").strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+
+    fm_lines = [ln.rstrip("\n") for ln in lines[1:end]]
+    body = "".join(lines[end + 1:]).lstrip("\n")
+
+    meta: dict[str, str] = {}
+    key: str | None = None
+    block_parts: list[str] = []
+
+    def _flush() -> None:
+        if key is not None:
+            meta[key] = " ".join(" ".join(block_parts).split())
+
+    for raw in fm_lines:
+        if key is not None and (raw.startswith((" ", "\t")) or not raw.strip()):
+            # Continuation line of a block scalar (key: | / key: >).
+            block_parts.append(raw.strip())
+            continue
+        if ":" in raw and not raw.startswith((" ", "\t")):
+            _flush()
+            k, _, v = raw.partition(":")
+            key = k.strip()
+            block_parts = []
+            v = v.strip()
+            if v in ("|", ">", "|-", ">-", "|+", ">+"):
+                # Block scalar — value continues on indented lines below.
+                continue
+            block_parts.append(v.strip("'\""))
+    _flush()
+    return meta, body
+
+
+def _load_skill() -> tuple[dict[str, str], str, str]:
+    """Load the bundled SKILL.md → (frontmatter, body, path)."""
+    resource = resources.files(__package__).joinpath(_SKILL_FILENAME)
+    text = resource.read_text(encoding="utf-8")
+    frontmatter, body = _split_frontmatter(text)
+    return frontmatter, body, str(resource)
+
+
+_SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH = _load_skill()
+
+
+def _manual_action_description() -> str:
+    """Build the schema 'manual' action line from the skill frontmatter.
+
+    Injects the skill name + description (the frontmatter/catalog entry) so the
+    tool schema advertises the skill while the full body stays progressive-
+    disclosure behind action='manual'.
+    """
+    name = _SKILL_FRONTMATTER.get("name", "telegram-mcp-manual")
+    description = _SKILL_FRONTMATTER.get("description", "")
+    return (
+        f"manual: progressive-disclosure usage manual (skill '{name}') — "
+        "call this (no other args) to pull the full bundled SKILL.md. "
+        f"{description}"
+    ).strip()
+
+
 _NOTIFICATION_HEADER_TEMPLATE = _load_notification_header_template()
+_NOTIFICATION_CHANNEL = "mcp.telegram"
+_COMPOUND_ID_RE = re.compile(r"#([^\s:#]+:-?\d+:\d+)\b")
+
+
+def _looks_like_compound_id(value: str) -> bool:
+    parts = value.split(":")
+    if len(parts) != 3 or not parts[0]:
+        return False
+    try:
+        int(parts[1])
+        int(parts[2])
+    except ValueError:
+        return False
+    return True
+
 
 # Emoji reactions for different states (Bot API 7.0+)
 REACTION_SEEN = [{"type": "emoji", "emoji": "👀"}]      # Message received
@@ -166,23 +267,25 @@ SCHEMA = {
                 "send", "check", "read", "reply", "search",
                 "delete", "edit",
                 "contacts", "add_contact", "remove_contact",
-                "accounts",
+                "accounts", "manual",
             ],
             "description": (
-                "send: send message to a chat (chat_id, text; optional media, reply_markup, placeholder, chat_action). "
+                "send: send message to a chat (chat_id, text; optional media, reply_markup, placeholder, chat_action, parse_mode/entities). "
+                "For charts, reports, generated artifacts, and other files the user should open intact, prefer media.type='document'; use media.type='photo' only when an inline Telegram photo preview is desired, because photo previews may crop, compress, or display poorly for text-heavy graphics. "
                 "If chat_action is set and no text/media is provided, sends a typing "
                 "indicator (auto-expires after 5s) instead of a message. "
                 "check: list recent conversations with unread counts (optional account). "
                 "read: read messages from a chat (chat_id; optional limit). "
-                "reply: reply to a specific message (message_id from read results, text). "
+                "reply: reply to a specific message (message_id from read results, text; optional parse_mode/entities). "
                 "search: search messages (query; optional account, chat_id). "
                 "delete: delete a bot message (message_id). "
-                "edit: edit a bot message (message_id, text; optional reply_markup). "
+                "edit: edit a bot message (message_id, text; optional reply_markup, parse_mode/entities). "
                 "contacts: list saved contacts. "
                 "add_contact: save a chat alias (chat_id, alias); this does not grant inbound permission. "
                 "To receive messages from that user, their Telegram user ID must also be in allowed_users. "
                 "remove_contact: remove a contact (alias or chat_id). "
-                "accounts: list configured bot accounts."
+                "accounts: list configured bot accounts. "
+                + _manual_action_description()
             ),
         },
         "account": {
@@ -207,11 +310,40 @@ SCHEMA = {
                 "type": {"type": "string", "enum": ["photo", "document", "voice", "audio"]},
                 "path": {"type": "string"},
             },
-            "description": "Media attachment: {type: 'photo'|'document'|'voice'|'audio', path: '/path/to/file'}",
+            "description": (
+                "Media attachment: {type: 'photo'|'document'|'voice'|'audio', path: '/path/to/file'}. "
+                "For charts, HTML/SVG/PNG reports, CSVs, PDFs, and other generated artifacts that should arrive as an intact file, use type='document'. "
+                "Use type='photo' only for native inline photo previews; Telegram photo delivery can crop, compress, thumbnail, or otherwise display text-heavy charts poorly. "
+                "Do not paste local file paths in message text as a substitute for attaching the file."
+            ),
         },
         "reply_markup": {
             "type": "object",
             "description": "Inline keyboard markup",
+        },
+        "parse_mode": {
+            "type": "string",
+            "enum": ["HTML", "MarkdownV2", "Markdown", ""],
+            "description": (
+                "Telegram Bot API parse_mode for rich text (send/reply/edit, "
+                "and media captions). Omit or pass an empty string for plain text."
+            ),
+        },
+        "entities": {
+            "type": "array",
+            "description": "Telegram MessageEntity[] for message text formatting (send/reply/edit).",
+        },
+        "caption_entities": {
+            "type": "array",
+            "description": "Telegram MessageEntity[] for media captions.",
+        },
+        "link_preview_options": {
+            "type": "object",
+            "description": "Telegram LinkPreviewOptions for text messages.",
+        },
+        "disable_web_page_preview": {
+            "type": "boolean",
+            "description": "Compatibility shortcut to disable link previews for text messages.",
         },
         "placeholder": {
             "type": "boolean",
@@ -240,12 +372,13 @@ SCHEMA = {
         },
         "chat_action": {
             "type": "string",
-            "enum": ["typing", "upload_photo", "upload_document", "upload_voice"],
+            "enum": ["typing", "upload_photo", "upload_document", "upload_voice", ""],
             "description": (
                 "For send action only. When set and no text/media is provided, "
                 "sends a chat action indicator (e.g. 'typing...') instead of a "
                 "message. Auto-expires after 5 seconds — re-send periodically "
-                "during long tasks to keep it visible."
+                "during long tasks to keep it visible. Omit or pass an empty "
+                "string for no chat action."
             ),
         },
     },
@@ -259,7 +392,7 @@ DESCRIPTION = (
     "do not attempt to configure or reconfigure this MCP — your orchestrator "
     "manages it, and if the network needs this MCP to reach you the wiring "
     "is propagated to your session automatically. "
-    "Use 'send' for outgoing messages (text, photos, documents, inline keyboards). "
+    "Use 'send' for outgoing messages (text, photos, documents, inline keyboards, rich formatting). "
     "'check' to see recent conversations. "
     "'read' to read messages from a specific chat. "
     "'reply' to respond to a message (use compound ID from read results). "
@@ -344,6 +477,8 @@ class TelegramManager:
                 return self._remove_contact(args)
             elif action == "accounts":
                 return self._accounts()
+            elif action == "manual":
+                return self._manual()
             else:
                 return {"error": f"Unknown telegram action: {action}"}
         except Exception as e:
@@ -553,6 +688,18 @@ class TelegramManager:
                     "message_id": payload.get("id"),
                     "account": account_alias,
                     "chat_id": payload.get("chat", {}).get("id"),
+                    # LICC preview metadata copied into .notification/mcp.telegram.json.
+                    # Keep both the legacy Telegram-specific keys above and the
+                    # generic chat keys below so the producer can later clear a
+                    # handled notification mirror without re-reading Telegram.
+                    "platform": "telegram",
+                    "conversation_ref": f"{account_alias}:{payload.get('chat', {}).get('id')}",
+                    # Callback queries reuse the message_id of the inline-keyboard
+                    # message, so the compound ID is not unique per callback event.
+                    # Leave those mirrors for explicit handling rather than
+                    # auto-clearing a fresh callback because an older callback on
+                    # the same Telegram message was already read.
+                    "message_ref": payload.get("id") if update_type != "callback_query" else None,
                     "has_media": payload.get("media") is not None,
                     "has_callback": payload.get("callback_query") is not None,
                     "callback_data": payload.get("callback_query"),
@@ -824,6 +971,106 @@ class TelegramManager:
                 os.unlink(tmp)
             raise
 
+    def _notification_message_ids(self, payload: dict) -> set[str] | None:
+        """Return Telegram compound IDs referenced by an MCP notification mirror.
+
+        New Telegram events publish ``message_ref`` in LICC preview metadata.
+        Older notifications only have the bounded conversation preview body,
+        whose lines include ``#account:chat:message`` anchors; parse those as a
+        best-effort migration path so stale mirrors can be cleared after read.
+
+        Returns ``None`` when any preview entry lacks an identifiable Telegram
+        message ID. In that case clearing the coalesced notification could hide
+        another unread event, so the mirror is left for explicit handling.
+        """
+        data = payload.get("data") if isinstance(payload, dict) else None
+        previews = data.get("previews") if isinstance(data, dict) else None
+        if not isinstance(previews, list) or not previews:
+            return None
+
+        ids: set[str] = set()
+        for preview in previews:
+            if not isinstance(preview, dict):
+                return None
+
+            subject = preview.get("subject")
+            if isinstance(subject, str) and "callback_query" in subject:
+                # Telegram callback queries reuse the message_id of the inline
+                # keyboard message, so a compound ID is not a unique event ID.
+                # Keep these mirrors for explicit handling rather than clearing
+                # a fresh callback just because an older callback on that
+                # message was read.
+                return None
+
+            ref = preview.get("message_ref")
+            if isinstance(ref, str) and _looks_like_compound_id(ref):
+                ids.add(ref)
+                continue
+
+            # Backward compatibility for notification files produced before
+            # Telegram populated the generic LICC ``message_ref`` field.
+            body_preview = preview.get("preview")
+            matches = (
+                [
+                    match
+                    for match in _COMPOUND_ID_RE.findall(body_preview)
+                    if _looks_like_compound_id(match)
+                ]
+                if isinstance(body_preview, str)
+                else []
+            )
+            if not matches:
+                return None
+            ids.update(matches)
+        return ids
+
+    def _all_notification_ids_read(self, compound_ids: set[str]) -> bool:
+        read_by_account: dict[str, set[str]] = {}
+        for compound_id in compound_ids:
+            try:
+                account, _chat_id, _msg_id = self._parse_compound_id(compound_id)
+            except ValueError:
+                return False
+            if account not in read_by_account:
+                read_by_account[account] = self._read_ids(account)
+            if compound_id not in read_by_account[account]:
+                return False
+        return bool(compound_ids)
+
+    def _clear_notification_if_handled(self) -> None:
+        """Clear stale ``mcp.telegram`` notification mirrors once handled.
+
+        LICC notification files are wake-up mirrors, not Telegram's source of
+        truth. If every Telegram message referenced by the current mirror is
+        now in the producer's durable ``read.json`` state, remove the mirror so
+        a later wake/molt does not re-deliver the same handled message.
+        """
+        target = self._working_dir / ".notification" / f"{_NOTIFICATION_CHANNEL}.json"
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (json.JSONDecodeError, OSError) as exc:
+            log.debug("cannot inspect Telegram notification mirror: %s", exc)
+            return
+
+        notification_ids = self._notification_message_ids(payload)
+        if notification_ids is None:
+            return
+        if not self._all_notification_ids_read(notification_ids):
+            return
+
+        try:
+            from lingtai_kernel.notifications import clear as clear_notification
+
+            clear_notification(self._working_dir, _NOTIFICATION_CHANNEL)
+            log.info(
+                "telegram notification mirror cleared after read: ids=%s",
+                sorted(notification_ids),
+            )
+        except Exception as exc:
+            log.debug("failed to clear Telegram notification mirror: %s", exc)
+
     def _load_contacts(self, account: str) -> dict:
         path = self._account_dir(account) / "contacts.json"
         if path.is_file():
@@ -908,6 +1155,72 @@ class TelegramManager:
     # Actions
     # ------------------------------------------------------------------
 
+    _PARSE_MODES = {"HTML", "MarkdownV2", "Markdown"}
+
+    @staticmethod
+    def _normalize_parse_mode(value: Any) -> Any:
+        """Treat an empty parse_mode as omitted/plain text.
+
+        Some tool callers serialize absent optional string fields as ``""``.
+        Telegram Bot API itself omits parse_mode for plain text, so normalize
+        the empty string before validation and payload persistence.
+        """
+        if value == "":
+            return None
+        return value
+
+    @staticmethod
+    def _normalize_chat_action(value: Any) -> Any:
+        """Treat an empty chat_action as omitted/no typing indicator.
+
+        Optional enum-like tool arguments may be serialized as ``""`` by some
+        callers.  Telegram only needs chat_action when the caller explicitly
+        asks for one, so normalize an empty string before action dispatch.
+        """
+        if value == "":
+            return None
+        return value
+
+    def _rich_text_options(self, args: dict) -> tuple[dict[str, Any], str | None]:
+        """Extract Bot API rich text options for text messages from tool args.
+
+        Returns (options, error). When nothing relevant is supplied the
+        options dict is empty, so existing plain-text callers behave exactly
+        as before.
+        """
+        opts: dict[str, Any] = {}
+        parse_mode = self._normalize_parse_mode(args.get("parse_mode"))
+        if parse_mode is not None:
+            if parse_mode not in self._PARSE_MODES:
+                return {}, "parse_mode must be one of: HTML, MarkdownV2, Markdown"
+            opts["parse_mode"] = parse_mode
+        if args.get("entities") is not None:
+            opts["entities"] = args.get("entities")
+        if args.get("link_preview_options") is not None:
+            opts["link_preview_options"] = args.get("link_preview_options")
+        if args.get("disable_web_page_preview") is not None:
+            opts["disable_web_page_preview"] = bool(args.get("disable_web_page_preview"))
+        return opts, None
+
+    def _caption_options(self, args: dict) -> tuple[dict[str, Any], str | None]:
+        """Extract Bot API rich caption options for media sends from tool args.
+
+        If ``caption_entities`` is omitted but ``entities`` is supplied, the
+        latter is treated as caption entities for convenience.
+        """
+        opts: dict[str, Any] = {}
+        parse_mode = self._normalize_parse_mode(args.get("parse_mode"))
+        if parse_mode is not None:
+            if parse_mode not in self._PARSE_MODES:
+                return {}, "parse_mode must be one of: HTML, MarkdownV2, Markdown"
+            opts["parse_mode"] = parse_mode
+        caption_entities = args.get("caption_entities")
+        if caption_entities is None:
+            caption_entities = args.get("entities")
+        if caption_entities is not None:
+            opts["caption_entities"] = caption_entities
+        return opts, None
+
     def _send(self, args: dict) -> dict:
         account = self._resolve_account(args)
         chat_id = args.get("chat_id")
@@ -920,8 +1233,12 @@ class TelegramManager:
         if media and isinstance(media, dict) and not (media.get("path") or "").strip():
             media = None
         reply_markup = args.get("reply_markup")
-        chat_action = args.get("chat_action")
+        chat_action = self._normalize_chat_action(args.get("chat_action"))
         placeholder = bool(args.get("placeholder", False))
+        rich_text_options, rich_text_error = self._rich_text_options(args)
+        caption_options, caption_error = self._caption_options(args)
+        if rich_text_error or caption_error:
+            return {"error": rich_text_error or caption_error}
 
         if not chat_id:
             return {"error": "chat_id is required"}
@@ -980,11 +1297,13 @@ class TelegramManager:
                 result = acct.send_photo(
                     chat_id, media_path, caption=text or None,
                     reply_to_message_id=reply_to,
+                    **caption_options,
                 )
             elif media_type == "document":
                 result = acct.send_document(
                     chat_id, media_path, caption=text or None,
                     reply_to_message_id=reply_to,
+                    **caption_options,
                 )
             else:
                 return {"error": f"Unknown media type: {media_type}"}
@@ -992,6 +1311,7 @@ class TelegramManager:
             result = acct.send_message(
                 chat_id, text, reply_markup=reply_markup,
                 reply_to_message_id=reply_to,
+                **rich_text_options,
             )
 
         # Track for duplicate detection
@@ -1010,6 +1330,11 @@ class TelegramManager:
             "text": text,
             "media": media,
             "reply_markup": reply_markup,
+            "parse_mode": self._normalize_parse_mode(args.get("parse_mode")),
+            "entities": args.get("entities"),
+            "caption_entities": args.get("caption_entities"),
+            "link_preview_options": args.get("link_preview_options"),
+            "disable_web_page_preview": args.get("disable_web_page_preview"),
             "sent_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": "placeholder" if placeholder else "sent",
         }
@@ -1111,6 +1436,7 @@ class TelegramManager:
         compound_ids = [m["id"] for m in recent if m.get("id")]
         if compound_ids:
             self._mark_read(account, compound_ids)
+            self._clear_notification_if_handled()
 
         # Strip internal fields
         cleaned = []
@@ -1139,15 +1465,24 @@ class TelegramManager:
             return {"error": "text is required"}
 
         account, chat_id, tg_msg_id = self._parse_compound_id(compound_id)
-        return self._send({
+        result = self._send({
             "account": account,
             "chat_id": chat_id,
             "text": text,
             "media": args.get("media"),
             "reply_markup": args.get("reply_markup"),
+            "parse_mode": self._normalize_parse_mode(args.get("parse_mode")),
+            "entities": args.get("entities"),
+            "caption_entities": args.get("caption_entities"),
+            "link_preview_options": args.get("link_preview_options"),
+            "disable_web_page_preview": args.get("disable_web_page_preview"),
             # We need to pass reply_to_message_id through
             "_reply_to_message_id": tg_msg_id,
         })
+        if result.get("status") == "sent":
+            self._mark_read(account, [compound_id])
+            self._clear_notification_if_handled()
+        return result
 
     def _search(self, args: dict) -> dict:
         query = args.get("query", "")
@@ -1199,6 +1534,10 @@ class TelegramManager:
             return {"error": "text is required"}
         account, chat_id, tg_msg_id = self._parse_compound_id(compound_id)
         reply_markup = args.get("reply_markup")
+        rich_text_options, rich_text_error = self._rich_text_options(args)
+        caption_options, caption_error = self._caption_options(args)
+        if rich_text_error or caption_error:
+            return {"error": rich_text_error or caption_error}
         acct = self._service.get_account(account)
 
         # Detect if original message had media (caption edit vs text edit)
@@ -1216,9 +1555,11 @@ class TelegramManager:
                     except (json.JSONDecodeError, OSError):
                         continue
 
+        edit_options = caption_options if is_caption else rich_text_options
         acct.edit_message(
             chat_id=chat_id, message_id=tg_msg_id, text=text,
             reply_markup=reply_markup, is_caption=is_caption,
+            **edit_options,
         )
         return {"status": "edited", "message_id": compound_id}
 
@@ -1267,4 +1608,26 @@ class TelegramManager:
             "accounts": self._service.list_accounts(),
             "details": self._service.account_details(),
             "identity_path": str(self._service.identity_path()),
+        }
+
+    # ------------------------------------------------------------------
+    # Manual — progressive-disclosure usage guidance
+    # ------------------------------------------------------------------
+    #
+    # The manual lives in this package's bundled SKILL.md (standard skill
+    # format: YAML frontmatter + markdown body), loaded at import time above.
+    # action='manual' returns the full skill markdown plus parsed metadata and
+    # the resolved path; the frontmatter is also injected into the schema's
+    # 'manual' action description as a catalog entry. Bundled assets/references,
+    # if any, are documented inside SKILL.md and are not returned as a structured
+    # tool-side list; do not add assets/references fields here.
+
+    def _manual(self) -> dict:
+        return {
+            "status": "ok",
+            "action": "manual",
+            "skill": _SKILL_FRONTMATTER.get("name", "telegram-mcp-manual"),
+            "metadata": dict(_SKILL_FRONTMATTER),
+            "path": _SKILL_PATH,
+            "manual": _SKILL_BODY,
         }

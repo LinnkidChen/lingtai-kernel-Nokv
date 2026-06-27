@@ -841,8 +841,17 @@ class TelegramAccount:
         reply_markup: dict | None = None,
         reply_to_message_id: int | None = None,
         parse_mode: str | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        link_preview_options: dict[str, Any] | None = None,
+        disable_web_page_preview: bool | None = None,
     ) -> dict:
-        """Send a text message. Returns the sent Message object."""
+        """Send a text message. Returns the sent Message object.
+
+        Rich-formatting options (``parse_mode``, ``entities``,
+        ``link_preview_options``, ``disable_web_page_preview``) are passed
+        through to the Bot API only when supplied — omitting them preserves
+        the previous plain-text behaviour.
+        """
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_markup:
             payload["reply_markup"] = reply_markup
@@ -850,11 +859,22 @@ class TelegramAccount:
             payload["reply_to_message_id"] = reply_to_message_id
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if entities is not None:
+            payload["entities"] = entities
+        if link_preview_options is not None:
+            payload["link_preview_options"] = link_preview_options
+        if disable_web_page_preview is not None:
+            payload["disable_web_page_preview"] = disable_web_page_preview
         return self._request("sendMessage", json=payload)
 
     def send_photo(
-        self, chat_id: int, photo_path: str, caption: str | None = None,
+        self,
+        chat_id: int,
+        photo_path: str,
+        caption: str | None = None,
         reply_to_message_id: int | None = None,
+        parse_mode: str | None = None,
+        caption_entities: list[dict[str, Any]] | None = None,
     ) -> dict:
         """Send a photo via multipart upload."""
         with open(photo_path, "rb") as f:
@@ -864,11 +884,21 @@ class TelegramAccount:
                 data["caption"] = caption
             if reply_to_message_id:
                 data["reply_to_message_id"] = str(reply_to_message_id)
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+            if caption_entities is not None:
+                # Multipart fields must be strings; serialize the array.
+                data["caption_entities"] = json.dumps(caption_entities)
             return self._request("sendPhoto", files=files, data=data)
 
     def send_document(
-        self, chat_id: int, doc_path: str, caption: str | None = None,
+        self,
+        chat_id: int,
+        doc_path: str,
+        caption: str | None = None,
         reply_to_message_id: int | None = None,
+        parse_mode: str | None = None,
+        caption_entities: list[dict[str, Any]] | None = None,
     ) -> dict:
         """Send a document via multipart upload."""
         with open(doc_path, "rb") as f:
@@ -878,11 +908,25 @@ class TelegramAccount:
                 data["caption"] = caption
             if reply_to_message_id:
                 data["reply_to_message_id"] = str(reply_to_message_id)
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+            if caption_entities is not None:
+                # Multipart fields must be strings; serialize the array.
+                data["caption_entities"] = json.dumps(caption_entities)
             return self._request("sendDocument", files=files, data=data)
 
     def edit_message(
-        self, chat_id: int, message_id: int, text: str,
-        reply_markup: dict | None = None, is_caption: bool = False,
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+        is_caption: bool = False,
+        parse_mode: str | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        caption_entities: list[dict[str, Any]] | None = None,
+        link_preview_options: dict[str, Any] | None = None,
+        disable_web_page_preview: bool | None = None,
     ) -> dict:
         """Edit a sent message's text or caption."""
         if is_caption:
@@ -891,6 +935,10 @@ class TelegramAccount:
             }
             if reply_markup:
                 payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            if caption_entities is not None:
+                payload["caption_entities"] = caption_entities
             return self._request("editMessageCaption", json=payload)
         else:
             payload = {
@@ -898,6 +946,14 @@ class TelegramAccount:
             }
             if reply_markup:
                 payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            if entities is not None:
+                payload["entities"] = entities
+            if link_preview_options is not None:
+                payload["link_preview_options"] = link_preview_options
+            if disable_web_page_preview is not None:
+                payload["disable_web_page_preview"] = disable_web_page_preview
             return self._request("editMessageText", json=payload)
 
     def delete_message(self, chat_id: int, message_id: int) -> dict:

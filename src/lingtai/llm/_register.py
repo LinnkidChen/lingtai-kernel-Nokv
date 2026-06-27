@@ -6,6 +6,13 @@ to the adapter's actual constructor signature.
 """
 from __future__ import annotations
 
+# Official Codex REST endpoint. Used as the default ``base_url`` for the
+# ``codex`` provider when the manifest/provider-defaults do not configure one.
+# A configured ``base_url`` (the generic provider convention) overrides it so a
+# future local ``lingtai-codex-pool`` endpoint can front the same provider
+# without a separate adapter.
+CODEX_OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
 
 def register_all_adapters() -> None:
     from lingtai.llm.service import LLMService
@@ -63,19 +70,45 @@ def register_all_adapters() -> None:
         from lingtai.auth.codex import CodexTokenManager
         kw.pop("model", None)
         kw.pop("api_key", None)  # ignore env-resolved key
-        kw.pop("base_url", None)  # we set our own
+        # Honor an explicitly configured endpoint (manifest ``base_url`` /
+        # ``provider_defaults['base_url']``, already resolved into ``base_url``
+        # by LLMService._create_adapter) so a future local ``lingtai-codex-pool``
+        # can front this provider. Absent/blank -> the official Codex endpoint.
+        # The pool routes later off the unchanged ``prompt_cache_key`` /
+        # ``session_id`` / ``thread_id`` identity emitted below; the OAuth bearer
+        # may reach localhost in that use case, which is acceptable here.
+        configured_base_url = kw.pop("base_url", None)
+        codex_base_url = (
+            configured_base_url.strip()
+            if isinstance(configured_base_url, str) and configured_base_url.strip()
+            else CODEX_OFFICIAL_BASE_URL
+        )
         # Per-agent Codex REST cache-affinity header config (issue #378). The
         # host wiring (service.build_provider_defaults_from_manifest_llm) passes
         # down the agent path as ``codex_session_anchor`` by default; the adapter
-        # hashes it to one 8-char value used byte-identically for session_id,
-        # thread_id, and prompt_cache_key, so a normal Codex agent sends stable
-        # per-agent headers. ``codex_thread_salt`` is forwarded only as a legacy
-        # pass-through (it no longer derives a separate thread). The adapter has
-        # no per-agent identity of its own; absent these keys (e.g. a bare
-        # service built in a test) it sends no session/thread headers.
+        # hashes it together with the current molt_count into one 8-char value
+        # used byte-identically for session_id, thread_id, and prompt_cache_key,
+        # so a normal Codex agent sends per-agent headers. ``codex_thread_salt``
+        # is forwarded only as a legacy pass-through (it no longer derives a
+        # separate thread). The adapter has no per-agent identity of its own;
+        # absent these keys (e.g. a bare service built in a test) it sends no
+        # session/thread headers.
         d = defaults or {}
         codex_id_kw: dict = {}
-        for cfg_key in ("codex_session_id", "codex_session_anchor", "codex_thread_salt"):
+        for cfg_key in ("codex_session_anchor", "codex_thread_salt"):
+            val = d.get(cfg_key)
+            if val is not None:
+                codex_id_kw[cfg_key] = val
+        # Optional Codex-only endpoint POOL (molt-boundary shuffle). When
+        # ``codex_base_urls`` carries 2+ valid endpoints, the adapter chooses one
+        # at request time by (stable per-agent offset + current ``molt_count``
+        # from ``<working_dir>/.agent.json``); the choice is stable within a molt
+        # segment and rotates only at a molt boundary. Empty/blank -> single
+        # ``base_url`` behavior above (PR #495). ``codex_molt_count`` is an
+        # explicit override (tests/hosts) used instead of reading ``.agent.json``.
+        # Neither affects the ``session_id`` / ``thread_id`` / ``prompt_cache_key``
+        # identity the pool routes off.
+        for cfg_key in ("codex_base_urls", "codex_molt_count"):
             val = d.get(cfg_key)
             if val is not None:
                 codex_id_kw[cfg_key] = val
@@ -91,7 +124,7 @@ def register_all_adapters() -> None:
         mgr = CodexTokenManager(**mgr_kw)
         adapter = CodexOpenAIAdapter(
             api_key=mgr.get_access_token(),
-            base_url="https://chatgpt.com/backend-api/codex",
+            base_url=codex_base_url,
             use_responses=True,
             force_responses=True,
             # The user's own ChatGPT account id (sent as the ``ChatGPT-Account-ID``
@@ -123,6 +156,23 @@ def register_all_adapters() -> None:
 
     LLMService.register_adapter("codex", _codex)
 
+    def _claude_code(*, model=None, defaults=None, **kw):
+        # Drive the local `claude` CLI as the agent brain on a Claude
+        # subscription. The CLI owns auth (stored OAuth / CLAUDE_CODE_OAUTH_TOKEN),
+        # so there is no api_key/base_url — drop any env-resolved ones.
+        from .claude_code.adapter import ClaudeCodeAdapter
+        kw.pop("model", None)
+        kw.pop("api_key", None)
+        kw.pop("base_url", None)
+        kw.pop("default_headers", None)
+        return ClaudeCodeAdapter(model=model, **{k: v for k, v in kw.items() if v is not None})
+
+    # Register both the dash and underscore spellings: there is no dash/underscore
+    # normalization in LLMService, and preset_connectivity treats both as the same
+    # local CLI-login provider — so a saved `claude_code` preset must build too.
+    for name in ("claude-code", "claude_code"):
+        LLMService.register_adapter(name, _claude_code)
+
     def _deepseek(*, model=None, defaults=None, **kw):
         from .deepseek.adapter import DeepSeekAdapter
         kw.pop("model", None)
@@ -144,23 +194,6 @@ def register_all_adapters() -> None:
         return MimoAdapter(**{k: v for k, v in kw.items() if v is not None})
 
     LLMService.register_adapter("mimo", _mimo)
-
-    def _claude_agent_sdk(*, model=None, defaults=None, **kw):
-        # Experimental clean-room provider. The Claude Agent SDK authenticates
-        # through the local Claude CLI login (no per-request API key), so the
-        # env-resolved key and base_url are ignored.
-        from .claude_agent_sdk.adapter import ClaudeAgentSDKAdapter
-        kw.pop("api_key", None)
-        kw.pop("base_url", None)
-        adapter_kw: dict = {}
-        if model:
-            adapter_kw["model"] = model
-        if kw.get("max_rpm"):
-            adapter_kw["max_rpm"] = kw["max_rpm"]
-        return ClaudeAgentSDKAdapter(**adapter_kw)
-
-    for name in ("claude-agent-sdk", "claude_agent_sdk"):
-        LLMService.register_adapter(name, _claude_agent_sdk)
 
     # Providers routed through the generic custom adapter
     for name in ("grok", "qwen", "kimi"):

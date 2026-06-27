@@ -575,9 +575,11 @@ def _classify_terminal_state(
     future raises, ``_on_emanation_done`` sets ``status="failed"`` directly and
     does not call this helper.
 
-    The sole purpose is to keep a non-normal terminal state (timeout / cancelled
-    / failed) from being misread as a tiny ``"done"`` and silently swallowed by
-    the ``suppressed_short`` gate. Only a genuine ``"done"`` may be suppressed.
+    The sole purpose is to preserve the true terminal state (timeout /
+    cancelled / failed / done) before publishing the parent-facing daemon
+    notification. Every terminal state, including a short successful
+    ``"done"`` result, is now surfaced so the parent can safely go idle after
+    dispatch and wake when the run ends.
 
     Priority order (first match wins):
 
@@ -593,7 +595,7 @@ def _classify_terminal_state(
       P5  elapsed >= fraction * timeout_s with a ``[no output]`` body — a
           deliberately low-priority heuristic for the rare case where neither
           the recorded state nor the events survived.
-      P6  ``"done"`` — genuine success (suppression-eligible).
+      P6  ``"done"`` — genuine success.
     """
     run_dir = entry.get("run_dir") if entry else None
 
@@ -645,10 +647,11 @@ def _classify_terminal_state(
 class DaemonManager:
     """Manages subagent (emanation) lifecycle."""
 
-    # Minimum text length to trigger a parent notification for a *successful*
-    # (done) run — short happy-path results are suppressed to avoid notification
-    # storms. Non-success terminal states (failed / cancelled / timeout) always
-    # notify regardless of length; see _on_emanation_done.
+    # Historical constructor default for ``notify_threshold``. Terminal daemon
+    # completions are no longer suppressed by result length: the compact system
+    # notification is the parent wake signal for every terminal state. The
+    # constructor argument remains accepted for compatibility with existing
+    # callers/configs.
     _NOTIFY_MIN_LEN = 20
 
     def __init__(self, agent: "Agent", max_emanations: int = 100,
@@ -1122,9 +1125,8 @@ class DaemonManager:
         provider_key = str(provider).lower()
         bucket = dict(base_defaults or {})
         if provider_key == "codex":
-            # A manifest-level fixed id is an agent-level override; daemon traffic
-            # must still use the daemon run identity so it gets its own cache slot.
-            bucket.pop("codex_session_id", None)
+            # Daemon traffic must use the daemon run identity so it gets its own
+            # cache slot, not the parent agent's anchor.
             bucket["codex_session_anchor"] = self._daemon_codex_session_anchor(run_dir)
         if not bucket:
             return None
@@ -1137,7 +1139,6 @@ class DaemonManager:
             "api_compat",
             "base_url",
             "codex_auth_path",
-            "codex_session_id",
             "codex_session_anchor",
             "codex_thread_salt",
             "compact_threshold",
@@ -5085,9 +5086,53 @@ class DaemonManager:
             "last_output": state.get("last_output"),
             "last_output_at": state.get("last_output_at"),
             "error": state.get("error"),
+            "artifacts": self._artifacts_summary(run_path),
             "events": events,
             "events_total": events_total,
             "events_returned": len(events),
+        }
+
+    def _artifacts_summary(self, run_path: Path) -> dict:
+        """Compact artifact-manifest block for a `check` response.
+
+        Prefers the persisted ``artifacts.json`` (written at terminal time);
+        for an old run that predates it — or a still-running run that has no
+        manifest yet — falls back to computing one on the fly from the run dir.
+        Either way only path/size/mtime/role metadata is surfaced (never file
+        contents). ``source`` distinguishes the persisted manifest from a
+        computed fallback so the parent knows whether it is reading a terminal
+        snapshot or a live view. Never raises: a manifest is a convenience and
+        must not break `check`.
+        """
+        manifest_path = run_path / "artifacts.json"
+        source = "manifest"
+        manifest = None
+        try:
+            if manifest_path.is_file():
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    manifest = loaded
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            manifest = None
+        if manifest is None:
+            # No persisted manifest (old run / still running). Compute a safe
+            # fallback so the parent still gets a file listing.
+            source = "fallback"
+            try:
+                manifest = DaemonRunDir.build_manifest(run_path)
+            except Exception as e:  # never let a manifest break check
+                return {"source": "unavailable", "error": str(e),
+                        "artifacts": []}
+
+        return {
+            "source": source,
+            "state": manifest.get("state"),
+            "result_path": manifest.get("result_path"),
+            "error_path": manifest.get("error_path"),
+            "artifact_count": manifest.get("artifact_count"),
+            "artifacts_total": manifest.get("artifacts_total"),
+            "truncated": manifest.get("truncated", False),
+            "artifacts": manifest.get("artifacts", []),
         }
 
     def _resolve_historical_run_dir(
@@ -5276,9 +5321,9 @@ class DaemonManager:
         # recorded ``run_dir`` state authoritative (current main's behaviour) and
         # layers timeout_event / cancel_event / sentinel / elapsed fallbacks on
         # top, so a non-normal terminal state (timeout / cancelled / failed) is
-        # never misclassified as a tiny ``done`` and swallowed by the short-
-        # result gate below. The parent always learns the daemon terminated even
-        # when it failed silently. A raised future is ``failed`` unconditionally.
+        # never misclassified as a tiny ``done``. The parent always learns the
+        # daemon terminated, and with the correct terminal label, even when it
+        # failed silently. A raised future is ``failed`` unconditionally.
         if future_succeeded:
             status = _classify_terminal_state(entry, future_succeeded, text, timeout_s)
         else:
@@ -5291,15 +5336,9 @@ class DaemonManager:
             self._log("daemon_error", em_id=em_id,
                       exception=type(exc).__name__, exception_message=str(exc))
 
-        # Suppress notifications only for short *successful* results to prevent
-        # notification storms. Every non-success terminal state (failed,
-        # cancelled, timeout) always notifies so the parent can safely go idle
-        # after dispatch and still learn the run ended.
-        if status == "done" and len(text) < self._notify_threshold:
-            self._log("daemon_result", em_id=em_id, status="suppressed_short",
-                      text_length=len(text))
-            return
-
+        # Deliver every terminal state, including short successful results: the
+        # compact system notification is the wake signal that lets the parent
+        # safely go idle after dispatch and still learn the run ended.
         # Deliver exactly once per run: the done-callback can fire more than
         # once for the same em_id (racing reclaim, re-entrant callbacks). The
         # run directory owns the once-only claim, decoupled from the system

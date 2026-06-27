@@ -16,11 +16,19 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .. import _skill
+
 if TYPE_CHECKING:
     from .account import IMAPAccount
     from .service import IMAPMailService
 
 log = logging.getLogger(__name__)
+
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter name/description are
+# injected into the tool schema as a progressive-disclosure catalog entry.
+_SKILL_NAME = "imap-mcp-manual"
+_SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH = _skill.load_skill(__package__)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +67,7 @@ SCHEMA = {
                 "send", "check", "read", "reply", "search",
                 "delete", "move", "flag", "folders",
                 "contacts", "add_contact", "remove_contact", "edit_contact",
-                "accounts",
+                "accounts", "manual",
             ],
             "description": (
                 "send: send email via IMAP/SMTP (requires address, message; optional subject, cc, bcc, attachments). "
@@ -76,7 +84,8 @@ SCHEMA = {
                 "add_contact: add/update contact (requires address, name; optional note). "
                 "remove_contact: remove contact (requires address). "
                 "edit_contact: update contact fields (requires address; optional name, note). "
-                "accounts: list configured IMAP accounts and connection status."
+                "accounts: list configured IMAP accounts and connection status. "
+                + _skill.manual_action_description(_SKILL_FRONTMATTER, _SKILL_NAME)
             ),
         },
         "account": {
@@ -251,6 +260,8 @@ class IMAPMailManager:
 
     def handle(self, args: dict) -> dict:
         action = args.get("action")
+        if action == "manual":
+            return self._manual()
         account = self._service.get_account(args.get("account"))
         if account is None and action != "accounts":
             return self._inject_meta(
@@ -279,6 +290,19 @@ class IMAPMailManager:
             return self._inject_meta(dispatch[action](args, account))
         else:
             return self._inject_meta({"error": f"Unknown imap action: {action}"})
+
+    def _manual(self) -> dict:
+        # The manual lives in this package's bundled SKILL.md (standard skill
+        # format: YAML frontmatter + markdown body), loaded at import time.
+        # action='manual' returns the full skill markdown plus parsed metadata
+        # and the resolved path; the frontmatter is also injected into the
+        # schema's 'manual' action description as a catalog entry. Bundled
+        # asset/reference sidecars, if any, are documented inside SKILL.md and
+        # are not returned as structured tool fields.
+        # It is account-independent, so it skips account lookup/meta injection.
+        return _skill.manual_payload(
+            _SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH, _SKILL_NAME
+        )
 
     # ------------------------------------------------------------------
     # Receive handler — called by IMAPMailService IMAP poll

@@ -51,6 +51,17 @@ class _GatedSession:
             return None
         return comment_fn()
 
+    def static_adapter_comment(self):
+        static_comment = getattr(self._inner, "static_adapter_comment", None)
+        if callable(static_comment):
+            return static_comment()
+        return None
+
+    def dynamic_adapter_comment(self):
+        dynamic_comment = getattr(self._inner, "dynamic_adapter_comment", None)
+        if callable(dynamic_comment):
+            return dynamic_comment()
+        return None
     def on_history_summarized(self, summarized_ids):
         hook = getattr(self._inner, "on_history_summarized", None)
         if callable(hook):
@@ -97,6 +108,16 @@ class LLMAdapter(ABC):
         if self._gate is None:
             return session
         return _GatedSession(session, self._gate)  # type: ignore[return-value]
+
+    def static_adapter_comment(self) -> dict[str, Any] | None:
+        """Return static, prompt-safe adapter guidance before chat creation.
+
+        Dynamic per-turn state belongs on the concrete ``ChatSession``.  This
+        adapter-level hook is for rule-like guidance that the prompt builder may
+        need while constructing the very first system prompt, before a session
+        object exists.
+        """
+        return None
 
     @abstractmethod
     def create_chat(

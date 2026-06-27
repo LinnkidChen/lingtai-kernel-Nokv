@@ -1067,12 +1067,19 @@ def _dismiss_changed_surface(result: dict) -> bool:
 
 
 def _signal_notification_dismissed(agent, channel: str) -> None:
-    """Tell the chat session a dismiss rewrote the notification surface.
+    """Signal a notification-surface dismiss to the chat session's adapter.
 
-    Mirrors ``on_history_summarized``: a notification dismiss/cleanup forces the
-    next Codex request to start a fresh ws_full epoch instead of continuing as
-    ws_incremental. Best-effort and adapter-agnostic — adapters without the hook
-    (or providers that don't care about the boundary) treat it as a no-op.
+    Best-effort and adapter-agnostic: forwards to ``on_notification_dismissed``
+    on the chat session if the hook exists. The Codex adapter INTENTIONALLY
+    treats this as a no-op (``CodexResponsesSession.on_notification_dismissed``):
+    a dismiss is high-frequency housekeeping, not context compaction, and must
+    NOT break the ``previous_response_id`` / strict-prefix continuation chain.
+    Only ``on_history_summarized`` rewrites old tool-result payloads enough to
+    require a fresh full epoch. (Earlier this hook was wired to force a fresh
+    ``ws_full`` epoch on every dismiss; that footgun is now neutralized at the
+    adapter — the ``_dismiss_changed_surface`` guard below is retained so the
+    signal stays meaningful if the hook is ever re-armed.) Adapters without the
+    hook treat the call as a no-op.
     """
     chat = getattr(agent, "_chat", None)
     if chat is None:

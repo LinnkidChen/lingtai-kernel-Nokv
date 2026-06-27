@@ -8,7 +8,9 @@ P1 signal) and delivers each terminal notification exactly once via
 signals layered on top of that: when the run_dir state was never recorded
 (crash before mark_*, missing run_dir), the timeout_event / cancel_event /
 ``[cancelled]`` sentinel / elapsed-near-timeout signals still keep a
-timeout/cancelled run from being swallowed by the ``suppressed_short`` gate.
+timeout/cancelled run from being mislabeled as an ordinary success. Every
+terminal state now publishes the compact daemon notification, including short
+successful results.
 
 The once-only terminal-notification dedupe and the run_dir-authoritative
 classification are exercised in tests/test_daemon.py and must remain intact;
@@ -84,8 +86,7 @@ class TestClassifyRunDirAuthority:
         assert _classify_terminal_state(entry, True, "anything", 3600.0) == "failed"
 
     def test_run_dir_done_with_short_text_stays_done(self):
-        """A genuinely-done run with a short body stays 'done' and is eligible
-        for suppression."""
+        """A genuinely-done run with a short body stays 'done'."""
         entry = _make_entry(run_dir_state="done")
         assert _classify_terminal_state(entry, True, "ok", 3600.0) == "done"
 
@@ -177,7 +178,7 @@ class TestClassifyFallbackSignals:
         assert _classify_terminal_state(entry, True, "real result body", 3600.0) == "done"
 
     def test_genuine_short_success_stays_done(self):
-        """No abnormal signal anywhere -> 'done' (suppression eligible)."""
+        """No abnormal signal anywhere -> 'done'."""
         entry = _make_entry(run_dir_state=None)
         assert _classify_terminal_state(entry, True, "42", 3600.0) == "done"
 
@@ -235,10 +236,10 @@ class TestOnEmanationDoneIntegration:
     """Verify the gate is wired into _on_emanation_done end-to-end and that the
     once-only terminal-notification dedupe (current main) is preserved."""
 
-    def test_timeout_event_not_suppressed_without_run_dir_state(self, tmp_path):
+    def test_timeout_event_notifies_without_run_dir_state(self, tmp_path):
         """The key #194 case via the *event* fallback: a timed-out run whose
         run_dir never recorded 'timeout' (e.g. crash before mark_timeout) still
-        notifies because timeout_event is set — not swallowed as a short success.
+        notifies with the correct terminal label because timeout_event is set.
         """
         from lingtai_kernel.notifications import collect_notifications
 
@@ -266,7 +267,7 @@ class TestOnEmanationDoneIntegration:
         assert len(events) == 1
         assert "timeout" in events[0]["body"].lower()
 
-    def test_cancel_event_not_suppressed_without_run_dir_state(self, tmp_path):
+    def test_cancel_event_notifies_without_run_dir_state(self, tmp_path):
         from lingtai_kernel.notifications import collect_notifications
 
         agent = _make_agent(tmp_path)
@@ -292,8 +293,10 @@ class TestOnEmanationDoneIntegration:
         assert len(events) == 1
         assert "cancelled" in events[0]["body"].lower()
 
-    def test_genuine_short_success_still_suppressed(self, tmp_path):
-        """No abnormal signal -> 'done' + short text -> suppressed, no notify."""
+    def test_genuine_short_success_notifies(self, tmp_path):
+        """Even a tiny successful result must wake the parent: the daemon
+        terminal notification is the completion signal, not a long-output echo.
+        """
         from lingtai_kernel.notifications import collect_notifications
 
         agent = _make_agent(tmp_path)
@@ -316,7 +319,11 @@ class TestOnEmanationDoneIntegration:
 
         mgr._on_emanation_done("em-short", "test task", future)
 
-        assert collect_notifications(agent._working_dir) == {}
+        events = collect_notifications(agent._working_dir)["system"]["data"]["events"]
+        assert len(events) == 1
+        assert events[0]["ref_id"] == "em-short"
+        assert "Daemon em-short done." in events[0]["body"]
+        assert "Preview:\n42" in events[0]["body"]
 
     def test_timeout_terminal_notified_only_once(self, tmp_path):
         """Dedupe preservation: a timeout surfaced via the event fallback is

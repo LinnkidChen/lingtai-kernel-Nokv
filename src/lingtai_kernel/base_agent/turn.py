@@ -25,6 +25,7 @@ from ..meta_block import (
 )
 from ..sent_message_tracker import SEND_TOOLS, SEND_ACTIONS, CHECK_ACTIONS
 from ..time_veil import now_iso
+from .worker_recovery import is_worker_interface_poisoned
 
 logger = get_logger()
 
@@ -39,14 +40,37 @@ class EmptyLLMResponseError(RuntimeError):
     transitioning to IDLE and abandoning the in-progress task.
     """
 
-    def __init__(self, *, ledger_source: str, in_tool_loop: bool):
+    def __init__(
+        self,
+        *,
+        ledger_source: str,
+        in_tool_loop: bool,
+        response_id: str | None = None,
+        response_model: str | None = None,
+        finish_reason: str | None = None,
+        api_call_id: str | None = None,
+    ):
         self.ledger_source = ledger_source
         self.in_tool_loop = in_tool_loop
+        self.response_id = response_id
+        self.response_model = response_model
+        self.finish_reason = finish_reason
+        self.api_call_id = api_call_id
         where = "after tool results" if in_tool_loop else "on initial send"
         super().__init__(
             f"LLM returned empty response (no text, no tool_calls, no thoughts) "
             f"{where}; ledger={ledger_source}"
         )
+
+    def diagnostic_fields(self) -> dict:
+        return {
+            "ledger_source": self.ledger_source,
+            "in_tool_loop": self.in_tool_loop,
+            "response_id": self.response_id,
+            "response_model": self.response_model,
+            "finish_reason": self.finish_reason,
+            "api_call_id": self.api_call_id,
+        }
 
 
 _TRANSIENT_AED_RETRY_LIMIT = 3
@@ -523,7 +547,7 @@ def _run_loop(agent) -> None:
                 # appendable from a fresh wake. Common cause: cancel
                 # mid-batch leaves the just-arrived assistant response
                 # with tool_calls on the wire but no results yet.
-                if getattr(agent, "_llm_worker_interface_poisoned", False):
+                if is_worker_interface_poisoned(agent):
                     # Poisoned interface — the worker may still be mutating
                     # it. Do not heal/save; refresh will rebuild from disk.
                     agent._log(
@@ -591,7 +615,7 @@ def _run_loop(agent) -> None:
                     # Fail closed: if a prior turn already poisoned the
                     # interface, do not run another turn against it. Request
                     # refresh and sleep instead.
-                    if getattr(agent, "_llm_worker_interface_poisoned", False):
+                    if is_worker_interface_poisoned(agent):
                         from .worker_recovery import request_worker_hang_refresh
 
                         artifact = getattr(agent, "_llm_worker_poison_artifact", None)
@@ -899,6 +923,39 @@ def _check_molt_pressure(agent) -> None:
 
     clear_notification(agent._working_dir, "molt")
 
+
+def _turn_boundary_housekeeping(agent) -> None:
+    """Run the turn-boundary housekeeping trio.
+
+    Called from every branch at an LLM-round boundary. Timing relative to the
+    ``session.send`` differs by path and is deliberately preserved from the
+    pre-refactor inline code: the request path (``_handle_request``) runs the
+    trio *before* the initial send of the turn, while the continuation paths
+    (``_handle_tc_wake`` and the ``_process_response`` tool loop) run it *after*
+    a send completes. In all cases the trio fires in this fixed order:
+
+    1. ``_check_molt_pressure`` — clear the legacy pressure-warning channel.
+    2. ``_sync_notifications`` — record same-turn notification changes (while
+       ACTIVE this defers delivery to the next IDLE boundary).
+    3. ``_rescan_large_tool_results`` — rediscover large unsummarized tool
+       results already in chat history (e.g. after refresh / migration).
+
+    Steps 2 and 3 are best-effort and must never abort the turn, so each is
+    guarded independently. This deliberately excludes the standalone
+    IDLE-boundary notification check in ``_run_loop``, which has different
+    control flow and must not be folded in here.
+    """
+    _check_molt_pressure(agent)
+    try:
+        agent._sync_notifications()
+    except Exception:
+        pass
+    try:
+        agent._rescan_large_tool_results()
+    except Exception:
+        pass
+
+
 def _is_context_molt_call(tc) -> bool:
     """Return True when ``tc`` is ``psyche(context, molt, ...)``.
 
@@ -924,7 +981,7 @@ def _batch_includes_context_molt(tool_calls) -> bool:
 
 def _handle_request(agent, msg: Message) -> None:
     """Send request to LLM, process response with tool calls."""
-    if getattr(agent, "_llm_worker_interface_poisoned", False):
+    if is_worker_interface_poisoned(agent):
         from .worker_recovery import request_worker_hang_refresh
 
         artifact = getattr(agent, "_llm_worker_poison_artifact", None)
@@ -949,21 +1006,7 @@ def _handle_request(agent, msg: Message) -> None:
         dup_free_passes=dup_free,
         dup_hard_block=dup_hard,
     )
-    agent._executor = ToolExecutor(
-        dispatch_fn=agent._dispatch_tool,
-        make_tool_result_fn=lambda name, result, **kw: agent.service.make_tool_result(
-            name, result, provider=agent._config.provider, **kw
-        ),
-        guard=guard,
-        known_tools=set(agent._intrinsics) | set(agent._tool_handlers),
-        parallel_safe_tools=agent._PARALLEL_SAFE_TOOLS,
-        logger_fn=agent._log,
-        meta_fn=lambda: build_meta(agent),
-        working_dir=agent._working_dir,
-        summarize_notification_threshold=getattr(
-            agent, "_summarize_notification_threshold", None
-        ),
-    )
+    agent._executor = _make_tool_executor(agent, guard)
     content = agent._pre_request(msg)
     # If a prior worker hang left an open recovery artifact, prepend one
     # concise recovery notice to this first safe request (once per artifact).
@@ -975,25 +1018,10 @@ def _handle_request(agent, msg: Message) -> None:
         pass
     meta = build_meta(agent)
 
-    # Molt pressure — warn agent when context is getting full.
-    _check_molt_pressure(agent)
-
-    # Synchronous notification sync — record same-turn notification
-    # changes.  While ACTIVE this deliberately defers without mutating
-    # unrelated tool results; delivery happens at the next IDLE boundary.
-    try:
-        agent._sync_notifications()
-    except Exception:
-        pass
-
-    # Rescan live chat history for large unsummarized tool results that were
-    # already in context before this turn (e.g. after a refresh, notification
-    # dismissed, or history migration).  Uses skip_if_ref_id_exists so no
-    # duplicate notifications are published for results already tracked.
-    try:
-        agent._rescan_large_tool_results()
-    except Exception:
-        pass
+    # Turn-boundary housekeeping: molt pressure + notification sync +
+    # large-result rescan. On the request path this runs *before* the initial
+    # send (preserved pre-refactor timing); see _turn_boundary_housekeeping.
+    _turn_boundary_housekeeping(agent)
 
     prefix = render_meta(agent, meta)
     if prefix:
@@ -1025,7 +1053,7 @@ def _handle_tc_wake(agent, msg: Message) -> None:
     of no-op-and-return — the previous "tc_inbox_empty" silent
     no-op was the bug that left spliced notification pairs unread.
     """
-    if getattr(agent, "_llm_worker_interface_poisoned", False):
+    if is_worker_interface_poisoned(agent):
         from .worker_recovery import request_worker_hang_refresh
 
         artifact = getattr(agent, "_llm_worker_poison_artifact", None)
@@ -1063,23 +1091,12 @@ def _handle_tc_wake(agent, msg: Message) -> None:
         )
         return
 
-    agent._executor = ToolExecutor(
-        dispatch_fn=agent._dispatch_tool,
-        make_tool_result_fn=lambda name, result, **kw: agent.service.make_tool_result(
-            name, result, provider=agent._config.provider, **kw
-        ),
-        guard=LoopGuard(
+    agent._executor = _make_tool_executor(
+        agent,
+        LoopGuard(
             max_total_calls=_get_guard_limits(agent)[0],
             dup_free_passes=2,
             dup_hard_block=8,
-        ),
-        known_tools=set(agent._intrinsics) | set(agent._tool_handlers),
-        parallel_safe_tools=agent._PARALLEL_SAFE_TOOLS,
-        logger_fn=agent._log,
-        meta_fn=lambda: build_meta(agent),
-        working_dir=agent._working_dir,
-        summarize_notification_threshold=getattr(
-            agent, "_summarize_notification_threshold", None
         ),
     )
 
@@ -1187,20 +1204,10 @@ def _handle_tc_wake(agent, msg: Message) -> None:
         agent._last_usage = response.usage
         agent._save_chat_history(ledger_source="tc_wake")
         _process_response(agent, response, ledger_source="tc_wake")
-        # Notification-driven turns should also check pressure so
-        # warnings fire even when the agent is woken by mail/soul.
-        _check_molt_pressure(agent)
-        # Synchronous notification sync — same ACTIVE deferral semantics as
-        # _handle_request; delivery happens at the next IDLE boundary.
-        try:
-            agent._sync_notifications()
-        except Exception:
-            pass
-        # Rescan for large unsummarized results in chat history.
-        try:
-            agent._rescan_large_tool_results()
-        except Exception:
-            pass
+        # Notification-driven turns also run turn-boundary housekeeping so molt
+        # pressure / notification sync / large-result rescan fire even when the
+        # agent is woken by mail/soul (see _turn_boundary_housekeeping).
+        _turn_boundary_housekeeping(agent)
     except Exception as e:
         from ..llm_utils import WorkerStillRunningError
 
@@ -1224,7 +1231,10 @@ def _handle_tc_wake(agent, msg: Message) -> None:
                 tool_completed=True,
             )
             agent._save_chat_history()
-        agent._log("tc_wake_error", error=str(e)[:300])
+        fields = {"error": str(e)[:300]}
+        if isinstance(e, EmptyLLMResponseError):
+            fields.update(e.diagnostic_fields())
+        agent._log("tc_wake_error", **fields)
         raise
 
 
@@ -1236,6 +1246,32 @@ def _get_guard_limits(agent) -> tuple[int, int, int]:
     so stale init.json files cannot make the runtime harsher or looser.
     """
     return (ACTIVE_TURN_TOOL_CALL_EMERGENCY_LIMIT, 3, 8)
+
+
+def _make_tool_executor(agent, guard: LoopGuard) -> ToolExecutor:
+    """Construct the per-turn ``ToolExecutor`` with the shared wiring.
+
+    Every turn path wires the executor identically — dispatch fn, provider-aware
+    tool-result factory, known/parallel-safe tool sets, logger, meta fn, working
+    dir, and summarize threshold. Only the ``LoopGuard`` differs between paths
+    (e.g. ``dup_free_passes`` 3 for fresh requests vs 2 for tc-wake
+    continuations), so the caller supplies it.
+    """
+    return ToolExecutor(
+        dispatch_fn=agent._dispatch_tool,
+        make_tool_result_fn=lambda name, result, **kw: agent.service.make_tool_result(
+            name, result, provider=agent._config.provider, **kw
+        ),
+        guard=guard,
+        known_tools=set(agent._intrinsics) | set(agent._tool_handlers),
+        parallel_safe_tools=agent._PARALLEL_SAFE_TOOLS,
+        logger_fn=agent._log,
+        meta_fn=lambda: build_meta(agent),
+        working_dir=agent._working_dir,
+        summarize_notification_threshold=getattr(
+            agent, "_summarize_notification_threshold", None
+        ),
+    )
 
 
 def _check_external_send(agent, tool_calls, tool_results=None) -> None:
@@ -1416,6 +1452,10 @@ def _process_response(agent, response, *, ledger_source: str = "main") -> dict:
             raise EmptyLLMResponseError(
                 ledger_source=ledger_source,
                 in_tool_loop=in_tool_loop,
+                response_id=_diag.get("response_id"),
+                response_model=_diag.get("response_model"),
+                finish_reason=_diag.get("finish_reason"),
+                api_call_id=getattr(response, "api_call_id", None),
             )
 
         if response.text:
@@ -1642,26 +1682,13 @@ def _process_response(agent, response, *, ledger_source: str = "main") -> dict:
         agent._last_usage = response.usage
         agent._save_chat_history(ledger_source=ledger_source)
 
-        # Mid-loop legacy molt-notification sweep. Context pressure is now
-        # surfaced every tool result under _meta.agent_meta.context.molt
-        # (meta_block.build_meta), so this only clears any stale legacy
-        # molt.json left from older builds; it no longer publishes pressure.
-        _check_molt_pressure(agent)
-        # Synchronous notification sync — same ACTIVE deferral semantics as
-        # _handle_request; delivery happens at the next IDLE boundary.
-        try:
-            agent._sync_notifications()
-        except Exception:
-            pass
-        # Keep summarize reminders in sync across tool-loop LLM rounds too.
-        # New tool results are handled by the executor hook, but old live
-        # results (or dismissed reminders for still-unsummarized results) must
-        # be rediscovered after each continuation round, not only at external
-        # request / notification-wake boundaries.
-        try:
-            agent._rescan_large_tool_results()
-        except Exception:
-            pass
+        # Mid-loop turn-boundary housekeeping. Context pressure is now surfaced
+        # every tool result under _meta.agent_meta.context.molt
+        # (meta_block.build_meta), so _check_molt_pressure here only clears any
+        # stale legacy molt.json; the rescan keeps summarize reminders in sync
+        # across tool-loop LLM rounds, not only at request/notification-wake
+        # boundaries (see _turn_boundary_housekeeping).
+        _turn_boundary_housekeeping(agent)
 
     final_text = "\n".join(collected_text_parts)
     has_errors = bool(collected_errors)

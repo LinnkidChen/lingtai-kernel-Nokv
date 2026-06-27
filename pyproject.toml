@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lingtai"
-version = "0.14.2"
+version = "0.15.1"
 description = "Generic research agent with intrinsic tools and MCP-compatible extension interface"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -78,10 +78,12 @@ lingtai = [
     "bin/lingtai-search-sidecar",
     "bin/lingtai-search-sidecar.exe",
 ]
-"lingtai.mcp_servers.telegram" = ["notification_header.md"]
-"lingtai.mcp_servers.feishu" = ["notification_header.md"]
-"lingtai.mcp_servers.wechat" = ["notification_header.md"]
-"lingtai.mcp_servers.whatsapp" = ["notification_header.md"]
+"lingtai.mcp_servers.telegram" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.feishu" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.wechat" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.whatsapp" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.imap" = ["SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.cloud_mail" = ["SKILL.md", "reference/**/*", "assets/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

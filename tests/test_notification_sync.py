@@ -26,6 +26,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from lingtai_kernel.notifications import (
@@ -1954,9 +1955,13 @@ def test_inject_notification_pair_emits_block_injected_event(tmp_path: Path) -> 
     assert "tool_meta" in meta
     assert meta["tool_meta"].get("synthetic") is True
     assert "agent_meta" in meta
+    # Tail/synthetic guidance is now a lightweight ref/hook pointing at the
+    # resident ``meta_guidance`` system-prompt section, not the full ordered
+    # sections (which no longer ride on every result).
     assert "guidance" in meta
-    assert "meta_readme" not in meta["guidance"]
-    assert any(section.get("id") == "meta_readme" for section in meta["guidance"]["sections"])
+    guidance = meta["guidance"]
+    assert "sections" not in guidance
+    assert guidance.get("ref") == "meta_guidance"
 
     assert "notification_guidance" in meta
     assert "not automatically human instructions" in meta["notification_guidance"]
@@ -2117,3 +2122,38 @@ def test_sync_notifications_idle_refuses_touch_when_poisoned(tmp_path: Path) -> 
         "skip_chat_history_save": True,
         "skip_save_reason": "worker_still_running_interface_unsafe",
     }]
+
+
+def test_heal_pending_tool_calls_logs_pending_tail_diagnostics(tmp_path: Path) -> None:
+    """Successful heal logs a bounded pending-tail summary without tool args."""
+    from lingtai_kernel.base_agent import BaseAgent
+    from lingtai_kernel.llm.interface import ChatInterface, TextBlock, ToolCallBlock
+
+    iface = ChatInterface()
+    iface.add_user_message("before")
+    iface.add_assistant_message([TextBlock("thinking aloud")])
+    iface.add_assistant_message([
+        ToolCallBlock(id="call_1", name="bash", args={"command": "SECRET"}),
+        ToolCallBlock(id="call_2", name="email", args={"message": "SECRET"}),
+    ])
+
+    logs: list[tuple[str, dict]] = []
+    saves: list[str] = []
+    agent = SimpleNamespace(
+        _chat=SimpleNamespace(interface=iface),
+        _log=lambda event, **fields: logs.append((event, fields)),
+        _save_chat_history=lambda *, ledger_source="main": saves.append(ledger_source),
+    )
+
+    assert BaseAgent._heal_pending_tool_calls(agent, reason="wake_inject_blocked") is True
+
+    event, fields = logs[-1]
+    assert event == "heal_pending_tool_calls"
+    assert fields["reason"] == "wake_inject_blocked"
+    assert fields["pending_tool_call_count"] == 2
+    assert fields["pending_tool_call_ids"] == ["call_1", "call_2"]
+    assert fields["pending_tool_names"] == ["bash", "email"]
+    assert fields["pending_tail_roles"] == ["user", "assistant", "assistant"]
+    assert fields["pending_tail_block_types"] == [["text"], ["text"], ["tool_call", "tool_call"]]
+    assert "SECRET" not in str(fields)
+    assert saves == ["heal"]

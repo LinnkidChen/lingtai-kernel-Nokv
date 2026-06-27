@@ -6,12 +6,15 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import lingtai_kernel.meta_block as meta_block
 
 from lingtai_kernel.meta_block import (
+    GUIDANCE_KEY,
     GuidanceSchemaError,
     attach_active_notifications,
     attach_active_runtime,
     build_meta,
+    build_meta_guidance,
     build_meta_readme,
     build_molt_context,
     build_guidance_with_meta_readme,
@@ -19,7 +22,10 @@ from lingtai_kernel.meta_block import (
     clear_active_notification_holder,
     current_tool_result_chars,
     render_meta,
+    slim_adapter_comment_for_tail,
     stamp_meta,
+    static_adapter_comment,
+    dynamic_adapter_comment,
     validate_runtime_guidance,
 )
 from lingtai_kernel.llm.interface import ToolResultBlock
@@ -67,9 +73,29 @@ def test_build_meta_time_blind_regardless_of_timezone_awareness():
 
 def test_build_meta_includes_adapter_comment_when_chat_provides_one():
     agent = _fake_agent()
-    comment = {"adapter": "fake", "summary": "provider note"}
+    calls = {"legacy": 0, "dynamic": 0}
+
+    def legacy_comment():
+        calls["legacy"] += 1
+        return {
+            "adapter": "fake",
+            "summary": "legacy static provider note",
+            "cache_note": "legacy static cache prose",
+        }
+
+    def dynamic_comment():
+        calls["dynamic"] += 1
+        return {
+            "adapter": "fake",
+            "summary": "dynamic summary is not kernel-guessed static",
+            "turns_since_epoch_reset": 2,
+        }
+
     agent._session = SimpleNamespace(
-        chat=SimpleNamespace(adapter_comment=lambda: comment),
+        chat=SimpleNamespace(
+            adapter_comment=legacy_comment,
+            dynamic_adapter_comment=dynamic_comment,
+        ),
         _token_decomp_dirty=True,
         _system_prompt_tokens=0,
         _tools_tokens=0,
@@ -79,8 +105,13 @@ def test_build_meta_includes_adapter_comment_when_chat_provides_one():
 
     meta = build_meta(agent)
 
-    assert meta["adapter_comment"] == comment
-
+    tail = meta["adapter_comment"]
+    assert calls == {"legacy": 0, "dynamic": 1}
+    assert tail["adapter"] == "fake"
+    assert tail["summary"] == "dynamic summary is not kernel-guessed static"
+    assert tail["turns_since_epoch_reset"] == 2
+    assert "cache_note" not in tail
+    assert "meta_guidance_ref" not in tail
 
 def test_build_meta_omits_empty_adapter_comment():
     agent = _fake_agent()
@@ -137,13 +168,13 @@ def test_build_meta_counts_current_tool_result_chars_excluding_meta():
 
     current = meta["current_tool_result_chars"]
     expected = len(json.dumps(formal_payload, ensure_ascii=False, default=str))
-    assert "top 10" in current["_readme"]
+    assert "_readme" not in current
     assert current["total_chars"] == expected
     assert current["top_results"] == [
         {
             "id": "tc-history",
+            "tool_name": "bash",
             "chars": expected,
-            "preview": json.dumps(formal_payload, ensure_ascii=False)[:200],
         }
     ]
 
@@ -164,7 +195,7 @@ def _agent_with_history(blocks):
 def test_current_tool_result_chars_lists_top_10():
     # 15 prior results of strictly decreasing length; expect the 10 longest.
     blocks = [
-        ToolResultBlock(id=f"tc-{i}", name="bash", content={"payload": "X" * (100 - i)})
+        ToolResultBlock(id=f"tc-{i}", name="bash", content="X" * (1500 - i))
         for i in range(15)
     ]
     agent = _agent_with_history(blocks)
@@ -174,77 +205,58 @@ def test_current_tool_result_chars_lists_top_10():
     assert len(current["top_results"]) == 10
     ids = [entry["id"] for entry in current["top_results"]]
     assert ids == [f"tc-{i}" for i in range(10)]
+    assert all(entry["tool_name"] == "bash" for entry in current["top_results"])
+    assert all("preview" not in entry for entry in current["top_results"])
 
 
-def test_current_tool_result_chars_no_1000_char_threshold():
-    # Two short results, both well under 1000 chars, must still be listed.
+def test_current_tool_result_chars_filters_results_at_or_below_1000_chars():
     blocks = [
-        ToolResultBlock(id="tc-short-a", name="bash", content={"payload": "A" * 10}),
-        ToolResultBlock(id="tc-short-b", name="bash", content={"payload": "B" * 5}),
+        ToolResultBlock(id="tc-short", name="bash", content="A" * 1000),
+        ToolResultBlock(id="tc-long", name="read", content="B" * 1001),
     ]
     agent = _agent_with_history(blocks)
 
     current = current_tool_result_chars(agent)
 
-    ids = {entry["id"] for entry in current["top_results"]}
-    assert ids == {"tc-short-a", "tc-short-b"}
+    assert current["top_results"] == [
+        {"id": "tc-long", "tool_name": "read", "chars": 1001}
+    ]
 
 
-def test_current_tool_result_chars_includes_first_200_char_preview():
-    body = "Z" * 500
-    block = ToolResultBlock(id="tc-preview", name="bash", content={"payload": body})
+def test_current_tool_result_chars_entries_include_tool_name_and_no_preview():
+    block = ToolResultBlock(id="tc-preview", name="bash", content="Z" * 1200)
     agent = _agent_with_history([block])
 
     current = current_tool_result_chars(agent)
 
-    entry = current["top_results"][0]
-    preview = entry["preview"]
-    assert len(preview) == 200
-    # Preview is taken from the visible (JSON-serialized) formal payload.
-    assert preview == json.dumps({"payload": body}, ensure_ascii=False)[:200]
+    assert current["top_results"] == [
+        {"id": "tc-preview", "tool_name": "bash", "chars": 1200}
+    ]
 
 
-def test_current_tool_result_chars_preview_handles_short_body():
-    block = ToolResultBlock(id="tc-tiny", name="bash", content={"payload": "hi"})
-    agent = _agent_with_history([block])
+def test_current_tool_result_chars_tail_omits_readme_and_resident_readme_describes_fields():
+    agent = SimpleNamespace(_conversation=[])
 
     current = current_tool_result_chars(agent)
 
-    entry = current["top_results"][0]
-    assert entry["preview"] == json.dumps({"payload": "hi"}, ensure_ascii=False)
-    assert len(entry["preview"]) < 200
-
-
-def test_current_tool_result_chars_readme_drops_top5_and_1000_wording():
-    agent = _agent_with_history([])
-
-    current = current_tool_result_chars(agent)
-
-    readme = current["_readme"]
-    assert "top 10" in readme
-    assert "1000" not in readme
+    assert current["total_chars"] == 0
+    assert current["top_results"] == []
+    assert "_readme" not in current
+    readme = json.dumps(build_meta_readme())
+    assert "top_results" in readme
+    assert "no preview" in readme
     assert "top 5" not in readme
 
-
-def test_current_tool_result_chars_readme_says_no_need_to_summarize_helper():
-    agent = _agent_with_history([])
+def test_current_tool_result_chars_readme_is_resident_not_tail_state():
+    agent = SimpleNamespace(_conversation=[])
 
     current = current_tool_result_chars(agent)
 
-    readme = current["_readme"]
-    # The helper metadata itself does not need summarizing: it only ever
-    # appears on the latest tool result _meta, older copies are stripped.
-    assert "no need to summarize this" in readme
-    assert "latest" in readme
-    # It must still point the agent at the listed results and actively tell it
-    # to summarize prior results that no longer need to stay in full.
-    assert "proactively summarize" in readme
-    assert "useless" in readme
-    assert "no longer needed in full" in readme
-    assert "ids/previews" in readme
-    assert "1000" not in readme
-    assert "top 5" not in readme
-
+    assert "_readme" not in current
+    readme = json.dumps(build_meta_readme())
+    assert "proactive summarization" in readme
+    assert "top_results" in readme
+    assert "ids/previews" not in readme
 
 def test_build_meta_readme_mentions_tool_result_char_count_and_summarize():
     readme = build_meta_readme()
@@ -264,6 +276,185 @@ def test_build_guidance_with_meta_readme_keeps_section_shape_without_packaged_gu
     assert "meta_readme" not in guidance
     assert [section["id"] for section in guidance["sections"]] == ["meta_readme"]
 
+
+# ---------------------------------------------------------------------------
+# meta_guidance — resident system-prompt section + slimmed tail _meta.
+# ---------------------------------------------------------------------------
+
+
+def _meta_guidance_agent(static_comment=None):
+    """Agent stand-in whose chat exposes static_adapter_comment()."""
+    chat = SimpleNamespace(static_adapter_comment=lambda: static_comment)
+    return SimpleNamespace(_session=SimpleNamespace(chat=chat))
+
+
+def test_static_adapter_comment_reads_chat_static_method():
+    agent = _meta_guidance_agent(static_comment={"summary": "adapter rules"})
+
+    comment = static_adapter_comment(agent)
+
+    assert comment == {"summary": "adapter rules"}
+
+
+def test_dynamic_adapter_comment_prefers_chat_dynamic_method():
+    agent = _fake_agent()
+    calls = {"legacy": 0, "dynamic": 0}
+
+    def legacy_comment():
+        calls["legacy"] += 1
+        return {"adapter": "fake", "summary": "legacy static"}
+
+    def dynamic_comment():
+        calls["dynamic"] += 1
+        return {"adapter": "fake", "next_reset_in": 7}
+
+    agent._session = SimpleNamespace(
+        chat=SimpleNamespace(
+            adapter_comment=legacy_comment,
+            dynamic_adapter_comment=dynamic_comment,
+        )
+    )
+
+    assert dynamic_adapter_comment(agent) == {"adapter": "fake", "next_reset_in": 7}
+    assert calls == {"legacy": 0, "dynamic": 1}
+
+def test_static_adapter_comment_none_without_method():
+    agent = SimpleNamespace(_session=SimpleNamespace(chat=SimpleNamespace()))
+    assert static_adapter_comment(agent) is None
+
+
+def test_build_meta_guidance_renders_guidance_meta_readme_and_adapter():
+    static_comment = {
+        "adapter": "codex",
+        "summary": "Codex plans turns as full or incremental.",
+        "summarize_note": (
+            "Summarize breaks the incremental prefix and opens a fresh full epoch; "
+            "it is an investment, so keep the full:incremental ratio at or below "
+            "1:10 and defer non-urgent summarize until the savings justify the "
+            "cache miss; summarize immediately under high context pressure."
+        ),
+    }
+    agent = _meta_guidance_agent(static_comment)
+
+    section = build_meta_guidance(agent)
+
+    assert isinstance(section, str) and section.strip()
+    # Packaged guidance section body is present.
+    assert "progressive disclosure" in section
+    # meta_readme content (the _meta envelope explanation) is present.
+    assert "_meta envelope" in section or "_meta` envelope" in section
+    assert "tool_meta" in section
+    assert "agent_meta" in section
+    # Static adapter rules are present (the 4 required Codex points).
+    assert "full epoch" in section
+    assert "1:10" in section
+
+
+def test_build_meta_guidance_without_adapter_comment_still_renders():
+    agent = _meta_guidance_agent(None)
+    section = build_meta_guidance(agent)
+    assert isinstance(section, str) and section.strip()
+    assert "tool_meta" in section
+
+
+def test_slim_adapter_comment_for_tail_trims_ledger_without_static_key_guessing():
+    comment = {
+        "adapter": "codex",
+        "turns_since_epoch_reset": 3,
+        "last_full_api_calls_ago": 2,
+        "summary": "dynamic summary that should survive",
+        "cache_note": "adapter-owned dynamic value that should survive",
+        "summarize_full_note": "adapter-owned dynamic value that should survive",
+        "cache_ledger": {
+            "rows": [[0, "F", 0.5, 100.0, 50.0, "sum"]],
+            "summary": {"api_calls": 1, "cache_rate": 0.5},
+        },
+        "maintenance_hint": {
+            "summarize_economy": "reduce_summarize_frequency",
+            "full_to_incremental_ratio": "1:1",
+            "reason": "long prose reason",
+        },
+    }
+
+    slim = slim_adapter_comment_for_tail(comment)
+
+    # Dynamic scalars and arbitrary adapter keys survive: the kernel no longer
+    # guesses static-vs-dynamic from Codex-specific key names.
+    assert slim["turns_since_epoch_reset"] == 3
+    assert slim["last_full_api_calls_ago"] == 2
+    assert slim["summary"] == "dynamic summary that should survive"
+    assert slim["cache_note"] == "adapter-owned dynamic value that should survive"
+    assert slim["summarize_full_note"] == "adapter-owned dynamic value that should survive"
+    # The heavy 20-call cache history rows are size-trimmed generically.
+    assert "cache_ledger" not in slim
+    assert "rows" not in json.dumps(slim)
+    assert slim["cache_ledger_summary"] == {"api_calls": 1, "cache_rate": 0.5}
+    # maintenance decision survives, long prose reason dropped.
+    assert slim["maintenance_hint"]["summarize_economy"] == "reduce_summarize_frequency"
+    assert "reason" not in slim["maintenance_hint"]
+    # A hook points at the resident meta_guidance section.
+    assert "meta_guidance_ref" not in slim
+
+def test_attach_active_runtime_tail_guidance_is_ref_not_full_sections():
+    agent = _runtime_agent(total_calls=1)
+    content = _stamped_result({"current_time": "T"}, 12)
+    block = ToolResultBlock(id="t1", name="x", content=content)
+
+    attach_active_runtime(agent, [block], prior_holder=None)
+
+    guidance = block.content["_meta"][GUIDANCE_KEY]
+    # Tail guidance is a lightweight ref/hook, not the full ordered sections.
+    assert "sections" not in guidance
+    assert "meta_guidance" in guidance.get("ref", "") + json.dumps(guidance)
+
+
+def test_attach_active_runtime_tail_adapter_comment_has_no_ledger_rows():
+    calls = {"legacy": 0, "dynamic": 0}
+
+    def legacy_comment():
+        calls["legacy"] += 1
+        return {
+            "adapter": "codex",
+            "summary": "legacy static summary",
+            "cache_note": "legacy static prose",
+        }
+
+    def dynamic_comment():
+        calls["dynamic"] += 1
+        return {
+            "adapter": "codex",
+            "turns_since_epoch_reset": 4,
+            "cache_ledger": {
+                "rows": [[0, "F", 0.5, 100.0, 50.0, "sum"]],
+                "summary": {"api_calls": 1},
+            },
+            "maintenance_hint": {"non_urgent_summarize": "wait", "reason": "long"},
+        }
+
+    agent = _runtime_agent(total_calls=1)
+    agent._session = SimpleNamespace(
+        chat=SimpleNamespace(
+            adapter_comment=legacy_comment,
+            dynamic_adapter_comment=dynamic_comment,
+        )
+    )
+    block = ToolResultBlock(
+        id="t-adapter", name="x", content=_stamped_result({"current_time": "T"}, 12)
+    )
+
+    attach_active_runtime(agent, [block])
+
+    tail = block.content["_meta"]["agent_meta"]["adapter_comment"]
+    assert calls == {"legacy": 0, "dynamic": 1}
+    assert tail["adapter"] == "codex"
+    assert tail["turns_since_epoch_reset"] == 4
+    assert "summary" not in tail
+    assert "cache_note" not in tail
+    assert "cache_ledger" not in tail
+    assert "rows" not in json.dumps(tail)
+    assert tail["cache_ledger_summary"] == {"api_calls": 1}
+    assert "reason" not in tail["maintenance_hint"]
+    assert "meta_guidance_ref" not in tail
 
 def _fake_agent_with_lang(lang: str, *, time_awareness: bool = True):
     return SimpleNamespace(
@@ -980,7 +1171,7 @@ def _stamped_result(meta, elapsed_ms):
 
 def test_attach_active_runtime_counts_current_batch_tool_result_chars():
     agent = _fake_agent()
-    result = {"payload": "batch"}
+    result = {"payload": "B" * 1200}
     stamp_meta(result, build_meta(agent), elapsed_ms=12)
     block = ToolResultBlock(id="tc-batch", name="bash", content=result)
 
@@ -988,14 +1179,13 @@ def test_attach_active_runtime_counts_current_batch_tool_result_chars():
 
     agent_meta = block.content["_meta"]["agent_meta"]
     current = agent_meta["current_tool_result_chars"]
-    expected = len(json.dumps({"payload": "batch"}, ensure_ascii=False, default=str))
+    expected = len(json.dumps({"payload": "B" * 1200}, ensure_ascii=False, default=str))
     assert current["total_chars"] == expected
-    # No >1000 threshold any more: the current batch result is always listed.
     assert current["top_results"] == [
         {
             "id": "tc-batch",
+            "tool_name": "bash",
             "chars": expected,
-            "preview": json.dumps({"payload": "batch"}, ensure_ascii=False)[:200],
         }
     ]
 
@@ -1014,22 +1204,12 @@ def test_attach_active_runtime_stamps_latest_with_state_and_guidance():
     assert agent_meta["elapsed_ms"] == 12
     # active_turn_tool_calls is sourced from the guard and lives under agent_meta.
     assert agent_meta["active_turn_tool_calls"] == 3
-    # guidance comes from guidance.json (package resource) and validates.
+    # Tail guidance is now a lightweight ref/hook pointing at the resident
+    # meta_guidance system-prompt section — NOT the full ordered sections,
+    # which moved into the system prompt to stop riding on every tail _meta.
     guidance = meta["guidance"]
-    assert guidance["schema_version"] == 1
-    # The latest-only meta_readme self-describes _meta as a guidance section,
-    # not as a sibling key beside sections.
-    assert "meta_readme" not in guidance
-    sections = {section["id"]: section for section in guidance["sections"]}
-    readme_section = sections["meta_readme"]
-    readme_body = readme_section["body"]
-    assert "`tool_meta`" in readme_body
-    assert "`agent_meta`" in readme_body
-    assert "`guidance`" in readme_body
-    assert "`notification_guidance`" in readme_body
-    assert "`notifications`" in readme_body
-    assert "every tool result" in readme_body.lower()
-    assert "latest" in readme_body.lower()
+    assert "sections" not in guidance
+    assert "meta_guidance" in json.dumps(guidance)
     # The transient scaffolding is consumed.
     assert "_runtime_pending" not in block.content
     # No top-level active_turn_tool_calls repetition, and no legacy _runtime key.
@@ -1040,16 +1220,28 @@ def test_attach_active_runtime_stamps_latest_with_state_and_guidance():
 
 def test_attach_active_runtime_refreshes_adapter_comment_at_batch_boundary():
     agent = _runtime_agent(total_calls=1)
-    comment = {"adapter": "fake", "summary": "late provider note"}
+
+    def dynamic_comment():
+        return {"adapter": "fake", "next_reset_in": 5}
+
     agent._session = SimpleNamespace(
-        chat=SimpleNamespace(adapter_comment=lambda: comment)
+        chat=SimpleNamespace(
+            adapter_comment=lambda: {"adapter": "fake", "summary": "legacy provider note"},
+            dynamic_adapter_comment=dynamic_comment,
+        )
     )
-    block = ToolResultBlock(id="t-adapter", name="x", content=_stamped_result({"current_time": "T"}, 12))
+    block = ToolResultBlock(
+        id="t-adapter", name="x", content=_stamped_result({"current_time": "T"}, 12)
+    )
 
     attach_active_runtime(agent, [block])
 
     agent_meta = block.content["_meta"]["agent_meta"]
-    assert agent_meta["adapter_comment"] == comment
+    tail = agent_meta["adapter_comment"]
+    assert tail["adapter"] == "fake"
+    assert tail["next_reset_in"] == 5
+    assert "summary" not in tail
+    assert "meta_guidance_ref" not in tail
 
 def test_attach_active_runtime_moves_to_latest_and_clears_prior():
     agent = _runtime_agent(total_calls=1)
@@ -1267,97 +1459,81 @@ def test_build_molt_context_absent_without_psyche():
     assert build_molt_context(agent, 0.95) is None
 
 
-def test_build_molt_context_consider_stage_50_to_70():
-    agent = _molt_agent()
-    for usage in (0.50, 0.55, 0.69):
-        molt = build_molt_context(agent, usage)
-        assert molt is not None, f"expected molt at {usage}"
+def test_build_molt_context_consider_stage_50_to_70(monkeypatch):
+    monkeypatch.setattr(meta_block, "MOLT_NOTICE_THRESHOLD", 0.5)
+    monkeypatch.setattr(meta_block, "MOLT_PRESSURE_THRESHOLD", 0.7)
+    monkeypatch.setattr(meta_block, "MOLT_URGENCY_THRESHOLD", 0.9)
+    for usage in (0.5, 0.6, 0.699):
+        molt = build_molt_context(_molt_agent(), usage)
         assert molt["stage"] == "consider"
         assert molt["level"] == "notice"
-        assert molt["usage"] == usage
-        # Strengthened guidance: idle -> proactively molt; shorter context is cheaper.
-        assert "idle" in molt["message"]
-        assert "costs less" in molt["message"]
+        assert molt["usage"] == round(usage, 5)
+        assert molt["manual"] == "psyche-manual"
+        assert "idle" in molt["action"]
+        assert "message" not in molt
+        assert "thresholds" not in molt
 
-
-def test_build_molt_context_strong_stage_70_to_90():
-    agent = _molt_agent()
-    for usage in (0.70, 0.80, 0.89):
-        molt = build_molt_context(agent, usage)
-        assert molt is not None, f"expected molt at {usage}"
+def test_build_molt_context_strong_stage_70_to_90(monkeypatch):
+    monkeypatch.setattr(meta_block, "MOLT_NOTICE_THRESHOLD", 0.5)
+    monkeypatch.setattr(meta_block, "MOLT_PRESSURE_THRESHOLD", 0.7)
+    monkeypatch.setattr(meta_block, "MOLT_URGENCY_THRESHOLD", 0.9)
+    for usage in (0.7, 0.8, 0.899):
+        molt = build_molt_context(_molt_agent(), usage)
         assert molt["stage"] == "strong"
         assert molt["level"] == "warning"
-        # Strengthened guidance: idle -> proactively molt; shorter context is cheaper;
-        # summarize-first preserved.
-        assert "idle" in molt["message"]
-        assert "costs less" in molt["message"]
-        assert 'system(action="summarize")' in molt["message"]
+        assert molt["usage"] == round(usage, 5)
+        assert "summarize" in molt["action"]
+        assert "message" not in molt
+        assert "thresholds" not in molt
 
-
-def test_build_molt_context_immediate_stage_90_plus():
-    agent = _molt_agent()
-    for usage in (0.90, 0.95, 1.0, 1.05):  # >100% can happen under overflow trim
-        molt = build_molt_context(agent, usage)
-        assert molt is not None, f"expected molt at {usage}"
+def test_build_molt_context_immediate_stage_90_plus(monkeypatch):
+    monkeypatch.setattr(meta_block, "MOLT_NOTICE_THRESHOLD", 0.5)
+    monkeypatch.setattr(meta_block, "MOLT_PRESSURE_THRESHOLD", 0.7)
+    monkeypatch.setattr(meta_block, "MOLT_URGENCY_THRESHOLD", 0.9)
+    for usage in (0.9, 0.95, 1.0):
+        molt = build_molt_context(_molt_agent(), usage)
         assert molt["stage"] == "immediate"
-        assert molt["level"] == "critical"
-        assert molt["message"].startswith("Context is above 90%; act now")
-        assert "do it immediately; otherwise molt now" in molt["message"]
+        assert molt["level"] == "immediate"
+        assert "molt" in molt["action"]
+        assert "message" not in molt
+        assert "thresholds" not in molt
 
+def test_build_molt_context_shape_is_short_with_pointer_not_full_procedure(monkeypatch):
+    monkeypatch.setattr(meta_block, "MOLT_NOTICE_THRESHOLD", 0.5)
+    monkeypatch.setattr(meta_block, "MOLT_PRESSURE_THRESHOLD", 0.7)
+    monkeypatch.setattr(meta_block, "MOLT_URGENCY_THRESHOLD", 0.9)
+    molt = build_molt_context(_molt_agent(), 0.55)
 
-def test_build_molt_context_shape_is_short_with_pointer_not_full_procedure():
-    agent = _molt_agent()
-    molt = build_molt_context(agent, 0.92)
-    assert molt is not None
-    # Required fields.
-    for key in ("usage", "stage", "level",
-                "message", "procedure_ref", "manual", "thresholds"):
-        assert key in molt, f"missing {key}"
-    # Pointers to the detailed procedure, not the full text inlined.
-    assert molt["procedure_ref"] == "procedures.md#performing-a-molt"
+    assert set(molt) == {"usage", "level", "stage", "action", "manual"}
     assert molt["manual"] == "psyche-manual"
-    # Message stays short — no long procedural recipe inlined.
-    assert len(molt["message"]) < 200, "molt message must stay short"
-    assert "session_journal_path" not in molt["message"]
-    # Context pressure is a hygiene signal: reduce bulky tool results first
-    # when summarize can bring pressure down; do not overreact to temporary spikes.
-    assert "temporary spikes" in molt["message"].lower()
-    assert 'system(action="summarize")' in molt["message"]
-    # Strengthened guidance: a shorter context is cheaper per turn.
-    assert "costs less" in molt["message"]
-    # Thresholds echo the configured stages.
-    assert molt["thresholds"] == {"consider": 0.5, "strong": 0.7, "immediate": 0.9}
+    assert "pressure" not in molt
+    assert "message" not in molt
+    assert "procedure_ref" not in molt
+    assert "thresholds" not in molt
+    serialized = json.dumps(molt)
+    assert len(serialized) < 200
+    assert "procedures.md#performing-a-molt" not in serialized
 
+def test_build_molt_context_ignores_legacy_molt_prompt(monkeypatch):
+    monkeypatch.setattr(meta_block, "MOLT_NOTICE_THRESHOLD", 0.5)
+    monkeypatch.setattr(meta_block, "MOLT_PRESSURE_THRESHOLD", 0.7)
+    monkeypatch.setattr(meta_block, "MOLT_URGENCY_THRESHOLD", 0.9)
+    molt = build_molt_context(_molt_agent(), 0.55)
 
-def test_build_molt_context_ignores_legacy_molt_prompt():
-    """A stale molt_prompt on the config must be ignored — the context.molt
-    message is always the hardcoded runtime default now (Jason #4140)."""
-    agent = _molt_agent()
-    # Simulate a legacy config that still carries a molt_prompt attribute.
-    agent._config.molt_prompt = "ship it: molt now please"
-    molt = build_molt_context(agent, 0.93)
-    assert molt is not None
-    # The hardcoded default message is used, NOT the stale override.
-    assert molt["message"] != "ship it: molt now please"
-    assert "Context is above 90%" in molt["message"]
+    assert "Now is the time" not in molt["action"]
+    assert "molt" in molt["action"]
+    assert "message" not in molt
 
+def test_build_molt_context_ignores_legacy_custom_thresholds(monkeypatch):
+    monkeypatch.setattr(meta_block, "MOLT_NOTICE_THRESHOLD", 0.5)
+    monkeypatch.setattr(meta_block, "MOLT_PRESSURE_THRESHOLD", 0.7)
+    monkeypatch.setattr(meta_block, "MOLT_URGENCY_THRESHOLD", 0.9)
 
-def test_build_molt_context_ignores_legacy_custom_thresholds():
-    # Stale/custom config thresholds must not shift the kernel-owned stage
-    # boundaries.  Old init/config fields are accepted for compatibility but
-    # ignored at runtime.
-    agent = _molt_agent(notice=0.6, strong=0.8, immediate=0.95)
-
-    assert build_molt_context(agent, 0.49) is None
-    assert build_molt_context(agent, 0.55)["stage"] == "consider"
-    assert build_molt_context(agent, 0.70)["stage"] == "strong"
-    assert build_molt_context(agent, 0.90)["stage"] == "immediate"
-    assert build_molt_context(agent, 0.55)["thresholds"] == {
-        "consider": 0.5,
-        "strong": 0.7,
-        "immediate": 0.9,
-    }
-
+    assert build_molt_context(_molt_agent(), 0.499) is None
+    assert build_molt_context(_molt_agent(), 0.5)["stage"] == "consider"
+    assert build_molt_context(_molt_agent(), 0.7)["stage"] == "strong"
+    assert build_molt_context(_molt_agent(), 0.9)["stage"] == "immediate"
+    assert "thresholds" not in build_molt_context(_molt_agent(), 0.9)
 
 def test_build_meta_attaches_context_molt_only_above_threshold():
     """build_meta integrates build_molt_context: context.molt is absent below
