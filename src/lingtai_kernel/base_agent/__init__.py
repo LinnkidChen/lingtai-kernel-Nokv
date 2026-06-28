@@ -318,18 +318,10 @@ class BaseAgent:
         self._working_dir = self._workdir.path
 
         # LoggingService: JSONL is the source of truth; SQLite is an additive,
-        # fail-open sidecar index for queryable history.
-        from ..services.logging import CompositeLoggingService, JSONLLoggingService, SQLiteEventIndex
-        log_dir = self._working_dir / "logs"
-        log_dir.mkdir(exist_ok=True)
-        jsonl_log_service = JSONLLoggingService(
-            log_dir / "events.jsonl",
-            ensure_ascii=self._config.ensure_ascii,
-        )
-        self._log_service = CompositeLoggingService(
-            jsonl_log_service,
-            sqlite_index=SQLiteEventIndex(log_dir / "log.sqlite", ensure=False, keep_open=False),
-        )
+        # fail-open sidecar index for queryable history. Feature 04 may install
+        # a stream mirror after init.json is resolved; default boot stays local.
+        self._jsonl_stream_store = None
+        self._configure_event_log_service(None)
 
         # Acquire working directory lock (10s grace for prior process cleanup)
         self._workdir.acquire_lock(timeout=10)
@@ -882,6 +874,29 @@ class BaseAgent:
         """Write a structured event to the agent's event log."""
         self._log(event_type, **fields)
 
+    def _configure_event_log_service(self, stream_store, *, close_existing: bool = False) -> None:
+        """Install the event logging service, optionally backed by a stream store."""
+        if close_existing:
+            try:
+                self._log_service.close()
+            except Exception:
+                pass
+        from ..services.logging import CompositeLoggingService, JSONLLoggingService, SQLiteEventIndex
+
+        self._jsonl_stream_store = stream_store
+        log_dir = self._working_dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        jsonl_log_service = JSONLLoggingService(
+            log_dir / "events.jsonl",
+            ensure_ascii=self._config.ensure_ascii,
+            stream_store=stream_store,
+            stream="logs/events",
+        )
+        self._log_service = CompositeLoggingService(
+            jsonl_log_service,
+            sqlite_index=SQLiteEventIndex(log_dir / "log.sqlite", ensure=False, keep_open=False),
+        )
+
     # ------------------------------------------------------------------
     # Public addon API (pass-throughs)
     # ------------------------------------------------------------------
@@ -1378,6 +1393,7 @@ class BaseAgent:
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
             logger_fn=self._log,
+            stream_store=getattr(self, "_jsonl_stream_store", None),
         )
 
     def _inject_notification_pair(self, notifications: dict) -> bool:
@@ -1905,7 +1921,15 @@ class BaseAgent:
             if state and state.get("messages"):
                 redacted_messages = redact_for_trajectory(state["messages"])
                 lines = [json.dumps(entry, ensure_ascii=False) for entry in redacted_messages]
-                (history_dir / "chat_history.jsonl").write_text("\n".join(lines) + "\n")
+                history_path = history_dir / "chat_history.jsonl"
+                history_path.write_text("\n".join(lines) + "\n")
+                stream_store = getattr(self, "_jsonl_stream_store", None)
+                if (
+                    stream_store is not None
+                    and callable(getattr(stream_store, "handles", None))
+                    and stream_store.handles("history/chat_history")
+                ):
+                    stream_store.replace_from_file("history/chat_history", history_path)
         except Exception as e:
             logger.warning(f"[{self.agent_name}] Failed to save chat history: {e}")
         # Update .agent.json with current state
@@ -1936,6 +1960,7 @@ class BaseAgent:
                     model=model,
                     endpoint=endpoint,
                     extra=ledger_extra,
+                    stream_store=getattr(self, "_jsonl_stream_store", None),
                 )
             except Exception as e:
                 logger.warning(f"[{self.agent_name}] Failed to append token ledger: {e}")

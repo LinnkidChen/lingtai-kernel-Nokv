@@ -736,6 +736,10 @@ class LocalFileIOService(FileIOService):
             max_visited=max_visited,
         )
 
+    def is_routed_path(self, path: str | Path) -> bool:
+        checker = getattr(self._backend, "is_routed_path", None)
+        return bool(callable(checker) and checker(path))
+
     def read(self, path: str) -> str:
         return self._backend.read(path)
 

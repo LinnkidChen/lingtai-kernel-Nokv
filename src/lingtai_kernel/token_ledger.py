@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 def _mirror_token_entry_to_sqlite(path: Path, entry: dict, source_offset: int) -> None:
@@ -112,6 +113,7 @@ def append_token_entry(
     model: str | None = None,
     endpoint: str | None = None,
     extra: dict | None = None,
+    stream_store: Any | None = None,
 ) -> None:
     """Append one token usage entry to the ledger.
 
@@ -146,6 +148,15 @@ def append_token_entry(
         entry["model"] = model
     if endpoint is not None:
         entry["endpoint"] = endpoint
+    if (
+        stream_store is not None
+        and callable(getattr(stream_store, "handles", None))
+        and stream_store.handles("logs/token_ledger")
+    ):
+        position = stream_store.append("logs/token_ledger", entry, ensure_ascii=True)
+        if position.source_offset is not None:
+            _mirror_token_entry_to_sqlite(path, entry, position.source_offset)
+        return
     payload = (json.dumps(entry) + "\n").encode("utf-8")
     with open(path, "ab") as f:
         source_offset = f.tell()

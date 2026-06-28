@@ -43,6 +43,7 @@ def recover_tool_result_block_from_events(
     tool_call_id: str,
     tool_name: str,
     logger_fn: LoggerFn | None = None,
+    stream_store: Any | None = None,
     max_scan_bytes: int = DEFAULT_MAX_SCAN_BYTES,
     max_scan_events: int = DEFAULT_MAX_SCAN_EVENTS,
     max_result_chars: int = PREVENTIVE_MAX_CHARS,
@@ -66,6 +67,12 @@ def recover_tool_result_block_from_events(
             max_scan_bytes=max_scan_bytes,
             max_scan_events=max_scan_events,
         )
+        if recovered is None and _stream_store_handles_events(stream_store):
+            recovered = _find_latest_tool_result_event_from_stream_store(
+                stream_store,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+            )
     except Exception as exc:  # noqa: BLE001 - recovery must never break heal
         _safe_log(
             logger_fn,
@@ -135,6 +142,43 @@ def recover_tool_result_block_from_events(
         content=capped,
         synthesized=False,
     )
+
+
+def _stream_store_handles_events(stream_store: Any | None) -> bool:
+    if stream_store is None:
+        return False
+    handles = getattr(stream_store, "handles", None)
+    return callable(handles) and bool(handles("logs/events"))
+
+
+def _find_latest_tool_result_event_from_stream_store(
+    stream_store: Any,
+    *,
+    tool_call_id: str,
+    tool_name: str,
+) -> _RecoveredEvent | None:
+    finder = getattr(stream_store, "find", None)
+    if not callable(finder) or not tool_call_id:
+        return None
+    candidates = finder("logs/events", tool_call_id=tool_call_id)
+    stats = _ScanStats(scanned_events=len(candidates), scanned_bytes=0)
+    for event in reversed(candidates):
+        if not isinstance(event, dict):
+            continue
+        if event.get("type", event.get("event")) != "tool_result":
+            continue
+        if "tool_name" in event and event.get("tool_name") is not None:
+            if event.get("tool_name") != tool_name:
+                continue
+        if "result" not in event:
+            continue
+        return _RecoveredEvent(
+            result=event.get("result"),
+            event_ts=event.get("ts"),
+            event_tool_name=event.get("tool_name"),
+            stats=stats,
+        )
+    return None
 
 
 def _find_latest_tool_result_event(
