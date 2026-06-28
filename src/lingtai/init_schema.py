@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 TOP_OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "env_file": str,
     "venv_path": str,
+    "storage": dict,
     # addons is a list of curated MCP names — looked up in the kernel
     # catalog and decompressed into mcp_registry.jsonl by the `mcp`
     # capability on agent boot.
@@ -42,7 +43,7 @@ DEPRECATED_TOP_FIELDS: set[str] = {
 LEGACY_MIGRATED_TOP_FIELDS: set[str] = {"procedures", "procedures_file"}
 
 TOP_KNOWN: set[str] = {
-    "manifest", "env_file", "venv_path", "addons", "mcp",
+    "manifest", "env_file", "venv_path", "storage", "addons", "mcp",
     "principle", "principle_file", "covenant", "covenant_file",
     "substrate", "substrate_file",
     "brief", "brief_file",
@@ -334,6 +335,46 @@ def validate_init(data: dict) -> list[str]:
     if isinstance(addons, list):
         if not all(isinstance(x, str) for x in addons):
             warnings.append("addons: all entries must be strings (curated MCP names)")
+
+    storage = data.get("storage")
+    if storage is not None:
+        if not isinstance(storage, dict):
+            raise ValueError(f"storage: expected object, got {type(storage).__name__}")
+        _optional_keys(storage, {
+            "enabled": bool,
+            "backend": str,
+            "nokv": dict,
+            "mounts": list,
+            "streams": list,
+        }, prefix="storage")
+        for key in storage:
+            if key not in {"enabled", "backend", "nokv", "mounts", "streams"}:
+                warnings.append(f"unknown field in storage: {key}")
+        mounts = storage.get("mounts")
+        if mounts is not None:
+            if not all(isinstance(v, str) and v for v in mounts):
+                raise ValueError("storage.mounts: expected list[str]")
+        streams = storage.get("streams")
+        if streams is not None:
+            if not all(isinstance(v, str) and v for v in streams):
+                raise ValueError("storage.streams: expected list[str]")
+        nokv_storage = storage.get("nokv")
+        if nokv_storage is not None:
+            allowed_nokv = {
+                "namespace_root",
+                "metadata_addr_env",
+                "bucket_env",
+                "endpoint_env",
+                "access_key_id_env",
+                "secret_access_key_env",
+                "region_env",
+            }
+            for key in nokv_storage:
+                if key not in allowed_nokv:
+                    warnings.append(f"unknown field in storage.nokv: {key}")
+            for key in allowed_nokv:
+                if key in nokv_storage and not isinstance(nokv_storage[key], str):
+                    raise ValueError(f"storage.nokv.{key}: expected str")
 
     # Validate manifest.capabilities.skills shape if present.
     caps = manifest.get("capabilities") or {}

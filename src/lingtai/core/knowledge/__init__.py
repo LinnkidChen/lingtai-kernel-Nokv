@@ -68,12 +68,7 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
 # Entry scanner
 # ---------------------------------------------------------------------------
 
-def _parse_entry_file(entry_file: Path, label: str) -> tuple[dict | None, dict | None]:
-    try:
-        text = entry_file.read_text(encoding="utf-8")
-    except OSError as e:
-        return None, {"folder": label, "reason": f"cannot read KNOWLEDGE.md: {e}"}
-
+def _entry_from_text(text: str, path: str, label: str) -> tuple[dict | None, dict | None]:
     fm = _parse_frontmatter(text)
     name = fm.get("name", "")
     description = fm.get("description", "")
@@ -86,8 +81,17 @@ def _parse_entry_file(entry_file: Path, label: str) -> tuple[dict | None, dict |
         "name": name,
         "description": description,
         "version": fm.get("version", ""),
-        "path": str(entry_file),
+        "path": path,
     }, None
+
+
+def _parse_entry_file(entry_file: Path, label: str) -> tuple[dict | None, dict | None]:
+    try:
+        text = entry_file.read_text(encoding="utf-8")
+    except OSError as e:
+        return None, {"folder": label, "reason": f"cannot read KNOWLEDGE.md: {e}"}
+
+    return _entry_from_text(text, str(entry_file), label)
 
 
 def _scan_recursive(
@@ -144,6 +148,32 @@ def _scan(directory: Path) -> tuple[list[dict], list[dict]]:
     valid: list[dict] = []
     problems: list[dict] = []
     _scan_recursive(directory, valid, problems)
+    return valid, problems
+
+
+def _scan_via_file_io(agent: "BaseAgent", directory: Path) -> tuple[list[dict], list[dict]]:
+    valid: list[dict] = []
+    problems: list[dict] = []
+    try:
+        matches = agent._file_io.glob("**/KNOWLEDGE.md", root=str(directory))
+    except Exception as e:
+        return [], [{"folder": str(directory), "reason": f"knowledge FileIO glob failed: {e}"}]
+
+    for path in sorted(matches):
+        try:
+            label = str(Path(path).parent.relative_to(directory))
+        except ValueError:
+            label = str(Path(path).parent)
+        try:
+            text = agent._file_io.read(path)
+        except Exception as e:
+            problems.append({"folder": label, "reason": f"cannot read KNOWLEDGE.md via FileIO: {e}"})
+            continue
+        entry, prob = _entry_from_text(text, path, label)
+        if entry:
+            valid.append(entry)
+        if prob:
+            problems.append(prob)
     return valid, problems
 
 
@@ -379,9 +409,16 @@ def _reconcile(agent: "BaseAgent") -> dict:
     working_dir = agent._working_dir
     knowledge_dir = working_dir / "knowledge"
 
-    migration_problems = _migrate_legacy_json(working_dir, knowledge_dir)
-    entries, problems = _scan(knowledge_dir)
-    problems = migration_problems + problems
+    is_routed = bool(
+        getattr(agent, "_file_io", None) is not None
+        and getattr(agent._file_io, "is_routed_path", lambda _path: False)(knowledge_dir)
+    )
+    if is_routed:
+        entries, problems = _scan_via_file_io(agent, knowledge_dir)
+    else:
+        migration_problems = _migrate_legacy_json(working_dir, knowledge_dir)
+        entries, problems = _scan(knowledge_dir)
+        problems = migration_problems + problems
 
     lang = agent._config.language
     catalog_yaml = _build_catalog_yaml(entries, lang)

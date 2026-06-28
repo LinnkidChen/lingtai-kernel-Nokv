@@ -125,10 +125,25 @@ class JSONLLoggingService(LoggingService):
     Thread-safe via lock. Flushes after every write for real-time tailing.
     """
 
-    def __init__(self, path: Path | str, *, ensure_ascii: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        ensure_ascii: bool = False,
+        stream_store: Any | None = None,
+        stream: str = "logs/events",
+    ) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self._path, "ab")
+        self._stream_store = (
+            stream_store
+            if stream_store is not None
+            and callable(getattr(stream_store, "handles", None))
+            and stream_store.handles(stream)
+            else None
+        )
+        self._stream = stream
+        self._file = None if self._stream_store is not None else open(self._path, "ab")
         self._lock = threading.RLock()
         self._ensure_ascii = ensure_ascii
         self._closed = False
@@ -141,9 +156,23 @@ class JSONLLoggingService(LoggingService):
         """Append event as one JSON line and return JSONL source metadata."""
         if self._closed:
             return None
+        if self._stream_store is not None:
+            with self._lock:
+                position = self._stream_store.append(
+                    self._stream,
+                    event,
+                    ensure_ascii=self._ensure_ascii,
+                    default=str,
+                )
+            return {
+                "source_file": position.source_file or str(self._path),
+                "source_offset": position.source_offset,
+            }
         line = json.dumps(event, ensure_ascii=self._ensure_ascii, default=str)
         payload = (line + "\n").encode("utf-8")
         with self._lock:
+            if self._file is None:
+                return None
             source_offset = self._file.tell()
             self._file.write(payload)
             self._file.flush()
@@ -152,6 +181,8 @@ class JSONLLoggingService(LoggingService):
     def get_events(self) -> list[dict]:
         """Read all events from the JSONL file. Thread-safe."""
         with self._lock:
+            if self._stream_store is not None:
+                return list(self._stream_store.iter_range(self._stream))
             if not self._path.exists():
                 return []
             events = []
@@ -168,7 +199,8 @@ class JSONLLoggingService(LoggingService):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._file.close()
+            if self._file is not None:
+                self._file.close()
 
 
 class SQLiteEventIndex:

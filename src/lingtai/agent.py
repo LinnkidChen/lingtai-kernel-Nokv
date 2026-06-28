@@ -1232,6 +1232,8 @@ class Agent(BaseAgent):
         else:
             self._summarize_notification_threshold = 3000
 
+        self._configure_storage_from_init(data)
+
         # Reload all prompt sections (covenant, character, principle,
         # procedures, brief, rules, pad, comment) from init.json and disk.
         self._reload_prompt_sections(data)
@@ -1336,6 +1338,75 @@ class Agent(BaseAgent):
             capabilities=[name for name, _ in self._capabilities],
             tools=list(self._tool_handlers.keys()),
         )
+
+    def _configure_storage_from_init(self, data: dict) -> None:
+        """Configure explicit selected-subtree FileIO routing from init.json."""
+        from .services.file_io_factory import build_file_io_service
+        from .services.storage_config import resolve_storage_config
+
+        raw_storage = data.get("storage")
+        nokv_backend = getattr(self, "_nokv_backend", None)
+        cfg = resolve_storage_config(
+            raw_storage,
+            agent_dir=self._working_dir,
+            nokv_backend=nokv_backend,
+        )
+        current_backend = getattr(getattr(self, "_file_io", None), "_backend", None)
+        local_backend = getattr(current_backend, "local_backend", current_backend)
+        self._file_io = build_file_io_service(
+            root=self._working_dir,
+            routes=cfg.routes,
+            local_backend=local_backend,
+            nokv_backend=cfg.nokv_backend,
+        )
+        status_path = self._working_dir / "system" / "storage.resolved.json"
+
+        def write_storage_status(health=None) -> None:
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            health_doc = None
+            if health is not None:
+                health_doc = (
+                    health.status_document()
+                    if callable(getattr(health, "status_document", None))
+                    else health
+                )
+            tmp = status_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(
+                    cfg.status_document(health=health_doc),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(status_path)
+
+        stream_store = None
+        if cfg.streams:
+            from lingtai_kernel.jsonl_stream import (
+                FilesystemJsonlStreamStore,
+                MirrorJsonlStreamStore,
+                NoKVSegmentedJsonlStreamStore,
+            )
+
+            stream_names = [stream.stream for stream in cfg.streams]
+            stream_roots = {
+                stream.stream: stream.remote_root
+                for stream in cfg.streams
+                if stream.backend == "nokv"
+            }
+            stream_store = MirrorJsonlStreamStore(
+                FilesystemJsonlStreamStore(self._working_dir, streams=stream_names),
+                NoKVSegmentedJsonlStreamStore(
+                    self._working_dir,
+                    stream_roots,
+                    cfg.nokv_backend,
+                ),
+                health_writer=write_storage_status,
+            )
+        self._configure_event_log_service(stream_store, close_existing=True)
+        write_storage_status()
 
     def _reload_prompt_sections(self, data: dict | None = None) -> None:
         """Re-read all prompt sections from init.json and disk.

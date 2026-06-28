@@ -28,7 +28,9 @@ from .services.file_io import (
     LocalFileIOService,
     NoKVFileIOBackend,
 )
+from .services.file_io_factory import RoutedFileIOBackend, build_file_io_service
 from .services.nokv import NoKVConfig, NoKVUnsupportedError
+from .services.storage_config import ResolvedStorageConfig, StorageRoute, StorageStreamRoute, resolve_storage_config
 from .services.file_io_sidecar import (
     BACKEND_ENV_VAR,
     RustFileIOBackend,
@@ -67,12 +69,18 @@ __all__ = [
     "NoKVConfig",
     "NoKVFileIOBackend",
     "NoKVUnsupportedError",
+    "ResolvedStorageConfig",
+    "RoutedFileIOBackend",
     "RustFileIOBackend",
     "SidecarAdapter",
     "SidecarError",
+    "StorageRoute",
+    "StorageStreamRoute",
     "BACKEND_ENV_VAR",
+    "build_file_io_service",
     "default_file_io_service",
     "resolve_sidecar_binary",
+    "resolve_storage_config",
     "GrepMatch",
     "MailService",
     "FilesystemMailService",
