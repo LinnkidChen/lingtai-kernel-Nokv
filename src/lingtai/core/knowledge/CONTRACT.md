@@ -1,8 +1,10 @@
 # Knowledge capability contract
 
 `knowledge` is the agent-private durable knowledge capability. It scans the
-agent's local `knowledge/` directory for `KNOWLEDGE.md`-bearing entries and
-injects a compact catalog into the system prompt. The implementation lives in
+agent's `knowledge/` directory for `KNOWLEDGE.md`-bearing entries and injects a
+compact catalog into the system prompt. Local knowledge scans the filesystem;
+when `knowledge` is an explicitly configured selected NoKV mount, the scanner
+uses FileIO. The implementation lives in
 `src/lingtai/core/knowledge/`; the code is the source of truth.
 
 ## Routing Card
@@ -78,7 +80,7 @@ alias.
 
 ## Storage
 
-The on-disk layout is:
+The local layout is:
 
 ```text
 <agent>/knowledge/
@@ -118,6 +120,12 @@ them via the regular `read`/`bash` tools when it loads an entry.
 The agent is the sole long-term author of `knowledge/`. The only capability
 write is a one-time legacy migration: if `knowledge/knowledge.json` or old `codex/codex.json` exists, entries are converted to `knowledge/<slug>/KNOWLEDGE.md`, each legacy `supplementary` field is written to `references/supplementary.md`, and the source JSON is renamed to `<name>.json.migrated` to prevent repeat work.
 
+With selected-subtree NoKV storage, only an explicitly configured `knowledge`
+mount routes to NoKV. The capability scans it through FileIO, skips legacy JSON
+migration, and still injects only catalog metadata. Runtime state, mailbox,
+logs, locks, and signals stay local; explicit `nokv://` paths remain backed by
+the injected NoKV client behavior in FileIO.
+
 ## Prompt injection
 
 On setup and on every `info` call, the capability rewrites protected prompt
@@ -150,7 +158,7 @@ skill -> private knowledge.
 |---|---|---|
 | `knowledge` is the only private durable memory capability in the builtin registry | `src/lingtai/capabilities/__init__.py` | `tests/test_check_caps.py::test_get_all_providers_includes_expected_capabilities` |
 | `knowledge` setup registers only the `knowledge` tool | `src/lingtai/core/knowledge/__init__.py` | `tests/test_knowledge.py::test_knowledge_setup_registers_only_knowledge_tool` |
-| Legacy `knowledge/knowledge.json` and `codex/codex.json` entries migrate once into `KNOWLEDGE.md` folders; `supplementary` becomes `references/supplementary.md` | `src/lingtai/core/knowledge/__init__.py` | `tests/test_knowledge.py::test_legacy_knowledge_json_migrates_to_knowledge_md`, `tests/test_knowledge.py::test_legacy_codex_json_migrates_to_knowledge_md` |
+| Local legacy `knowledge/knowledge.json` and `codex/codex.json` entries migrate once into `KNOWLEDGE.md` folders; NoKV-backed `knowledge/` skips migration | `src/lingtai/core/knowledge/__init__.py` | `tests/test_knowledge.py::test_legacy_knowledge_json_migrates_to_knowledge_md`, `tests/test_knowledge.py::test_legacy_codex_json_migrates_to_knowledge_md`, `tests/test_nokv_knowledge_scan.py` |
 | Manager-style lookup is exact: `knowledge` resolves and former names do not | `src/lingtai/agent.py` | `tests/test_knowledge.py::test_former_alias_capabilities_do_not_register_knowledge` |
 | Catalog reads `<agent>/knowledge/<name>/KNOWLEDGE.md` and excludes `SKILL.md` entries | `src/lingtai/core/knowledge/__init__.py` | `tests/test_knowledge.py::test_knowledge_md_convention_distinct_from_skill_md` |
 | Prompt catalog includes only `name`/`description`/`path` from frontmatter | `src/lingtai/core/knowledge/__init__.py` | `tests/test_knowledge.py::test_prompt_catalog_only_metadata_not_body` |
@@ -165,6 +173,7 @@ skill -> private knowledge.
 | Skills do not depend on private knowledge | documented invariant; enforce by review | Check shared skill docs for private paths/ids | Shared skills become non-portable |
 | Knowledge and skills use distinct manifest filenames | `tests/test_knowledge.py::test_knowledge_md_convention_distinct_from_skill_md` | Drop a `SKILL.md` into `<agent>/knowledge/foo/` and confirm it is not picked up | Physical separation collapses; private/public boundary blurs |
 | Body content stays out of prompt catalog | `tests/test_knowledge.py::test_prompt_catalog_only_metadata_not_body` | Author an entry with a long body and inspect the prompt section | Prompt bloat / private detail leakage |
+| NoKV-backed knowledge scans through FileIO and skips legacy migration | `tests/test_nokv_knowledge_scan.py` | Enable only the `knowledge` selected mount and inspect storage routes | Migration writes into remote storage or bypasses configured routing |
 
 Run before merging knowledge changes:
 

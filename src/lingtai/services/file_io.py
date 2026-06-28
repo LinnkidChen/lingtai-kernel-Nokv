@@ -552,9 +552,16 @@ class NoKVFileIOBackend(FileIOBackend):
         import os
 
         self.last_traversal = TraversalStats()
+        start = time.monotonic()
         root_path = self._object_path(root or "/")
         results: list[str] = []
         for entry in self.list(root_path):
+            if walltime_s is not None and (time.monotonic() - start) > walltime_s:
+                self.last_traversal.truncated_reason = "walltime"
+                break
+            if max_visited is not None and self.last_traversal.visited >= max_visited:
+                self.last_traversal.truncated_reason = "visited"
+                break
             self.last_traversal.visited += 1
             rel = os.path.relpath(entry["path"], root_path)
             if fnmatch.fnmatch(rel, pattern):
@@ -562,6 +569,7 @@ class NoKVFileIOBackend(FileIOBackend):
                 if max_results is not None and len(results) >= max_results:
                     self.last_traversal.truncated_reason = "max_results"
                     break
+        self.last_traversal.elapsed_ms = int((time.monotonic() - start) * 1000)
         results.sort()
         return results
 
@@ -580,17 +588,39 @@ class NoKVFileIOBackend(FileIOBackend):
 
         regex = re.compile(pattern)
         self.last_traversal = TraversalStats()
+        start = time.monotonic()
         root_path = self._object_path(path or "/")
         results: list[GrepMatch] = []
         for entry in self.list(root_path):
+            if walltime_s is not None and (time.monotonic() - start) > walltime_s:
+                self.last_traversal.truncated_reason = "walltime"
+                break
+            if max_visited is not None and self.last_traversal.visited >= max_visited:
+                self.last_traversal.truncated_reason = "visited"
+                break
             self.last_traversal.visited += 1
-            content = self.read(entry["path"])
+            metadata = entry.get("metadata") or {}
+            size = metadata.get("size")
+            if size is None:
+                size = metadata.get("bytes")
+            if size is None:
+                size = metadata.get("content_length")
+            if max_file_bytes is not None and isinstance(size, int) and size > max_file_bytes:
+                self.last_traversal.files_skipped_size += 1
+                continue
+            try:
+                content = self.read(entry["path"])
+            except UnicodeDecodeError:
+                self.last_traversal.files_skipped_binary += 1
+                continue
             for i, line in enumerate(content.splitlines(), 1):
                 if regex.search(line):
                     results.append(GrepMatch(self._uri(entry["path"]), i, line))
                     if len(results) >= max_results:
                         self.last_traversal.truncated_reason = "max_results"
+                        self.last_traversal.elapsed_ms = int((time.monotonic() - start) * 1000)
                         return results
+        self.last_traversal.elapsed_ms = int((time.monotonic() - start) * 1000)
         return results
 
 
@@ -685,6 +715,390 @@ class HybridFileIOBackend(FileIOBackend):
         )
 
 
+class RoutedFileIOBackend(FileIOBackend):
+    """Route selected agent-local subtrees to NoKV and keep runtime state local."""
+
+    def __init__(
+        self,
+        *,
+        agent_dir: Path | str,
+        local_backend: FileIOBackend,
+        nokv_backend: FileIOBackend,
+        routes: Iterable[Any],
+        uri_prefixes: tuple[str, ...] = DEFAULT_NOKV_URI_PREFIXES,
+    ):
+        self._agent_dir = Path(agent_dir).resolve(strict=False)
+        self._local_backend = local_backend
+        self._nokv_backend = nokv_backend
+        self._routes = tuple(routes)
+        self._uri_prefixes = tuple(uri_prefixes)
+        self._last_backend: FileIOBackend = self._local_backend
+        self._last_traversal = TraversalStats()
+
+    @property
+    def last_traversal(self) -> TraversalStats:
+        return self._last_traversal
+
+    @last_traversal.setter
+    def last_traversal(self, value: TraversalStats) -> None:
+        self._last_traversal = value
+        self._last_backend.last_traversal = value
+
+    @staticmethod
+    def _copy_traversal_stats(stats: TraversalStats) -> TraversalStats:
+        return TraversalStats(
+            visited=stats.visited,
+            elapsed_ms=stats.elapsed_ms,
+            truncated_reason=stats.truncated_reason,
+            files_skipped_size=stats.files_skipped_size,
+            files_skipped_binary=stats.files_skipped_binary,
+            dirs_pruned=stats.dirs_pruned,
+        )
+
+    @classmethod
+    def _aggregate_traversal_stats(cls, stats_items: Iterable[TraversalStats]) -> TraversalStats:
+        aggregate = TraversalStats()
+        for stats in stats_items:
+            snapshot = cls._copy_traversal_stats(stats)
+            aggregate.visited += snapshot.visited
+            aggregate.elapsed_ms += snapshot.elapsed_ms
+            aggregate.files_skipped_size += snapshot.files_skipped_size
+            aggregate.files_skipped_binary += snapshot.files_skipped_binary
+            aggregate.dirs_pruned += snapshot.dirs_pruned
+            if aggregate.truncated_reason is None and snapshot.truncated_reason is not None:
+                aggregate.truncated_reason = snapshot.truncated_reason
+        return aggregate
+
+    @staticmethod
+    def _remaining_visited_budget(max_visited: int | None, stats_items: Iterable[TraversalStats]) -> int | None:
+        if max_visited is None:
+            return None
+        visited = sum(stats.visited for stats in stats_items)
+        return max(max_visited - visited, 0)
+
+    @staticmethod
+    def _remaining_walltime_budget(walltime_s: float | None, start: float) -> float | None:
+        if walltime_s is None:
+            return None
+        return max(walltime_s - (time.monotonic() - start), 0.0)
+
+    def _resolve_local_path(self, path: str | Path) -> Path:
+        p = Path(path)
+        if not p.is_absolute():
+            p = self._agent_dir / p
+        return p.resolve(strict=False)
+
+    def _route_for_local_path(self, path: str | Path):
+        resolved = self._resolve_local_path(path)
+        for route in self._routes:
+            local_root = Path(route.local_root).resolve(strict=False)
+            try:
+                rel = resolved.relative_to(local_root)
+            except ValueError:
+                continue
+            return route, rel
+        return None
+
+    @staticmethod
+    def _join_remote(remote_root: str, rel: Path) -> str:
+        rel_text = rel.as_posix()
+        if rel_text in {"", "."}:
+            return remote_root.rstrip("/") or "/"
+        return f"{remote_root.rstrip('/')}/{rel_text}"
+
+    def _remote_for_path(self, path: str | Path) -> tuple[Any, str] | None:
+        match = self._route_for_local_path(path)
+        if match is None:
+            return None
+        route, rel = match
+        return route, self._join_remote(route.remote_root, rel)
+
+    def _local_for_remote(self, remote_path: str, *, route: Any | None = None) -> str | None:
+        object_path = normalize_nokv_path(remote_path, self._uri_prefixes)
+        routes = (route,) if route is not None else self._routes
+        for candidate in routes:
+            remote_root = normalize_nokv_path(candidate.remote_root, self._uri_prefixes)
+            local_root = Path(candidate.local_root).resolve(strict=False)
+            if object_path == remote_root:
+                return str(local_root)
+            prefix = remote_root.rstrip("/") + "/"
+            if object_path.startswith(prefix):
+                rel = object_path[len(prefix):]
+                rel_parts = tuple(part for part in rel.split("/") if part)
+                if any(part in {".", ".."} for part in rel_parts):
+                    return None
+                local_path = (local_root / Path(rel)).resolve(strict=False)
+                try:
+                    local_path.relative_to(local_root)
+                except ValueError:
+                    return None
+                return str(local_path)
+        return None
+
+    def _pattern_for_route(self, pattern: str, mount: str) -> str | None:
+        if pattern == mount:
+            return "."
+        prefix = mount.rstrip("/") + "/"
+        if pattern.startswith(prefix):
+            return pattern[len(prefix):]
+        for route in self._routes:
+            other_mount = str(route.mount)
+            if other_mount == mount:
+                continue
+            if pattern == other_mount or pattern.startswith(other_mount.rstrip("/") + "/"):
+                return None
+        return pattern
+
+    def _routes_under_local_root(self, root: str | None) -> list[Any]:
+        search_root = self._resolve_local_path(root or str(self._agent_dir))
+        routes: list[Any] = []
+        for route in self._routes:
+            local_root = Path(route.local_root).resolve(strict=False)
+            try:
+                local_root.relative_to(search_root)
+            except ValueError:
+                continue
+            routes.append(route)
+        return routes
+
+    def _exclude_route_mounts(
+        self,
+        root: str | None,
+        exclude_dirs: frozenset[str] | set[str] | None,
+    ) -> frozenset[str] | set[str] | None:
+        routes = self._routes_under_local_root(root)
+        if not routes:
+            return exclude_dirs
+        route_mounts = {route.mount for route in routes}
+        if exclude_dirs is None:
+            return DEFAULT_EXCLUDED_DIRS | route_mounts
+        return set(exclude_dirs) | route_mounts
+
+    def _is_under_route_local_root(self, path: str | Path) -> bool:
+        return self._route_for_local_path(path) is not None
+
+    def is_routed_to_nokv(self, path: str | Path) -> bool:
+        return self._route_for_local_path(path) is not None
+
+    def _backend_for_path(self, path: str) -> tuple[FileIOBackend, str]:
+        if is_nokv_uri(path, self._uri_prefixes):
+            self._last_backend = self._nokv_backend
+            return self._nokv_backend, path
+        remote = self._remote_for_path(path)
+        if remote is not None:
+            _, remote_path = remote
+            self._last_backend = self._nokv_backend
+            return self._nokv_backend, remote_path
+        self._last_backend = self._local_backend
+        return self._local_backend, path
+
+    def read(self, path: str) -> str:
+        backend, backend_path = self._backend_for_path(path)
+        return backend.read(backend_path)
+
+    def write(self, path: str, content: str) -> None:
+        backend, backend_path = self._backend_for_path(path)
+        backend.write(backend_path, content)
+
+    def edit(self, path: str, old_string: str, new_string: str) -> str:
+        backend, backend_path = self._backend_for_path(path)
+        return backend.edit(backend_path, old_string, new_string)
+
+    def glob(
+        self,
+        pattern: str,
+        root: str | None = None,
+        *,
+        exclude_dirs: frozenset[str] | set[str] | None = None,
+        walltime_s: float | None = DEFAULT_WALLTIME_S,
+        max_visited: int | None = DEFAULT_MAX_VISITED,
+        max_results: int | None = 2000,
+    ) -> list[str]:
+        if root and is_nokv_uri(root, self._uri_prefixes):
+            self._last_backend = self._nokv_backend
+            results = self._nokv_backend.glob(
+                pattern,
+                root=root,
+                exclude_dirs=exclude_dirs,
+                walltime_s=walltime_s,
+                max_visited=max_visited,
+                max_results=max_results,
+            )
+            self._last_traversal = self._copy_traversal_stats(self._nokv_backend.last_traversal)
+            return sorted(result for result in results if result is not None)
+
+        remote = self._remote_for_path(root or str(self._agent_dir))
+        if remote is not None:
+            route, remote_root = remote
+            self._last_backend = self._nokv_backend
+            results = self._nokv_backend.glob(
+                pattern,
+                root=remote_root,
+                exclude_dirs=exclude_dirs,
+                walltime_s=walltime_s,
+                max_visited=max_visited,
+                max_results=max_results,
+            )
+            self._last_traversal = self._copy_traversal_stats(self._nokv_backend.last_traversal)
+            mapped = [
+                local
+                for path in results
+                if (local := self._local_for_remote(path, route=route)) is not None
+            ]
+            return sorted(mapped)
+
+        self._last_backend = self._local_backend
+        local_exclude_dirs = self._exclude_route_mounts(root, exclude_dirs)
+        traversal_start = time.monotonic()
+        combined = self._local_backend.glob(
+            pattern,
+            root=root,
+            exclude_dirs=local_exclude_dirs,
+            walltime_s=walltime_s,
+            max_visited=max_visited,
+            max_results=max_results,
+        )
+        traversal_stats = [self._copy_traversal_stats(self._local_backend.last_traversal)]
+        combined = [
+            path for path in combined
+            if not self._is_under_route_local_root(path)
+        ]
+        remaining = None if max_results is None else max(max_results - len(combined), 0)
+        for route in self._routes_under_local_root(root):
+            if remaining == 0:
+                break
+            if any(stats.truncated_reason in {"visited", "walltime"} for stats in traversal_stats):
+                break
+            remaining_visited = self._remaining_visited_budget(max_visited, traversal_stats)
+            if remaining_visited == 0:
+                traversal_stats.append(TraversalStats(truncated_reason="visited"))
+                break
+            remaining_walltime = self._remaining_walltime_budget(walltime_s, traversal_start)
+            if remaining_walltime == 0:
+                traversal_stats.append(TraversalStats(truncated_reason="walltime"))
+                break
+            route_pattern = self._pattern_for_route(pattern, route.mount)
+            if route_pattern is None:
+                continue
+            remote_results = self._nokv_backend.glob(
+                route_pattern,
+                root=route.remote_root,
+                exclude_dirs=exclude_dirs,
+                walltime_s=remaining_walltime,
+                max_visited=remaining_visited,
+                max_results=remaining,
+            )
+            traversal_stats.append(self._copy_traversal_stats(self._nokv_backend.last_traversal))
+            for path in remote_results:
+                local = self._local_for_remote(path, route=route)
+                if local is None:
+                    continue
+                combined.append(local)
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+        self._last_traversal = self._aggregate_traversal_stats(traversal_stats)
+        return sorted(dict.fromkeys(combined))
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        max_results: int = 50,
+        *,
+        exclude_dirs: frozenset[str] | set[str] | None = None,
+        walltime_s: float | None = DEFAULT_WALLTIME_S,
+        max_visited: int | None = DEFAULT_MAX_VISITED,
+        max_file_bytes: int | None = DEFAULT_MAX_FILE_BYTES,
+    ) -> list[GrepMatch]:
+        if path and is_nokv_uri(path, self._uri_prefixes):
+            self._last_backend = self._nokv_backend
+            matches = self._nokv_backend.grep(
+                pattern,
+                path=path,
+                max_results=max_results,
+                exclude_dirs=exclude_dirs,
+                walltime_s=walltime_s,
+                max_visited=max_visited,
+                max_file_bytes=max_file_bytes,
+            )
+            self._last_traversal = self._copy_traversal_stats(self._nokv_backend.last_traversal)
+            return matches
+
+        remote = self._remote_for_path(path or str(self._agent_dir))
+        if remote is not None:
+            route, remote_root = remote
+            self._last_backend = self._nokv_backend
+            matches = self._nokv_backend.grep(
+                pattern,
+                path=remote_root,
+                max_results=max_results,
+                exclude_dirs=exclude_dirs,
+                walltime_s=walltime_s,
+                max_visited=max_visited,
+                max_file_bytes=max_file_bytes,
+            )
+            self._last_traversal = self._copy_traversal_stats(self._nokv_backend.last_traversal)
+            return [
+                GrepMatch(local, match.line_number, match.line)
+                for match in matches
+                if (local := self._local_for_remote(match.path, route=route)) is not None
+            ]
+
+        self._last_backend = self._local_backend
+        local_exclude_dirs = self._exclude_route_mounts(path, exclude_dirs)
+        traversal_start = time.monotonic()
+        combined = self._local_backend.grep(
+            pattern,
+            path=path,
+            max_results=max_results,
+            exclude_dirs=local_exclude_dirs,
+            walltime_s=walltime_s,
+            max_visited=max_visited,
+            max_file_bytes=max_file_bytes,
+        )
+        traversal_stats = [self._copy_traversal_stats(self._local_backend.last_traversal)]
+        combined = [
+            match for match in combined
+            if not self._is_under_route_local_root(match.path)
+        ]
+        remaining = max(max_results - len(combined), 0)
+        for route in self._routes_under_local_root(path):
+            if remaining == 0:
+                break
+            if any(stats.truncated_reason in {"visited", "walltime"} for stats in traversal_stats):
+                break
+            remaining_visited = self._remaining_visited_budget(max_visited, traversal_stats)
+            if remaining_visited == 0:
+                traversal_stats.append(TraversalStats(truncated_reason="visited"))
+                break
+            remaining_walltime = self._remaining_walltime_budget(walltime_s, traversal_start)
+            if remaining_walltime == 0:
+                traversal_stats.append(TraversalStats(truncated_reason="walltime"))
+                break
+            remote_matches = self._nokv_backend.grep(
+                pattern,
+                path=route.remote_root,
+                max_results=remaining,
+                exclude_dirs=exclude_dirs,
+                walltime_s=remaining_walltime,
+                max_visited=remaining_visited,
+                max_file_bytes=max_file_bytes,
+            )
+            traversal_stats.append(self._copy_traversal_stats(self._nokv_backend.last_traversal))
+            for match in remote_matches:
+                local = self._local_for_remote(match.path, route=route)
+                if local is None:
+                    continue
+                combined.append(GrepMatch(local, match.line_number, match.line))
+                remaining -= 1
+                if remaining == 0:
+                    break
+        self._last_traversal = self._aggregate_traversal_stats(traversal_stats)
+        return sorted(combined, key=lambda match: (match.path, match.line_number, match.line))
+
+
 class LocalFileIOService(FileIOService):
     """Tool-facing file I/O service facade using a pluggable backend.
 
@@ -735,6 +1149,12 @@ class LocalFileIOService(FileIOService):
             walltime_s=walltime_s,
             max_visited=max_visited,
         )
+
+    def is_routed_to_nokv(self, path: str | Path) -> bool:
+        checker = getattr(self._backend, "is_routed_to_nokv", None)
+        if checker is None:
+            return False
+        return bool(checker(path))
 
     def read(self, path: str) -> str:
         return self._backend.read(path)

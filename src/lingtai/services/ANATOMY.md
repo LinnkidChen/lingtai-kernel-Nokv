@@ -9,11 +9,13 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 | File | LOC | Role |
 |---|---|---|
 | `__init__.py` | 1 | Docstring-only package marker |
-| `file_io.py` | 785 | `FileIOService` facade contract + `LocalFileIOBackend`, `NoKVFileIOBackend`, and `HybridFileIOBackend` — backs read/edit/write/glob/grep |
+| `file_io.py` | 987 | `FileIOService` facade contract + `LocalFileIOBackend`, `NoKVFileIOBackend`, `HybridFileIOBackend`, and `RoutedFileIOBackend` — backs read/edit/write/glob/grep |
+| `file_io_factory.py` | 35 | Builds selected-subtree routed `LocalFileIOService` instances from resolved storage config |
 | `file_io_sidecar.py` | 680 | Rust-backed grep/glob: `RustFileIOBackend`, `SidecarAdapter`, `SidecarError`, plus the `resolve_sidecar_binary` resolver and the `default_file_io_service` factory used by `Agent.__init__` |
 | `mail.py` | 4 | Re-exports `MailService`, `FilesystemMailService` from `lingtai_kernel.services.mail` |
 | `mcp.py` | 530 | `MCPClient` (stdio) + `HTTPMCPClient` (streamable HTTP) — async-to-sync MCP bridges |
 | `nokv.py` | 123 | NoKV config/URI helpers, `NoKVUnsupportedError`, and selected-subtree classification |
+| `storage_config.py` | 217 | Parses top-level `storage` config into secret-free selected-mount routes |
 
 **Sub-packages (not covered here):** `vision/` (7 provider files), `websearch/` (6 provider files).
 **Sibling crates:** `crates/lingtai-search-sidecar/` (Rust) — opt-in binary that backs `RustFileIOBackend`. Not required for install/tests.
@@ -25,12 +27,14 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 - **→ `mcp.client.stdio`**, **`mcp.client.streamable_http`**, **`mcp.client.session`** (mcp.py:224, 406-407) — third-party MCP SDK. Imported lazily inside async connect methods.
 - **← `lingtai.capabilities.vision`** — uses `services.vision.VisionService`.
 - **← `lingtai.capabilities.web_search`** — uses `services.websearch.SearchService`.
-- **← `lingtai.core.*`** — read/write/edit/glob/grep use `FileIOService`; `lingtai.core.nokv` uses `NoKVFileIOBackend`.
-- **`file_io.py` → `nokv.py`** — `NoKVFileIOBackend` / `HybridFileIOBackend` import URI normalization and disabled-backend errors.
+- **← `lingtai.agent.Agent`** — parses `init.json` storage config, writes `system/storage.resolved.json`, and wraps default file I/O with `build_routed_file_io_service` when enabled.
+- **← `lingtai.core.*`** — read/write/edit/glob/grep use `FileIOService`; `lingtai.core.knowledge` asks the service whether `knowledge/` is routed before choosing FileIO scan vs local migration/scan.
+- **`file_io.py` → `nokv.py`** — NoKV-aware backends import URI normalization and disabled-backend errors.
+- **`file_io_factory.py` → `storage_config.py`** — factory consumes `ResolvedStorageConfig` / `StorageRoute`.
 
 ## Composition
 
-`file_io.py` is a pure stdlib abstraction layer. `LocalFileIOService` is the tool-facing facade while `LocalFileIOBackend` owns the default Python local filesystem implementation. `NoKVFileIOBackend` owns explicit `nokv://` object operations (`file_io.py:402-594`), and `HybridFileIOBackend` routes ordinary paths to local storage while requiring configured NoKV for `nokv://` (`file_io.py:597-685`). `nokv.py` keeps URI/config/subtree policy outside the low-level backend (`nokv.py:13-123`). `file_io_sidecar.py` provides `RustFileIOBackend`, an opt-in alternative backend that delegates `read`/`write`/`edit` to a private `LocalFileIOBackend` but routes `grep`/`glob` to the Rust binary under `crates/lingtai-search-sidecar/` via short-lived JSON subprocess calls. `mail.py` is a passthrough re-export. `mcp.py` is the heavy module — two parallel client classes sharing the same pattern.
+`file_io.py` is a pure stdlib abstraction layer. `LocalFileIOService` is the tool-facing facade while `LocalFileIOBackend` owns the default Python local filesystem implementation. `NoKVFileIOBackend` owns explicit `nokv://` object operations (`file_io.py:402-594`), `HybridFileIOBackend` routes ordinary paths to local storage while requiring configured NoKV for `nokv://` (`file_io.py:597-685`), and `RoutedFileIOBackend` routes only configured agent-local mounts to NoKV (`file_io.py:688-858`). `storage_config.py` parses the enabled `storage.backend="nokv"` block into allowed mounts (`artifacts`, `reports`, `checkpoints`, `knowledge`) rooted under the agent directory and a secret-free status shape. `file_io_factory.py` wraps an existing local service with `RoutedFileIOBackend`. `nokv.py` keeps URI/config/subtree policy outside the low-level backend (`nokv.py:13-123`). `file_io_sidecar.py` provides `RustFileIOBackend`, an opt-in alternative backend that delegates `read`/`write`/`edit` to a private `LocalFileIOBackend` but routes `grep`/`glob` to the Rust binary under `crates/lingtai-search-sidecar/` via short-lived JSON subprocess calls. `mail.py` is a passthrough re-export. `mcp.py` is the heavy module — two parallel client classes sharing the same pattern.
 
 ## State
 
@@ -40,6 +44,8 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 - **`NoKVConfig`**: immutable optional NoKV config shape; default `enabled=False` keeps runtime local (`nokv.py:43-56`).
 - **`NoKVFileIOBackend`**: injected NoKV client plus URI prefixes and traversal stats; imports no NoKV SDK at module load (`file_io.py:402-418`).
 - **`HybridFileIOBackend`**: local backend, optional NoKV backend, and `_last_backend` for `last_traversal` routing (`file_io.py:597-610`).
+- **`ResolvedStorageConfig` / `StorageRoute`**: immutable selected-mount config; disabled storage is local-only, enabled storage produces explicit agent-local-to-NoKV routes.
+- **`RoutedFileIOBackend`**: local backend, NoKV backend, selected routes, and `_last_backend`; `is_routed_to_nokv(path)` exposes route checks for callers such as knowledge.
 - **`RustFileIOBackend`**: holds an embedded `LocalFileIOBackend` (for read/write/edit), a `SidecarAdapter` (subprocess client), and a `last_traversal` rebuilt from each sidecar envelope.
 - **`SidecarAdapter`**: stateless apart from the resolved binary path; one subprocess per `call()`.
 - **`FileIOService` / `FileIOBackend` ABCs**: pure interfaces, no state.
@@ -52,4 +58,4 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 - `mcp.py` has significant code duplication between the two classes — same `call_tool()`, `list_tools()`, `_run_loop()`, `_async_cleanup()` pattern.
 - `mail.py` is a thin shim — the real implementation lives in `lingtai_kernel.services.mail`.
 - `file_io_sidecar.py` is the **default native backend** for `Agent`-created file-I/O services. `default_file_io_service` is the factory that `Agent.__init__` calls; it consults `LINGTAI_FILE_IO_BACKEND` (`auto` / `rust` / `python`, default `auto`) and `resolve_sidecar_binary` to pick between Rust and the pure-Python `LocalFileIOBackend`. Resolver priority: explicit `binary_path=` > `LINGTAI_FILE_IO_SIDECAR` env > `LINGTAI_SEARCH_SIDECAR` (legacy) env > packaged `lingtai/bin/` binary (shipped in platform-specific wheels by `setup.py`) > dev-tree `crates/lingtai-search-sidecar/target/{release,debug}/`. The strict `SidecarAdapter()` constructor still ignores packaged / dev-tree sources — opt-in callers see `not_configured` rather than picking up a stale binary. Defaults (`DEFAULT_*` constants) are imported from `file_io.py` so both backends stay in lock-step. Cargo is **not** required for install or the normal test suite — tests use a Python-script "sidecar"; only `test_rust_sidecar_integration_grep_and_glob` is cargo-gated.
-- NoKV remains explicit: ordinary local paths never route to NoKV, and `nokv://` raises `NoKVUnsupportedError` unless a NoKV backend/client is injected.
+- NoKV remains explicit: runtime state, mailbox, logs, locks, signals, and ordinary local paths stay local. Only configured selected mounts (`artifacts`, `reports`, `checkpoints`, `knowledge`) route to NoKV through `RoutedFileIOBackend`; `nokv://` continues to require an injected NoKV backend/client.

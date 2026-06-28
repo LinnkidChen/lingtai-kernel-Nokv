@@ -87,6 +87,109 @@ def test_edit_via_capability(tmp_path):
     agent.stop(timeout=1.0)
 
 
+class RecordingEditFileIO:
+    def __init__(self, *, routed: bool):
+        self.routed = routed
+        self.calls: list[tuple] = []
+        self.last_traversal = None
+
+    def read(self, path: str) -> str:
+        self.calls.append(("read", path))
+        return "dup dup"
+
+    def write(self, path: str, content: str) -> None:
+        self.calls.append(("write", path, content))
+
+    def edit(self, path: str, old_string: str, new_string: str) -> str:
+        self.calls.append(("edit", path, old_string, new_string))
+        if old_string == "dup":
+            raise ValueError("old_string appears 2 times")
+        return "updated"
+
+    def glob(self, pattern: str, root: str | None = None, **kwargs):
+        return []
+
+    def grep(self, pattern: str, path: str | None = None, max_results: int = 50, **kwargs):
+        return []
+
+    def is_routed_to_nokv(self, path: str) -> bool:
+        return self.routed
+
+
+def test_edit_capability_delegates_non_replace_all_to_file_io_edit(tmp_path):
+    file_io = RecordingEditFileIO(routed=True)
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=tmp_path / "test",
+        file_io=file_io,
+        capabilities=["edit"],
+    )
+    try:
+        result = agent._tool_handlers["edit"](
+            {"file_path": "knowledge/a.md", "old_string": "dup", "new_string": "x"}
+        )
+
+        assert result["status"] == "error"
+        assert "appears 2 times" in result["message"]
+        assert file_io.calls == [
+            ("edit", str(agent.working_dir / "knowledge" / "a.md"), "dup", "x")
+        ]
+    finally:
+        agent.stop(timeout=1.0)
+
+
+def test_edit_capability_rejects_replace_all_for_routed_nokv_paths(tmp_path):
+    file_io = RecordingEditFileIO(routed=True)
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=tmp_path / "test",
+        file_io=file_io,
+        capabilities=["edit"],
+    )
+    try:
+        result = agent._tool_handlers["edit"](
+            {
+                "file_path": "knowledge/a.md",
+                "old_string": "dup",
+                "new_string": "x",
+                "replace_all": True,
+            }
+        )
+
+        assert result["status"] == "error"
+        assert "replace_all" in result["message"]
+        assert file_io.calls == []
+    finally:
+        agent.stop(timeout=1.0)
+
+
+def test_edit_capability_keeps_local_replace_all_compatibility(tmp_path):
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=tmp_path / "test",
+        capabilities=["edit"],
+    )
+    try:
+        target = agent.working_dir / "local.txt"
+        target.write_text("dup dup", encoding="utf-8")
+        result = agent._tool_handlers["edit"](
+            {
+                "file_path": str(target),
+                "old_string": "dup",
+                "new_string": "x",
+                "replace_all": True,
+            }
+        )
+
+        assert result == {"status": "ok", "replacements": 2}
+        assert target.read_text(encoding="utf-8") == "x x"
+    finally:
+        agent.stop(timeout=1.0)
+
+
 def test_glob_via_capability(tmp_path):
     """Glob files through capability handler."""
     agent = Agent(

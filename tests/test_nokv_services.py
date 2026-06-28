@@ -59,6 +59,22 @@ class FakeNoKVClient:
         return {"path": path, "generation": self.objects[path].generation}
 
 
+class BudgetNoKVClient(FakeNoKVClient):
+    def __init__(self):
+        super().__init__()
+        self.read_paths: list[str] = []
+        self.raise_on_read: set[str] = set()
+        self.runtime_error_on_read: set[str] = set()
+
+    def read(self, path: str) -> dict:
+        self.read_paths.append(path)
+        if path in self.runtime_error_on_read:
+            raise RuntimeError("backend unavailable")
+        if path in self.raise_on_read:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+        return super().read(path)
+
+
 def test_selected_subtree_policy_allows_outputs_and_keeps_runtime_state_local():
     assert (
         classify_lingtai_subtree(".lingtai/alice/artifacts/report.md")
@@ -118,6 +134,93 @@ def test_nokv_file_io_edit_preserves_unique_replace_contract():
     backend.write("nokv://project/reports/r.md", "dup dup")
     with pytest.raises(ValueError, match="appears 2 times"):
         backend.edit("nokv://project/reports/r.md", "dup", "x")
+
+
+def test_nokv_grep_honors_max_visited_budget():
+    fake = BudgetNoKVClient()
+    for i in range(5):
+        fake.objects[f"/project/knowledge/{i}.md"] = FakeObject("needle\n", f"gen-{i}", {})
+    backend = NoKVFileIOBackend(fake)
+
+    results = backend.grep("needle", path="nokv://project/knowledge", max_visited=2)
+
+    assert len(results) == 2
+    assert backend.last_traversal.truncated_reason == "visited"
+    assert backend.last_traversal.visited == 2
+    assert fake.read_paths == ["/project/knowledge/0.md", "/project/knowledge/1.md"]
+
+
+def test_nokv_grep_skips_entries_over_max_file_bytes_when_metadata_has_size():
+    fake = BudgetNoKVClient()
+    fake.objects["/project/knowledge/big.md"] = FakeObject(
+        "needle big\n",
+        "gen-big",
+        {"size": 100},
+    )
+    fake.objects["/project/knowledge/small.md"] = FakeObject(
+        "needle small\n",
+        "gen-small",
+        {"size": 5},
+    )
+    backend = NoKVFileIOBackend(fake)
+
+    results = backend.grep(
+        "needle",
+        path="nokv://project/knowledge",
+        max_file_bytes=10,
+    )
+
+    assert results == [GrepMatch("nokv://project/knowledge/small.md", 1, "needle small")]
+    assert backend.last_traversal.files_skipped_size == 1
+    assert fake.read_paths == ["/project/knowledge/small.md"]
+
+
+def test_nokv_grep_counts_and_skips_read_or_decode_failures():
+    fake = BudgetNoKVClient()
+    fake.objects["/project/knowledge/bad.md"] = FakeObject("needle bad\n", "gen-bad", {})
+    fake.objects["/project/knowledge/good.md"] = FakeObject("needle good\n", "gen-good", {})
+    fake.raise_on_read.add("/project/knowledge/bad.md")
+    backend = NoKVFileIOBackend(fake)
+
+    results = backend.grep("needle", path="nokv://project/knowledge")
+
+    assert results == [GrepMatch("nokv://project/knowledge/good.md", 1, "needle good")]
+    assert backend.last_traversal.files_skipped_binary == 1
+
+
+def test_nokv_grep_propagates_backend_read_failures():
+    fake = BudgetNoKVClient()
+    fake.objects["/project/knowledge/bad.md"] = FakeObject("needle bad\n", "gen-bad", {})
+    fake.runtime_error_on_read.add("/project/knowledge/bad.md")
+    backend = NoKVFileIOBackend(fake)
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        backend.grep("needle", path="nokv://project/knowledge")
+
+    assert backend.last_traversal.files_skipped_binary == 0
+
+
+def test_nokv_grep_propagates_missing_client_configuration():
+    backend = NoKVFileIOBackend()
+
+    with pytest.raises(NoKVUnsupportedError, match="NoKV is not configured"):
+        backend.grep("needle", path="nokv://project/knowledge")
+
+
+def test_nokv_glob_honors_max_visited_budget_and_keeps_sorted_results():
+    fake = BudgetNoKVClient()
+    for name in ("c.md", "a.md", "b.md"):
+        fake.objects[f"/project/knowledge/{name}"] = FakeObject("", f"gen-{name}", {})
+    backend = NoKVFileIOBackend(fake)
+
+    results = backend.glob("*.md", root="nokv://project/knowledge", max_visited=2)
+
+    assert results == [
+        "nokv://project/knowledge/a.md",
+        "nokv://project/knowledge/b.md",
+    ]
+    assert backend.last_traversal.truncated_reason == "visited"
+    assert backend.last_traversal.visited == 2
 
 
 def test_hybrid_file_io_rejects_nokv_uri_when_backend_disabled(tmp_path):

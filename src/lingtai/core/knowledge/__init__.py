@@ -90,6 +90,23 @@ def _parse_entry_file(entry_file: Path, label: str) -> tuple[dict | None, dict |
     }, None
 
 
+def _parse_entry_text(text: str, path: str, label: str) -> tuple[dict | None, dict | None]:
+    fm = _parse_frontmatter(text)
+    name = fm.get("name", "")
+    description = fm.get("description", "")
+    if not name:
+        return None, {"folder": label, "reason": "KNOWLEDGE.md missing required frontmatter field: name"}
+    if not description:
+        return None, {"folder": label, "reason": "KNOWLEDGE.md missing required frontmatter field: description"}
+
+    return {
+        "name": name,
+        "description": description,
+        "version": fm.get("version", ""),
+        "path": path,
+    }, None
+
+
 def _scan_recursive(
     directory: Path,
     valid: list[dict],
@@ -144,6 +161,32 @@ def _scan(directory: Path) -> tuple[list[dict], list[dict]]:
     valid: list[dict] = []
     problems: list[dict] = []
     _scan_recursive(directory, valid, problems)
+    return valid, problems
+
+
+def _scan_via_file_io(agent: "BaseAgent", knowledge_dir: Path) -> tuple[list[dict], list[dict]]:
+    valid: list[dict] = []
+    problems: list[dict] = []
+    try:
+        paths = agent._file_io.glob("**/KNOWLEDGE.md", root=str(knowledge_dir))
+    except Exception as e:
+        return [], [{"folder": str(knowledge_dir), "reason": f"cannot scan NoKV knowledge: {e}"}]
+
+    for path in sorted(paths):
+        try:
+            text = agent._file_io.read(path)
+        except Exception as e:
+            problems.append({"folder": path, "reason": f"cannot read KNOWLEDGE.md: {e}"})
+            continue
+        try:
+            label = str(Path(path).parent.relative_to(knowledge_dir))
+        except ValueError:
+            label = path
+        entry, prob = _parse_entry_text(text, path, label)
+        if entry:
+            valid.append(entry)
+        if prob:
+            problems.append(prob)
     return valid, problems
 
 
@@ -379,9 +422,13 @@ def _reconcile(agent: "BaseAgent") -> dict:
     working_dir = agent._working_dir
     knowledge_dir = working_dir / "knowledge"
 
-    migration_problems = _migrate_legacy_json(working_dir, knowledge_dir)
-    entries, problems = _scan(knowledge_dir)
-    problems = migration_problems + problems
+    routed_checker = getattr(agent._file_io, "is_routed_to_nokv", None)
+    if callable(routed_checker) and routed_checker(knowledge_dir):
+        entries, problems = _scan_via_file_io(agent, knowledge_dir)
+    else:
+        migration_problems = _migrate_legacy_json(working_dir, knowledge_dir)
+        entries, problems = _scan(knowledge_dir)
+        problems = migration_problems + problems
 
     lang = agent._config.language
     catalog_yaml = _build_catalog_yaml(entries, lang)

@@ -35,6 +35,8 @@ class Agent(BaseAgent):
         *args, **kwargs: Passed through to BaseAgent.
     """
 
+    _nokv_storage_client_factory = staticmethod(lambda storage: None)
+
     def __init__(
         self,
         *args: Any,
@@ -63,6 +65,11 @@ class Agent(BaseAgent):
         if self._file_io is None:
             from .services.file_io_sidecar import default_file_io_service
             self._file_io = default_file_io_service(root=self._working_dir)
+        self._base_file_io = self._file_io
+
+        storage_data = self._read_storage_init_for_boot()
+        if storage_data is not None:
+            self._configure_storage(storage_data)
 
         # Expand groups and normalize to dict
         if isinstance(capabilities, list):
@@ -157,6 +164,84 @@ class Agent(BaseAgent):
             )
         except (TypeError, AttributeError, OSError):
             pass  # LLM config not available (e.g., mock service in tests)
+
+    def _project_root_for_storage(self) -> Path:
+        parent = self._working_dir.parent
+        if parent.name == ".lingtai":
+            return parent.parent
+        return parent
+
+    def _project_hash_for_storage(self, project_root: Path) -> str:
+        import hashlib
+
+        digest = hashlib.sha256(str(project_root.resolve(strict=False)).encode("utf-8")).hexdigest()
+        return digest[:12]
+
+    def _read_storage_init_for_boot(self) -> dict | None:
+        """Best-effort raw init read for storage routing during direct construction."""
+        init_path = self._working_dir / "init.json"
+        if not init_path.is_file():
+            return None
+        try:
+            data = json.loads(init_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            return None
+        if "env_file" in data:
+            try:
+                from lingtai_kernel.config_resolve import load_env_file
+                load_env_file(data["env_file"], overwrite=False)
+            except Exception:
+                pass
+        if "storage" not in data:
+            return None
+        return data
+
+    def _configure_storage(self, data: dict) -> None:
+        import os
+
+        from .services.file_io_factory import build_routed_file_io_service
+        from .services.file_io import NoKVFileIOBackend
+        from .services.nokv import NoKVUnsupportedError
+        from .services.storage_config import parse_storage_config
+
+        project_root = self._project_root_for_storage()
+        agent_name = self.agent_name or self._working_dir.name
+        storage = parse_storage_config(
+            data,
+            agent_dir=self._working_dir,
+            project_root=project_root,
+            project_hash=self._project_hash_for_storage(project_root),
+            agent_name=agent_name,
+            environ=os.environ,
+        )
+        base_file_io = getattr(self, "_base_file_io", self._file_io)
+        if not storage.enabled:
+            self._file_io = base_file_io
+            try:
+                (self._working_dir / "system" / "storage.resolved.json").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                self._log("storage_resolved_cleanup_failed")
+            return
+
+        nokv_client = self._nokv_storage_client_factory(storage)
+        if nokv_client is None:
+            raise NoKVUnsupportedError(
+                "NoKV backend/client is required before enabling selected-subtree storage"
+            )
+        self._file_io = build_routed_file_io_service(
+            agent_dir=self._working_dir,
+            local_service=base_file_io,
+            storage=storage,
+            nokv_backend=NoKVFileIOBackend(nokv_client),
+        )
+        system_dir = self._working_dir / "system"
+        system_dir.mkdir(parents=True, exist_ok=True)
+        (system_dir / "storage.resolved.json").write_text(
+            json.dumps(storage.to_status(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     def _setup_capability(self, name: str, **kwargs: Any) -> Any:
         """Load a named capability.
@@ -1075,6 +1160,8 @@ class Agent(BaseAgent):
             load_env_file(env_file, overwrite=overwrite_env_file)
         if overwrite_env_file:
             os.environ.pop("LINGTAI_REFRESH_ENV_OVERWRITE", None)
+
+        self._configure_storage(data)
 
         # Resolve *_file fields for top-level text content.
         # Note: "soul" / "soul_file" were retired in v0.7.6 and are now
