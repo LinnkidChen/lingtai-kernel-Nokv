@@ -52,12 +52,11 @@ print((root / "nokv-workbench" / "SKILL.md").exists())
 PY
 ```
 
-Tool-surface note: the 16-tool surface documented in SKILL.md (including
-workbench_append / workbench_edit / workbench_search / workbench_aggregate /
-workbench_catalog and conditional reads) requires a NoKV build that ships the
-specialized workbench MCP. Older 9-tool NoKV servers still work with this
-skill; the extra tools are simply absent from tools/list and the SKILL
-sections about them do not apply.
+Tool-surface note: the supported managed deployment requires the reviewed exact
+18-tool Workbench contract, including `workbench_snapshot_retire` and
+capability-gated `workbench_restore`. Older 9- or 16-tool servers are not a
+degraded supported mode: contract validation fails closed. Upgrade NoKV before
+activating or refreshing the registration.
 
 The checkpoint-lifecycle surface — workbench_snapshot_renew and
 workbench_snapshot_list, the workbench_snapshot `name`/`ttl_days` parameters

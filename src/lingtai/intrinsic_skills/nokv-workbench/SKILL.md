@@ -8,8 +8,9 @@ description: >
   file writes. Covers MCP registration, directory layout, append and edit
   discipline, conditional reads, cross-workbench queries, commit discipline,
   and leased checkpoint snapshots with naming, renewal, discovery, and
-  point-in-time history reads.
-version: 0.3.0
+  point-in-time history reads, explicit checkpoint retirement, and durable
+  restore-to-fork.
+version: 0.4.0
 tags: [nokv, mcp, workbench, artifacts, provenance, snapshots, checkpoints, leases]
 related_files:
 - src/lingtai/intrinsic_skills/nokv-workbench/assets/PREFLIGHT.md
@@ -222,6 +223,16 @@ every checkpoint of the workbench with its `name`, `snapshot_id`,
 `lease_expires_at`, and lifecycle `status` (`alive`, `expired`, or `reaped`).
 Use it to see what is still restorable before you try to read history.
 
+### Retire a checkpoint explicitly
+
+Use `workbench_snapshot_retire` when a checkpoint should release its retention
+pin before lease expiry. Pass the workbench `id` and exactly one of `name` or
+`snapshot_id`; an optional short `reason` records the lifecycle decision. The
+first acknowledged removal returns `retired=true`. An exact retry is
+idempotent and returns `retired=false`; that result never fabricates proof that
+this caller deleted an already-absent pin. Active fork retention, foreign-root
+snapshots, and other ownership mismatches remain typed errors.
+
 ### Read history with at_snapshot
 
 `workbench_stat`, `workbench_list`, and `workbench_read` accept an optional
@@ -245,6 +256,22 @@ artifacts remain reachable with `workbench_read`, `workbench_list`, and
 `workbench_stat` (no `at_snapshot`). Only the frozen historical view needs a
 live lease. If a checkpoint has reaped, re-mint a fresh one from the current
 committed state — the artifacts themselves are intact.
+
+### Restore a live checkpoint into a new workbench
+
+When `workbench_restore` is advertised, call it with source workbench `id`, a
+live checkpoint `at_snapshot` (name or numeric id), and a new
+`destination_id`:
+
+```json
+{"id":"spedas-task-001","at_snapshot":"final-v1","destination_id":"spedas-task-001-restored"}
+```
+
+Restore creates a durable copy-on-write fork. It does not mutate the source,
+the destination must not already exist, and an exact retry is idempotent. If
+the tool is absent, the selected NoKV metadata owners do not all advertise the
+required restore capability; do not substitute a raw copy or bypass the
+capability gate.
 
 ## Concurrency
 

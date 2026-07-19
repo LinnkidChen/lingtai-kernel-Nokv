@@ -12,7 +12,45 @@ import argparse
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
+
+
+_EXPECTED_TESTCASES = {
+    (
+        "tests.test_nokv_lingtai_mcp_smoke",
+        "test_build_cleanup_retires_cargo_descendants",
+    ),
+    (
+        "tests.test_nokv_lingtai_mcp_smoke",
+        "test_registered_lingtai_reader_profile_runs_frozen_contract",
+    ),
+}
+_REAL_SMOKE_NAME = "test_registered_lingtai_reader_profile_runs_frozen_contract"
+_REQUIRED_REAL_SMOKE_PROPERTIES = {
+    "lingtai_kernel_head",
+    "lingtai_kernel_dirty",
+    "lingtai_kernel_fingerprint",
+    "nokv_cargo_version",
+    "nokv_rustc_version",
+    "nokv_source_head",
+    "nokv_source_dirty",
+    "nokv_source_fingerprint",
+    "nokv_source_manifest_sha256",
+    "nokv_binary",
+    "nokv_binary_sha256",
+    "nokv_lingtai_contract_asset_sha256",
+    "nokv_mcp_profile",
+    "nokv_workspace_role",
+    "nokv_workspace_id_sha256",
+    "nokv_workspace_actor_id_sha256",
+    "nokv_workspace_grant_sha256",
+    "nokv_mcp_activation_args_sha256",
+    "nokv_mcp_tool_count",
+    "nokv_mcp_raw_contract_sha256",
+    "nokv_mcp_semantic_contract_sha256",
+    "nokv_mcp_contract_sha256",
+}
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -33,6 +71,75 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _validate_junit_evidence(path: Path) -> None:
+    """Require one complete, unfiltered execution of both smoke testcases."""
+
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise ValueError(f"cannot read pytest JUnit evidence: {error}") from error
+
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    if not suites:
+        raise ValueError("pytest JUnit evidence contains no testsuite")
+
+    totals = {field: 0 for field in ("tests", "failures", "errors", "skipped")}
+    cases: list[ET.Element] = []
+    for suite in suites:
+        for field in totals:
+            try:
+                totals[field] += int(suite.attrib[field])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"pytest JUnit testsuite has invalid {field!r} total"
+                ) from error
+        cases.extend(suite.findall("testcase"))
+
+    if totals != {"tests": 2, "failures": 0, "errors": 0, "skipped": 0}:
+        raise ValueError(f"pytest JUnit totals do not prove both smoke gates: {totals}")
+    observed = {
+        (case.attrib.get("classname"), case.attrib.get("name")) for case in cases
+    }
+    if len(cases) != 2 or observed != _EXPECTED_TESTCASES:
+        raise ValueError(
+            "pytest JUnit testcases do not exactly match the required smoke gates"
+        )
+    if any(
+        case.find(outcome) is not None
+        for case in cases
+        for outcome in ("failure", "error", "skipped")
+    ):
+        raise ValueError("pytest JUnit contains a non-passing smoke testcase")
+
+    real_case = next(
+        case for case in cases if case.attrib.get("name") == _REAL_SMOKE_NAME
+    )
+    properties = {
+        node.attrib.get("name"): node.attrib.get("value")
+        for node in real_case.findall("./properties/property")
+    }
+    missing = sorted(_REQUIRED_REAL_SMOKE_PROPERTIES - properties.keys())
+    if missing:
+        raise ValueError(
+            "pytest JUnit real smoke is missing required evidence properties: "
+            + ", ".join(missing)
+        )
+    empty = sorted(
+        name for name in _REQUIRED_REAL_SMOKE_PROPERTIES if not properties[name]
+    )
+    if empty:
+        raise ValueError(
+            "pytest JUnit real smoke has empty evidence properties: "
+            + ", ".join(empty)
+        )
+    if properties["nokv_mcp_tool_count"] != "20":
+        raise ValueError("pytest JUnit real smoke did not prove the 20-tool contract")
+    if properties["nokv_mcp_profile"] != "lingtai":
+        raise ValueError("pytest JUnit real smoke did not prove the LingTai profile")
+    if properties["nokv_workspace_role"] != "reader":
+        raise ValueError("pytest JUnit real smoke did not prove the reader role")
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if not args.nokv_source:
@@ -46,9 +153,13 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"--nokv-source is not a usable NoKV checkout: {source}")
     junit_xml = Path(args.junit_xml).expanduser().resolve()
     junit_xml.parent.mkdir(parents=True, exist_ok=True)
+    junit_xml.unlink(missing_ok=True)
 
     kernel_root = Path(__file__).resolve().parents[1]
     environment = dict(os.environ)
+    # The runner owns test selection. Inherited addopts can otherwise turn a
+    # filtered subset into a false-green evidence artifact.
+    environment.pop("PYTEST_ADDOPTS", None)
     environment["NOKV_LINGTAI_MCP_SMOKE"] = "1"
     environment["NOKV_LINGTAI_MCP_SOURCE"] = str(source)
     completed = subprocess.run(
@@ -58,6 +169,8 @@ def main(argv: list[str]) -> int:
             "pytest",
             "-q",
             "-o",
+            "addopts=",
+            "-o",
             "junit_family=legacy",
             f"--junitxml={junit_xml}",
             "tests/test_nokv_lingtai_mcp_smoke.py",
@@ -66,9 +179,15 @@ def main(argv: list[str]) -> int:
         env=environment,
         check=False,
     )
-    if completed.returncode == 0:
-        print(f"evidence_junit_xml: {junit_xml}")
-    return completed.returncode
+    if completed.returncode != 0:
+        return completed.returncode
+    try:
+        _validate_junit_evidence(junit_xml)
+    except ValueError as error:
+        print(f"invalid smoke evidence: {error}", file=sys.stderr)
+        return 2
+    print(f"evidence_junit_xml: {junit_xml}")
+    return 0
 
 
 if __name__ == "__main__":

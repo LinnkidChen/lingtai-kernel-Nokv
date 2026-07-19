@@ -203,6 +203,15 @@ def test_nokv_workbench_registry_example_is_valid():
     assert spec["args"] == record["args"]
     assert spec["template_arg_indices"] == record["template_arg_indices"]
 
+    skill_body = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    preflight_body = (skill_root / "assets" / "PREFLIGHT.md").read_text(
+        encoding="utf-8"
+    )
+    assert "workbench_snapshot_retire" in skill_body
+    assert "workbench_restore" in skill_body
+    assert "exact\n18-tool Workbench contract" in preflight_body
+    assert "Older 9- or 16-tool servers are not" in preflight_body
+
 
 def test_expand_agent_placeholders_scopes_workbench_root(tmp_path):
     # Per-agent root injection: a shared registry template resolves to a root
