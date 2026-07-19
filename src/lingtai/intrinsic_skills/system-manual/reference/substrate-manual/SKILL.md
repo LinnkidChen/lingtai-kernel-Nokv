@@ -13,13 +13,16 @@ description: >
   and resident substrate maintenance. This is
   a nested skill-reference under `system-manual`, not a standalone catalog skill;
   its folder may carry scripts/assets as the substrate reference grows.
-version: 1.2.0
+version: 1.2.1
 tags: [lingtai, system-manual, substrate, runtime, lifecycle, communication, memory, notifications, mcp, preset]
-last_changed_at: "2026-07-14T00:00:00-07:00"
+last_changed_at: "2026-07-19T00:00:00+10:00"
 related_files:
 - src/lingtai/intrinsic_skills/system-manual/SKILL.md
 - src/lingtai/prompts/substrate/substrate.md
 - src/lingtai/prompts/substrate/substrate.yaml
+- src/lingtai/ANATOMY.md
+- src/lingtai/tools/system/CONTRACT.md
+- src/lingtai/tools/system/ANATOMY.md
 maintenance: |
   Tracks the substrate-manual topic it documents; update when that integration changes.
 ---
@@ -440,7 +443,7 @@ Top-level prompt/env/venv/addons/MCP/manifest field groups follow the same raw
 |---|---|---|---|
 | Prompt pairs (`covenant`, `pad`, `lingtai`, `base_prompt`, `comment`) | Prompt reload (`agent.py` `_reload_prompt_sections`); kernel-owned `principle`/`substrate`/`procedures` ignore init overrides | `system/<section>.md` mirrors, prompt-manager sections | Reloaded on boot/refresh/molt |
 | `env_file`, `venv_path` | `init_reader.py`, CLI boot / `venv_resolve.py` | Resolved process environment, venv marker state (in memory; raw input is unchanged) | Boot resolves; refresh/restart reuse |
-| `addons`, `mcp` | MCP registry/addon decompression, capability setup | MCP clients, `_mcp_init_specs`, registry records | Boot loads; refresh retries failed then reloads |
+| `addons`, `mcp` | MCP registry/addon decompression, capability setup | MCP clients, `_mcp_init_specs`, registry records | Boot loads; refresh requires retry and full retirement to converge before relaunch |
 | `manifest` (LLM, capabilities, agent identity, limits) | Schema + composition roots + capability registry | LLM service, `AgentConfig`, `.agent.json` sanitized projection | Boot/refresh reconstruct; some fields need full refresh, not summarize |
 
 For the exact fields, validation, and per-field lifecycle detail, read
@@ -486,10 +489,16 @@ requires both `active` and `default` to be members of `allowed`.
    `preset` and `revert_preset` is a conflict.
 3. The refresh path checks the requested path's `allowed` membership, checks
    the target preset's context limit fits the current conversation, activates
-   atomically (writes raw `init.json`), persists the new selected default for
-   a named swap, best-effort retries failed MCPs, then rebuilds the runtime
-   (LLM/config/capabilities/MCP/prompt reconstruction, preserving conversation
-   history where a live session exists).
+   atomically (writes raw `init.json`), and persists the new selected default
+   for a named swap. It then requires failed-MCP reconciliation and complete
+   active/pending MCP retirement to converge before requesting the deferred
+   runtime relaunch. A retry exception, malformed or non-converged report,
+   `still_failed`, `unresolved`, or retirement failure returns an actionable
+   error and does **not** request deferred relaunch. The preset write may
+   already be durable at that point; fix the reported MCP cleanup or
+   configuration issue, then invoke `refresh` again. Only convergence rebuilds
+   LLM/config/capabilities/MCP/prompts while preserving conversation history
+   where a live session exists.
 4. A config, prompt, MCP, or capability edit needs `refresh` to take effect;
    `system(action="summarize")` alone does not reconstruct the runtime and
    must not be used as a refresh substitute.

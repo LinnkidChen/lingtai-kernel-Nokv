@@ -456,10 +456,14 @@ def test_programmable_watch_keeps_rendering_while_hidden_and_projects_after_reen
             assert tool_name == _TASK_CARD_TOOL
             return manager.handle({**args, "action": "_task_card_update"})
 
+    client = Client()
     events: list[dict[str, Any]] = []
     agent = SimpleNamespace(
         _working_dir=tmp_path,
-        _mcp_clients_by_tool={"telegram": Client()},
+        _call_mcp_owned_tool=lambda *, route_name, tool_name, tool_args,
+        expected_client=None, timeout=None: client.call_tool(
+            tool_name, tool_args, timeout=timeout
+        ),
         _enqueue_system_notification=lambda **event: events.append(event),
     )
     controller = TaskCardController(agent)

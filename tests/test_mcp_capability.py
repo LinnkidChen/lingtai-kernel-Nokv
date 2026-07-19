@@ -353,6 +353,125 @@ def test_loader_skips_unregistered_init_mcp(tmp_path, caplog):
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed MCP candidate activation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+def test_mcp_activation_list_failure_closes_unpublished_candidate(
+    tmp_path, monkeypatch, transport
+):
+    """A candidate is not public or tracked until its full catalog is ready."""
+    from lingtai.services import mcp as mcp_module
+
+    class Candidate:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            type(self).instances.append(self)
+
+        def start(self):
+            pass
+
+        def list_tools(self):
+            raise RuntimeError("catalog unavailable")
+
+        def close(self):
+            self.closed = True
+
+    class_name = "MCPClient" if transport == "stdio" else "HTTPMCPClient"
+    monkeypatch.setattr(mcp_module, class_name, Candidate)
+    agent, _ = _mk_agent(tmp_path)
+
+    connect = agent.connect_mcp if transport == "stdio" else agent.connect_mcp_http
+    kwargs = {"command": "fake"} if transport == "stdio" else {"url": "http://fake"}
+    with pytest.raises(RuntimeError, match="catalog unavailable"):
+        connect(**kwargs)
+
+    candidate = Candidate.instances[-1]
+    assert candidate.closed is True
+    assert candidate not in getattr(agent, "_mcp_clients", [])
+    assert candidate not in getattr(agent, "_mcp_clients_by_tool", {}).values()
+    assert getattr(agent, "_mcp_tool_names", set()) == set()
+    assert not any(
+        getattr(handler, "_lingtai_mcp_client", None) is candidate
+        for handler in agent._tool_handlers.values()
+    )
+
+
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+def test_mcp_activation_malformed_catalog_exact_restores_existing_state(
+    tmp_path, monkeypatch, transport
+):
+    """Validation is batch-first: a bad second tool cannot publish the first."""
+    from lingtai.services import mcp as mcp_module
+
+    class Candidate:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            type(self).instances.append(self)
+
+        def start(self):
+            pass
+
+        def list_tools(self):
+            return [
+                {
+                    "name": "candidate_ok",
+                    "description": "must never become visible",
+                    "schema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "candidate_bad",
+                    "description": "malformed schema",
+                    "schema": ["not", "an", "object"],
+                },
+            ]
+
+        def close(self):
+            self.closed = True
+
+    class_name = "MCPClient" if transport == "stdio" else "HTTPMCPClient"
+    monkeypatch.setattr(mcp_module, class_name, Candidate)
+    agent, _ = _mk_agent(tmp_path)
+    unrelated_handler = lambda args: {"kept": args}
+    agent.add_tool(
+        "unrelated",
+        schema={"type": "object", "properties": {}},
+        handler=unrelated_handler,
+        description="pre-existing",
+    )
+    handlers_before = agent._tool_handlers
+    handler_items_before = dict(handlers_before)
+    schemas_before = agent._tool_schemas
+    unrelated_schema = next(s for s in schemas_before if s.name == "unrelated")
+
+    connect = agent.connect_mcp if transport == "stdio" else agent.connect_mcp_http
+    kwargs = {"command": "fake"} if transport == "stdio" else {"url": "http://fake"}
+    with pytest.raises((TypeError, ValueError), match="schema"):
+        connect(**kwargs)
+
+    candidate = Candidate.instances[-1]
+    assert candidate.closed is True
+    assert agent._tool_handlers is handlers_before
+    assert agent._tool_schemas is schemas_before
+    assert agent._tool_handlers.keys() == handler_items_before.keys()
+    assert all(
+        agent._tool_handlers[name] is handler
+        for name, handler in handler_items_before.items()
+    )
+    assert agent._tool_handlers["unrelated"] is unrelated_handler
+    assert next(s for s in agent._tool_schemas if s.name == "unrelated") is unrelated_schema
+    assert {s.name for s in agent._tool_schemas}.isdisjoint(
+        {"candidate_ok", "candidate_bad"}
+    )
+    assert candidate not in getattr(agent, "_mcp_clients", [])
+    assert candidate not in getattr(agent, "_mcp_clients_by_tool", {}).values()
+
+
+# ---------------------------------------------------------------------------
 # Failed-MCP retry on refresh — regression for Lingtai-AI/lingtai#34
 # ---------------------------------------------------------------------------
 
@@ -402,19 +521,16 @@ def test_retry_failed_mcps_records_dead_then_recovers(tmp_path, monkeypatch):
     }
     (workdir / "init.json").write_text(json.dumps(init))
 
-    # Patch connect_mcp on the Agent class: first call → returns dead client
-    # (subprocess "exited" immediately); second call → returns live client.
+    # Patch the transport constructor: first candidate is immediately dead;
+    # retry constructs a live replacement through the real transaction path.
     call_count = {"n": 0}
 
-    def fake_connect_mcp(self, command, args=None, env=None):
-        call_count["n"] += 1
-        client = _FakeMCPClient(is_connected_value=(call_count["n"] >= 2))
-        if not hasattr(self, "_mcp_clients"):
-            self._mcp_clients = []
-        self._mcp_clients.append(client)
-        return []  # no tools to register
+    class SequencedMCPClient(_FakeMCPClient):
+        def __init__(self, *args, **kwargs):
+            call_count["n"] += 1
+            super().__init__(is_connected_value=(call_count["n"] >= 2))
 
-    monkeypatch.setattr(Agent, "connect_mcp", fake_connect_mcp)
+    monkeypatch.setattr("lingtai.services.mcp.MCPClient", SequencedMCPClient)
 
     agent = Agent(
         service=make_mock_service(),
@@ -459,14 +575,11 @@ def test_retry_failed_mcps_skips_healthy(tmp_path, monkeypatch):
         "mcp": {"telegram": {"type": "stdio", "command": "/bin/true"}},
     }))
 
-    def fake_connect_mcp(self, command, args=None, env=None):
-        client = _FakeMCPClient(is_connected_value=True)
-        if not hasattr(self, "_mcp_clients"):
-            self._mcp_clients = []
-        self._mcp_clients.append(client)
-        return []
+    class HealthyMCPClient(_FakeMCPClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(is_connected_value=True)
 
-    monkeypatch.setattr(Agent, "connect_mcp", fake_connect_mcp)
+    monkeypatch.setattr("lingtai.services.mcp.MCPClient", HealthyMCPClient)
 
     agent = Agent(
         service=make_mock_service(),
@@ -494,8 +607,14 @@ def test_retry_failed_mcps_no_specs_is_noop(tmp_path):
         capabilities={"mcp": {}},
     )
     report = agent._retry_failed_mcps()
-    assert report == {"retried": [], "recovered": [],
-                      "still_failed": [], "healthy": []}
+    assert report == {
+        "retried": [],
+        "recovered": [],
+        "still_failed": [],
+        "healthy": [],
+        "unresolved": [],
+        "converged": True,
+    }
 
 
 def test_curated_catalog_includes_whatsapp(tmp_path: Path):

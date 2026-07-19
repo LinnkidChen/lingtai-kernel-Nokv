@@ -1,6 +1,6 @@
 ---
 name: telegram-task-card
-contract_version: 3
+contract_version: 4
 root_contract: CONTRACT.md
 related_files:
   - src/lingtai/mcp_servers/telegram/task_card/ANATOMY.md
@@ -184,11 +184,15 @@ The resident boundary exposes the minimal Telegram-addon-owned operations
 The inbound driving port is the `task_card` tool (`start | inspect | retry |
 stop`; schema in `controller.py` `get_schema`). Core's outbound host dependency
 is the `TelegramTaskCardAgent` Protocol in `interface.py`: `_working_dir`,
-`_mcp_clients_by_tool`, `_telegram_task_card_context`, `_shutdown`, `add_tool`,
-and `_enqueue_system_notification`. Core's outbound rendering dependency is the
-private Telegram reverse channel `_lingtai_telegram_task_card` invoked with
-`channel="programmable"`. No concrete `Agent` or `BaseAgent` type crosses either
-boundary; the controller reads only the Protocol members.
+`_telegram_task_card_context`, `_shutdown`, `add_tool`, the required
+`_call_mcp_owned_tool` leased-call boundary, and the optional
+`_enqueue_system_notification`. Every programmable projection selects and
+leases the published `telegram` route through that method before invoking the
+private `_lingtai_telegram_task_card` tool with `channel="programmable"`.
+Refresh/stop may depublish immediately, but cannot close the selected transport
+until the projection lease drains; the controller never reads or calls the
+private client map directly. No concrete `Agent` or `BaseAgent` type crosses
+either boundary; the controller reads only the Protocol members.
 
 ## Adapters
 

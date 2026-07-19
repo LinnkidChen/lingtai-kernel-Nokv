@@ -381,6 +381,10 @@ def test_real_stdio_preserves_typed_error_fields(
             client.close()
         except Exception as error:  # pragma: no cover - failure-path evidence
             cleanup_failures.append(f"MCP client close failed: {error!r}")
+        else:
+            assert client._cleanup_postcondition_verified is True
+            assert client._stdio_process is not None
+            assert client._stdio_process.returncode is not None
         if not wait_for_thread_exit(client_thread):
             cleanup_failures.append("MCP client thread did not retire")
         for child in observer.records():

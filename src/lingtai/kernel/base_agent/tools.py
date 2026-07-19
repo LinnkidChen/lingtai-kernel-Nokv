@@ -4,6 +4,8 @@ The 2-layer tool dispatch: intrinsics (built-in) + capabilities/MCP.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from ..llm import FunctionSchema
 from ..tool_glossary import append_tool_glossary
 from ..types import UnknownToolError
@@ -15,6 +17,11 @@ _REASONING_DESCRIPTION = (
     "Brief explanation of why you are calling this tool "
     "(recorded in your diary)."
 )
+
+
+def _mcp_surface_lock(agent):
+    """Return the wrapper's MCP lifecycle lock or a no-op Core context."""
+    return getattr(agent, "_mcp_lifecycle_lock", None) or nullcontext()
 
 
 def _dispatch_tool(agent, tc) -> dict:
@@ -33,14 +40,17 @@ def _dispatch_tool(agent, tc) -> dict:
         args = dict(tc.args or {})
         args["_tc_id"] = tc.id
         return agent._intrinsics[tc.name](args)
-    elif tc.name in agent._tool_handlers:
-        return agent._tool_handlers[tc.name](tc.args or {})
-    elif tc.name == "bash" and "shell" in agent._tool_handlers:
-        # One-way rolling compatibility for historical/pending calls.  Do not
-        # register a second schema or expose ``bash`` in provider tools.
-        return agent._tool_handlers["shell"](tc.args or {})
-    else:
-        raise UnknownToolError(tc.name)
+    with _mcp_surface_lock(agent):
+        if tc.name in agent._tool_handlers:
+            handler = agent._tool_handlers[tc.name]
+        elif tc.name == "bash" and "shell" in agent._tool_handlers:
+            handler = agent._tool_handlers["shell"]
+        else:
+            raise UnknownToolError(tc.name)
+    # MCP handlers acquire a short in-flight lease themselves before their
+    # remote call.  Do not hold the registry lock through network/subprocess
+    # latency; retirement depublishes first and waits boundedly for that lease.
+    return handler(tc.args or {})
 
 
 def _refresh_tool_inventory_section(agent) -> None:
@@ -54,15 +64,19 @@ def _refresh_tool_inventory_section(agent) -> None:
     affects them.
     """
     lang = agent._config.language
+    with _mcp_surface_lock(agent):
+        intrinsic_names = list(agent._intrinsics)
+        intrinsic_modules = dict(agent._intrinsic_modules)
+        dynamic_schemas = list(agent._tool_schemas)
     lines = []
-    for name in agent._intrinsics:
-        module = agent._intrinsic_modules.get(name)
+    for name in intrinsic_names:
+        module = intrinsic_modules.get(name)
         if module:
             base = module.get_description()
             pkg = getattr(module, "__package__", None)
             rendered = append_tool_glossary(base, tool_package=pkg, language=lang)
             lines.append(f"### {name}\n{rendered}")
-    for s in agent._tool_schemas:
+    for s in dynamic_schemas:
         if s.description:
             rendered = append_tool_glossary(
                 s.description, tool_package=s.glossary_package, language=lang
@@ -81,46 +95,47 @@ def _build_tool_schemas(agent) -> list[FunctionSchema]:
     explain why it's calling this tool. Reasoning is logged as part of
     the agent's diary and stripped before the handler runs.
     """
-    reasoning_prop = {
-        "reasoning": {
-            "type": "string",
-            "description": _REASONING_DESCRIPTION,
-        },
-    }
+    with _mcp_surface_lock(agent):
+        reasoning_prop = {
+            "reasoning": {
+                "type": "string",
+                "description": _REASONING_DESCRIPTION,
+            },
+        }
 
-    schemas = []
+        schemas = []
 
-    # Intrinsic schemas — canonical English, language-independent.
-    for name in agent._intrinsics:
-        module = agent._intrinsic_modules.get(name)
-        if module:
-            params = dict(module.get_schema())
+        # Intrinsic schemas — canonical English, language-independent.
+        for name in agent._intrinsics:
+            module = agent._intrinsic_modules.get(name)
+            if module:
+                params = dict(module.get_schema())
+                props = dict(params.get("properties", {}))
+                props.update(reasoning_prop)
+                params["properties"] = props
+                schemas.append(
+                    FunctionSchema(
+                        name=name,
+                        description=module.get_description(),
+                        parameters=params,
+                    )
+                )
+
+        # Capability + MCP schemas — inject reasoning into each
+        for s in agent._tool_schemas:
+            params = dict(s.parameters)
             props = dict(params.get("properties", {}))
             props.update(reasoning_prop)
             params["properties"] = props
             schemas.append(
                 FunctionSchema(
-                    name=name,
-                    description=module.get_description(),
+                    name=s.name,
+                    description=s.description,
                     parameters=params,
                 )
             )
 
-    # Capability + MCP schemas — inject reasoning into each
-    for s in agent._tool_schemas:
-        params = dict(s.parameters)
-        props = dict(params.get("properties", {}))
-        props.update(reasoning_prop)
-        params["properties"] = props
-        schemas.append(
-            FunctionSchema(
-                name=s.name,
-                description=s.description,
-                parameters=params,
-            )
-        )
-
-    return schemas
+        return schemas
 
 
 def _add_tool(
@@ -132,9 +147,10 @@ def _add_tool(
     description: str = "",
     system_prompt: str = "",
     glossary_package: str | None = None,
+    _allow_sealed: bool = False,
 ) -> None:
     """Register a dynamic tool."""
-    if agent._sealed:
+    if agent._sealed and not _allow_sealed:
         raise RuntimeError("Cannot modify tools after start()")
     if handler is not None:
         agent._tool_handlers[name] = handler

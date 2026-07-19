@@ -295,7 +295,7 @@ def request_worker_hang_refresh(
     artifact_relpath: str | None = None,
     source: str,
 ) -> None:
-    """Idempotently request a forced refresh that skips poisoned chat save."""
+    """Request a forced refresh, latching only an acknowledged handoff."""
     if getattr(agent, "_llm_worker_refresh_requested", False):
         try:
             agent._log(
@@ -306,6 +306,37 @@ def request_worker_hang_refresh(
         except Exception:
             pass
         return
+    try:
+        agent._log(
+            "worker_hang_refresh_request_attempt",
+            source=source,
+            artifact=artifact_relpath,
+        )
+    except Exception:
+        pass
+    from .lifecycle import _request_refresh_handoff
+
+    handoff_requested = _request_refresh_handoff(
+        agent,
+        context="worker_hang_refresh",
+        skip_chat_history_save=True,
+        skip_save_reason="worker_still_running_interface_unsafe",
+        reconcile_failed_mcps=False,
+        sync_live_inventory=False,
+        retain_signal_on_failure=True,
+        create_signal_on_prerequisite_failure=True,
+    )
+    if handoff_requested is not True:
+        try:
+            agent._log(
+                "worker_hang_refresh_retry_retained",
+                source=source,
+                artifact=artifact_relpath,
+            )
+        except Exception:
+            pass
+        return
+
     agent._llm_worker_refresh_requested = True
     agent._llm_worker_refresh_source = source
     try:
@@ -316,21 +347,6 @@ def request_worker_hang_refresh(
         )
     except Exception:
         pass
-    try:
-        agent._perform_refresh(
-            skip_chat_history_save=True,
-            skip_save_reason="worker_still_running_interface_unsafe",
-        )
-    except Exception as refresh_err:
-        try:
-            agent._log(
-                "worker_hang_refresh_request_failed",
-                source=source,
-                artifact=artifact_relpath,
-                error=(str(refresh_err) or repr(refresh_err))[:300],
-            )
-        except Exception:
-            pass
 
 
 def _open_artifacts(agent) -> list[tuple[str, Path, dict]]:
