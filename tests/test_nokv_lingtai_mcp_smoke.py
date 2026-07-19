@@ -775,7 +775,9 @@ def test_registered_lingtai_reader_profile_runs_frozen_contract(
             },
         )
         assert denied_write["status"] == "error"
-        assert "WorkspacePermissionDenied" in denied_write["message"]
+        assert denied_write["message"] == (
+            "workspace capability does not permit this tool"
+        )
         unchanged_root = client.call_tool("workspace_list", {})
         assert unchanged_root == shared_root
         assert client.is_connected(), "permission denial must not kill the MCP client"
