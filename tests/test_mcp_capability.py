@@ -53,6 +53,37 @@ def test_validator_accepts_valid_stdio_record():
     assert ok, err
 
 
+def test_validator_accepts_explicit_template_arg_indices():
+    ok, err = validate_record({
+        "name": "nokv",
+        "summary": "test",
+        "transport": "stdio",
+        "command": "nokv",
+        "args": ["--workbench-root", "/agents/{agent_id}/wb"],
+        "template_arg_indices": [1],
+        "source": "user",
+    })
+    assert ok, err
+
+
+@pytest.mark.parametrize(
+    "indices",
+    (None, [True], [-1], [2], [1, 1], [1, 0], [0], "1"),
+)
+def test_validator_rejects_invalid_template_arg_indices(indices):
+    ok, err = validate_record({
+        "name": "nokv",
+        "summary": "test",
+        "transport": "stdio",
+        "command": "nokv",
+        "args": ["--workbench-root", "/agents/{agent_id}/wb"],
+        "template_arg_indices": indices,
+        "source": "user",
+    })
+    assert not ok
+    assert "template_arg_indices" in err
+
+
 def test_validator_accepts_valid_http_record():
     ok, err = validate_record({
         "name": "remote",
@@ -183,6 +214,144 @@ def test_expand_agent_placeholders_scopes_workbench_root(tmp_path):
     # Strings without a placeholder and non-strings pass through untouched.
     assert agent._expand_agent_placeholders("--profile") == "--profile"
     assert agent._expand_agent_placeholders(None) is None
+
+
+def test_connect_mcp_expands_only_explicit_template_args(tmp_path, monkeypatch):
+    from lingtai.services import mcp as mcp_service
+
+    captured = {}
+
+    class CapturingClient:
+        def __init__(self, *, command, args, env):
+            captured.update(command=command, args=args, env=env)
+
+        def start(self):
+            return None
+
+        def list_tools(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(mcp_service, "MCPClient", CapturingClient)
+    agent, workdir = _mk_agent(tmp_path)
+    agent.connect_mcp(
+        command="server-{agent_id}",
+        args=[
+            "--workbench-root",
+            "/agents/{agent_id}/wb",
+            "--workspace-id",
+            "workspace-{agent_id}",
+            "--workspace-actor-id",
+            "actor-{agent_dir}",
+        ],
+        env={"TEMPLATED": "{agent_dir}/runtime"},
+        template_arg_indices=[1],
+    )
+
+    assert captured["command"] == "server-agent"
+    assert captured["args"] == [
+        "--workbench-root",
+        "/agents/agent/wb",
+        "--workspace-id",
+        "workspace-{agent_id}",
+        "--workspace-actor-id",
+        "actor-{agent_dir}",
+    ]
+    assert captured["env"] == {"TEMPLATED": f"{workdir}/runtime"}
+
+
+def test_connect_mcp_without_template_indices_retains_legacy_expansion(
+    tmp_path, monkeypatch
+):
+    from lingtai.services import mcp as mcp_service
+
+    captured = {}
+
+    class CapturingClient:
+        def __init__(self, *, command, args, env):
+            captured.update(command=command, args=args, env=env)
+
+        def start(self):
+            return None
+
+        def list_tools(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(mcp_service, "MCPClient", CapturingClient)
+    agent, _workdir = _mk_agent(tmp_path)
+    agent.connect_mcp(command="server", args=["workspace-{agent_id}"])
+    assert captured["args"] == ["workspace-agent"]
+
+
+def test_connect_mcp_empty_template_indices_keeps_all_args_literal(
+    tmp_path, monkeypatch
+):
+    from lingtai.services import mcp as mcp_service
+
+    captured = {}
+
+    class CapturingClient:
+        def __init__(self, *, command, args, env):
+            captured.update(command=command, args=args, env=env)
+
+        def start(self):
+            return None
+
+        def list_tools(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(mcp_service, "MCPClient", CapturingClient)
+    agent, _workdir = _mk_agent(tmp_path)
+    agent.connect_mcp(
+        command="server",
+        args=["workspace-{agent_id}"],
+        template_arg_indices=[],
+    )
+    assert captured["args"] == ["workspace-{agent_id}"]
+
+
+def test_connect_mcp_rejects_template_indices_without_args(tmp_path, monkeypatch):
+    from lingtai.services import mcp as mcp_service
+
+    client = MagicMock()
+    monkeypatch.setattr(mcp_service, "MCPClient", client)
+    agent, _workdir = _mk_agent(tmp_path)
+    with pytest.raises(ValueError, match="template_arg_indices"):
+        agent.connect_mcp(
+            command="server",
+            args=None,
+            template_arg_indices=[0],
+        )
+    client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "indices",
+    ([True], [-1], [2], [1, 1], [1, 0], [0], "1"),
+)
+def test_connect_mcp_rejects_invalid_template_arg_indices(
+    tmp_path, monkeypatch, indices
+):
+    from lingtai.services import mcp as mcp_service
+
+    client = MagicMock()
+    monkeypatch.setattr(mcp_service, "MCPClient", client)
+    agent, _workdir = _mk_agent(tmp_path)
+    with pytest.raises(ValueError, match="template_arg_indices"):
+        agent.connect_mcp(
+            command="server",
+            args=["--root", "/agents/{agent_id}/wb"],
+            template_arg_indices=indices,
+        )
+    client.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -392,12 +561,18 @@ def test_retry_failed_mcps_records_dead_then_recovers(tmp_path, monkeypatch):
         "summary": "test",
         "transport": "stdio",
         "command": "/bin/true",
-        "args": [],
+        "args": ["--root", "/agents/{agent_id}"],
+        "template_arg_indices": [1],
         "source": "user",
     }) + "\n")
     init = {
         "mcp": {
-            "telegram": {"type": "stdio", "command": "/bin/true", "args": []},
+            "telegram": {
+                "type": "stdio",
+                "command": "/bin/true",
+                "args": ["--root", "/agents/{agent_id}"],
+                "template_arg_indices": [1],
+            },
         },
     }
     (workdir / "init.json").write_text(json.dumps(init))
@@ -405,9 +580,13 @@ def test_retry_failed_mcps_records_dead_then_recovers(tmp_path, monkeypatch):
     # Patch connect_mcp on the Agent class: first call → returns dead client
     # (subprocess "exited" immediately); second call → returns live client.
     call_count = {"n": 0}
+    template_calls = []
 
-    def fake_connect_mcp(self, command, args=None, env=None):
+    def fake_connect_mcp(
+        self, command, args=None, env=None, template_arg_indices=None
+    ):
         call_count["n"] += 1
+        template_calls.append(template_arg_indices)
         client = _FakeMCPClient(is_connected_value=(call_count["n"] >= 2))
         if not hasattr(self, "_mcp_clients"):
             self._mcp_clients = []
@@ -441,6 +620,7 @@ def test_retry_failed_mcps_records_dead_then_recovers(tmp_path, monkeypatch):
     # New client tracked.
     new_client = agent._mcp_init_specs["telegram"]["client"]
     assert new_client is not None and new_client.is_connected()
+    assert template_calls == [[1], [1]]
 
 
 def test_retry_failed_mcps_skips_healthy(tmp_path, monkeypatch):

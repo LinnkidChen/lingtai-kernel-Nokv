@@ -30,6 +30,36 @@ CATALOG_FILENAME = "mcp_catalog.json"
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}$")
 _VALID_TRANSPORTS = {"stdio", "http"}
 _MAX_SUMMARY_LEN = 200
+AGENT_TEMPLATE_TOKENS = ("{agent_id}", "{agent_address}", "{agent_dir}")
+
+
+def validate_template_arg_indices(args: object, indices: object) -> str | None:
+    """Validate explicit placeholder-bearing stdio argument positions."""
+
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return (
+            "stdio template_arg_indices requires field 'args' "
+            "(list of strings)"
+        )
+    if (
+        not isinstance(indices, list)
+        or any(isinstance(index, bool) or not isinstance(index, int) for index in indices)
+        or indices != sorted(set(indices))
+        or any(index < 0 or index >= len(args) for index in indices)
+    ):
+        return (
+            "stdio template_arg_indices must contain strictly increasing "
+            "in-range integers"
+        )
+    if any(
+        not any(token in args[index] for token in AGENT_TEMPLATE_TOKENS)
+        for index in indices
+    ):
+        return (
+            "stdio template_arg_indices may select only arguments containing "
+            "a supported agent placeholder"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +128,12 @@ def validate_record(record: dict) -> tuple[bool, str | None]:
         args = record.get("args", [])
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             return False, "stdio transport requires field 'args' (list of strings)"
+        if "template_arg_indices" in record:
+            template_error = validate_template_arg_indices(
+                args, record["template_arg_indices"]
+            )
+            if template_error is not None:
+                return False, template_error
     else:  # http
         if not isinstance(record.get("url"), str):
             return False, "http transport requires field 'url' (string)"

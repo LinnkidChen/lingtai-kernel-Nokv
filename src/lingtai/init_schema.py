@@ -435,6 +435,23 @@ def validate_init(data: dict) -> list[str]:
         if not all(isinstance(x, str) for x in addons):
             warnings.append("addons: all entries must be strings (curated MCP names)")
 
+    mcp = data.get("mcp")
+    if isinstance(mcp, dict):
+        from lingtai.services.mcp_registry import validate_template_arg_indices
+
+        for name, spec in mcp.items():
+            if not isinstance(spec, dict) or "template_arg_indices" not in spec:
+                continue
+            if spec.get("type", "stdio") != "stdio":
+                raise ValueError(
+                    f"mcp.{name}.template_arg_indices is valid only for stdio"
+                )
+            template_error = validate_template_arg_indices(
+                spec.get("args"), spec["template_arg_indices"]
+            )
+            if template_error is not None:
+                raise ValueError(f"mcp.{name}: {template_error}")
+
     # Validate manifest.capabilities.skills shape if present.
     caps = manifest.get("capabilities") or {}
     if isinstance(caps, dict):

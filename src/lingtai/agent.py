@@ -642,11 +642,25 @@ class Agent(BaseAgent):
                         "LINGTAI_MCP_NAME": name,
                         **(cfg.get("env") or {}),
                     }
-                    tools = self.connect_mcp(
-                        command=cfg["command"],
-                        args=cfg.get("args"),
-                        env=merged_env,
-                    )
+                    connect_kwargs = {
+                        "command": cfg["command"],
+                        "args": cfg.get("args"),
+                        "env": merged_env,
+                    }
+                    if "template_arg_indices" in cfg:
+                        from .services.mcp_registry import (
+                            validate_template_arg_indices,
+                        )
+
+                        template_error = validate_template_arg_indices(
+                            cfg.get("args"), cfg["template_arg_indices"]
+                        )
+                        if template_error is not None:
+                            raise ValueError(template_error)
+                        connect_kwargs["template_arg_indices"] = cfg[
+                            "template_arg_indices"
+                        ]
+                    tools = self.connect_mcp(**connect_kwargs)
                 logger.info("[%s] MCP %s (%s): loaded %d tools (%s)",
                             self.agent_name, name, source, len(tools),
                             ", ".join(tools))
@@ -806,11 +820,25 @@ class Agent(BaseAgent):
                         "LINGTAI_MCP_NAME": name,
                         **(cfg.get("env") or {}),
                     }
-                    self.connect_mcp(
-                        command=cfg["command"],
-                        args=cfg.get("args"),
-                        env=merged_env,
-                    )
+                    connect_kwargs = {
+                        "command": cfg["command"],
+                        "args": cfg.get("args"),
+                        "env": merged_env,
+                    }
+                    if "template_arg_indices" in cfg:
+                        from .services.mcp_registry import (
+                            validate_template_arg_indices,
+                        )
+
+                        template_error = validate_template_arg_indices(
+                            cfg.get("args"), cfg["template_arg_indices"]
+                        )
+                        if template_error is not None:
+                            raise ValueError(template_error)
+                        connect_kwargs["template_arg_indices"] = cfg[
+                            "template_arg_indices"
+                        ]
+                    self.connect_mcp(**connect_kwargs)
                 post_clients = list(getattr(self, "_mcp_clients", []) or [])
                 new = post_clients[len(pre_clients):]
                 new_client = new[-1] if new else None
@@ -972,6 +1000,8 @@ class Agent(BaseAgent):
         command: str,
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        *,
+        template_arg_indices: list[int] | None = None,
     ) -> list[str]:
         """Connect to an MCP server and auto-register all its tools.
 
@@ -979,6 +1009,10 @@ class Agent(BaseAgent):
             command: Executable to run (e.g., "uvx", "xhelio-spice-mcp").
             args: Arguments to the command.
             env: Environment variables for the subprocess.
+            template_arg_indices: Explicit argument positions that may expand
+                per-agent placeholders. ``None`` retains legacy expand-all
+                behavior for existing configurations; an explicit list keeps
+                every other argument byte-for-byte literal.
 
         Returns:
             List of registered tool names.
@@ -988,8 +1022,29 @@ class Agent(BaseAgent):
         # Expand per-agent placeholders (e.g. {agent_id}) so a shared registry
         # template gives each agent its own scope. See _expand_agent_placeholders.
         command = self._expand_agent_placeholders(command)
-        if args:
-            args = [self._expand_agent_placeholders(a) for a in args]
+        if template_arg_indices is not None:
+            from .services.mcp_registry import validate_template_arg_indices
+
+            template_error = validate_template_arg_indices(
+                args, template_arg_indices
+            )
+            if template_error is not None:
+                raise ValueError(template_error)
+        if args is not None:
+            if not isinstance(args, list) or any(
+                not isinstance(value, str) for value in args
+            ):
+                raise ValueError("MCP args must be a list of strings")
+            if template_arg_indices is None:
+                selected_indices = set(range(len(args)))
+            else:
+                selected_indices = set(template_arg_indices)
+            args = [
+                self._expand_agent_placeholders(value)
+                if index in selected_indices
+                else value
+                for index, value in enumerate(args)
+            ]
         if env:
             env = {k: self._expand_agent_placeholders(v) for k, v in env.items()}
 

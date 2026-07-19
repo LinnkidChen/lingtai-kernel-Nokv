@@ -373,6 +373,37 @@ def test_mcp_section_dict_valid():
     validate_init(data)
 
 
+def test_mcp_template_arg_indices_valid():
+    data = _valid_init()
+    data["mcp"] = {
+        "nokv": {
+            "type": "stdio",
+            "command": "nokv",
+            "args": ["--workbench-root", "/agents/{agent_id}/wb"],
+            "template_arg_indices": [1],
+        },
+    }
+    validate_init(data)
+
+
+@pytest.mark.parametrize(
+    "indices",
+    (None, [True], [-1], [2], [1, 1], [1, 0], [0]),
+)
+def test_mcp_template_arg_indices_invalid(indices):
+    data = _valid_init()
+    data["mcp"] = {
+        "nokv": {
+            "type": "stdio",
+            "command": "nokv",
+            "args": ["--workbench-root", "/agents/{agent_id}/wb"],
+            "template_arg_indices": indices,
+        },
+    }
+    with pytest.raises(ValueError, match="template_arg_indices"):
+        validate_init(data)
+
+
 def test_mcp_section_wrong_type_rejected():
     data = _valid_init()
     data["mcp"] = ["imap"]
