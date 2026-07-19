@@ -59,9 +59,15 @@ Use the registry route for anything you want to keep. Use `mcp/servers.json` whe
 | `type`     | `"stdio"` (default)         | `"http"` (required)               |
 | `command`  | executable (e.g. `npx`)     | —                                 |
 | `args`     | command-line arguments      | —                                 |
+| `template_arg_indices` | optional zero-based indices in `args` that may expand `{agent_id}`, `{agent_address}`, or `{agent_dir}`; missing means legacy expand-all, `[]` means all literal | — |
 | `env`      | env vars for the subprocess | —                                 |
 | `url`      | —                           | streamable-http endpoint          |
 | `headers`  | —                           | HTTP headers (typically auth)     |
+
+When `template_arg_indices` is present, each selected index must be unique,
+strictly increasing, in range, and point to an argument containing a supported
+placeholder. Keep opaque ids, signed capabilities, tokens, and user data
+unselected even if their bytes happen to look like placeholders.
 
 ## API keys and secrets
 

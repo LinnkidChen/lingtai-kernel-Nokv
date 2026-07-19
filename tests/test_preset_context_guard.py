@@ -173,7 +173,7 @@ def test_swap_allowed_when_current_context_fits(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        lambda: perform_calls.append(True) or True)
 
     small_path = str(plib / "small.json")
     result = agent._intrinsics["system"]({"action": "refresh", "preset": small_path})
@@ -198,7 +198,7 @@ def test_swap_allowed_when_target_has_no_context_limit(tmp_path, monkeypatch):
     activate_calls = []
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: True)
 
     no_limit_path = str(plib / "no_limit.json")
     result = agent._intrinsics["system"]({"action": "refresh", "preset": no_limit_path})
@@ -234,7 +234,7 @@ def test_swap_skips_guard_when_target_limit_is_zero(tmp_path, monkeypatch):
     activate_calls = []
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: True)
 
     zero_path = str(plib / "zero.json")
     result = agent._intrinsics["system"]({"action": "refresh", "preset": zero_path})
@@ -268,7 +268,7 @@ def test_swap_skips_guard_when_target_limit_is_negative(tmp_path, monkeypatch):
     activate_calls = []
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: True)
 
     negone_path = str(plib / "negone.json")
     result = agent._intrinsics["system"]({"action": "refresh", "preset": negone_path})

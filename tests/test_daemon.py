@@ -370,6 +370,184 @@ def test_build_tool_surface_rejects_task_mcp_name_collision(tmp_path):
         assert "collide" in str(e)
 
 
+def test_build_tool_surface_snapshots_one_parent_generation_for_both_paths(tmp_path):
+    """Default and preset fallback paths use one lifecycle-locked snapshot."""
+
+    class SwapProjectionOnExit:
+        def __init__(self, agent, tool_name, replacement_handler):
+            self._agent = agent
+            self._tool_name = tool_name
+            self._replacement_handler = replacement_handler
+            self._lock = threading.RLock()
+            self.entries = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self.entries += 1
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            replacement_schema = FunctionSchema(
+                name=self._tool_name,
+                description="replacement generation",
+                parameters={"type": "object", "properties": {}},
+            )
+            self._agent._tool_schemas = [
+                replacement_schema if schema.name == self._tool_name else schema
+                for schema in self._agent._tool_schemas
+            ]
+            self._agent._tool_handlers = {
+                **self._agent._tool_handlers,
+                self._tool_name: self._replacement_handler,
+            }
+            self._agent._mcp_tool_names = (
+                set(self._agent._mcp_tool_names) | {self._tool_name}
+            )
+            self._lock.release()
+
+    cases = (
+        ("default", "read", None),
+        ("preset", "shell", ({}, {})),
+    )
+    for case_name, tool_name, preset_surface in cases:
+        agent = _make_agent(
+            tmp_path,
+            ["file", "shell", "daemon"],
+            working_dir_name=f"daemon-agent-{case_name}",
+        )
+        mgr = agent.get_capability("daemon")
+        original_schema = next(
+            schema for schema in agent._tool_schemas if schema.name == tool_name
+        )
+        original_handler = agent._tool_handlers[tool_name]
+        replacement_handler = lambda args, name=tool_name: {
+            "generation": "replacement",
+            "tool": name,
+        }
+        projection_lock = SwapProjectionOnExit(
+            agent, tool_name, replacement_handler
+        )
+        agent._mcp_lifecycle_lock = projection_lock
+
+        schemas, dispatch = mgr._build_tool_surface(
+            [tool_name], preset_surface=preset_surface
+        )
+
+        assert projection_lock.entries == 1
+        assert agent._tool_handlers[tool_name] is replacement_handler
+        assert tool_name in agent._mcp_tool_names
+        assert next(
+            schema for schema in agent._tool_schemas if schema.name == tool_name
+        ) is not original_schema
+        assert next(schema for schema in schemas if schema.name == tool_name) is original_schema
+        assert dispatch[tool_name] is original_handler
+
+
+def test_build_tool_surface_blocks_retirement_until_snapshot_is_coherent(tmp_path):
+    """A real MCP depublish cannot split daemon schema/handler generations."""
+    agent = _make_agent(tmp_path, ["daemon"])
+    mgr = agent.get_capability("daemon")
+
+    class TaskCardOwner:
+        def handle(self, args):
+            return {"generation": "pre-retirement", "args": args}
+
+    owner = TaskCardOwner()
+    client = object()
+
+    def telegram_handler(args):
+        return {"telegram": args}
+
+    telegram_handler._lingtai_mcp_client = client
+    telegram_handler._lingtai_mcp_tool_name = "telegram"
+    agent.add_tool(
+        "task_card",
+        schema={"type": "object", "properties": {}},
+        handler=owner.handle,
+        description="Task card",
+        _allow_sealed=True,
+    )
+    agent.add_tool(
+        "telegram",
+        schema={"type": "object", "properties": {}},
+        handler=telegram_handler,
+        description="Telegram MCP",
+        _allow_sealed=True,
+    )
+    agent._task_card_controller = owner
+    agent._mcp_clients = [client]
+    agent._mcp_clients_by_tool = {"telegram": client}
+    agent._mcp_tool_names = {"telegram"}
+
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    retirement_attempted = threading.Event()
+    retirement_acquired = threading.Event()
+    retirement_done = threading.Event()
+
+    class BlockingSchemas(list):
+        def __init__(self, schemas):
+            super().__init__(schemas)
+            self._blocked_once = False
+
+        def __iter__(self):
+            if not self._blocked_once:
+                self._blocked_once = True
+                snapshot_started.set()
+                if not release_snapshot.wait(2.0):
+                    raise AssertionError("snapshot test did not release schema copy")
+            return super().__iter__()
+
+    agent._tool_schemas = BlockingSchemas(agent._tool_schemas)
+    original_expand = mgr._expand_requested_tools
+
+    def expand_after_retirement(requested):
+        if not retirement_done.wait(2.0):
+            raise AssertionError("retirement did not complete after snapshot")
+        return original_expand(requested)
+
+    mgr._expand_requested_tools = expand_after_retirement
+    outcome = {}
+
+    def build_surface():
+        try:
+            outcome["surface"] = mgr._build_tool_surface(["task_card"])
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    def retire_surface():
+        retirement_attempted.set()
+        with agent._mcp_lifecycle_lock:
+            retirement_acquired.set()
+            agent._depublish_mcp_clients([client])
+        retirement_done.set()
+
+    builder = threading.Thread(target=build_surface)
+    retiree = threading.Thread(target=retire_surface)
+    builder.start()
+    assert snapshot_started.wait(2.0)
+    retiree.start()
+    assert retirement_attempted.wait(2.0)
+    assert not retirement_acquired.wait(0.05)
+    release_snapshot.set()
+    builder.join(2.0)
+    retiree.join(2.0)
+
+    assert not builder.is_alive()
+    assert not retiree.is_alive()
+    assert "error" not in outcome
+    assert retirement_acquired.is_set()
+    assert retirement_done.is_set()
+    assert "task_card" not in agent._tool_handlers
+    assert "telegram" not in agent._tool_handlers
+    schemas, dispatch = outcome["surface"]
+    assert {schema.name for schema in schemas} >= {"task_card", "compact"}
+    assert dispatch["task_card"]({"x": 1}) == {
+        "generation": "pre-retirement",
+        "args": {"x": 1},
+    }
+
+
 def test_task_mcp_registrations_accept_full_objects_and_redact_secrets(tmp_path):
     """Task mcp is full registration YAML context, not name-based selection."""
     agent = _make_agent(tmp_path, ["daemon"])

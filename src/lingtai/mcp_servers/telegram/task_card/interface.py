@@ -7,9 +7,11 @@ only surface the controller depends on; the real agent satisfies it
 *structurally*, so the unit stays decoupled from the composition root and is
 trivially faked in tests.
 
-Every member below is read defensively (``getattr`` with a default) at call
-time, so a host that omits an optional member simply disables that path — e.g.
-a host without ``_enqueue_system_notification`` drops fail-loud wakes rather than
+Required members below are the complete structural host boundary. In
+particular, reverse projection must cross ``_call_mcp_owned_tool`` so the host
+can lease the selected Telegram client against concurrent refresh/stop
+retirement. Truly optional members are still read defensively — e.g. a host
+without ``_enqueue_system_notification`` drops fail-loud wakes rather than
 crashing a watcher thread.
 """
 
@@ -30,9 +32,6 @@ class TelegramTaskCardAgent(Protocol):
     #: Absolute agent working directory — renderer-path confinement root and the
     #: subprocess ``cwd`` for every renderer run.
     _working_dir: str | os.PathLike[str]
-    #: Stable ``tool_name -> MCP client`` map built at MCP registration time; the
-    #: ``"telegram"`` entry is the private Task Card reverse channel.
-    _mcp_clients_by_tool: dict[str, Any]
     #: Turn-local automatic-driver route (``{"account": str, "chat_id": int, ...}``)
     #: or ``None`` when no Telegram turn is active. Both slots share this route so
     #: they compose into the one tracked resident target.
@@ -48,8 +47,21 @@ class TelegramTaskCardAgent(Protocol):
         handler: Callable[[dict], dict],
         description: str = ...,
         glossary_package: Any = ...,
+        _allow_sealed: bool = ...,
     ) -> Any:
         """Register a model-facing tool (used once to add ``task_card``)."""
+        ...
+
+    def _call_mcp_owned_tool(
+        self,
+        *,
+        route_name: str,
+        tool_name: str,
+        tool_args: dict,
+        expected_client: Any | None = ...,
+        timeout: float | None = ...,
+    ) -> Any:
+        """Lease and call one published MCP route across concurrent retirement."""
         ...
 
     def _enqueue_system_notification(self, **kwargs: Any) -> Any:

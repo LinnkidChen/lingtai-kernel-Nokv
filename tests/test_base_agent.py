@@ -114,7 +114,7 @@ def test_perform_refresh_saves_chat_history(tmp_path):
 
 
 def test_perform_refresh_no_launch_cmd_is_noop(tmp_path):
-    """_perform_refresh with no _build_launch_cmd returns None is a no-op."""
+    """_perform_refresh explicitly reports no handoff without a launch command."""
     agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), working_dir=tmp_path / "test", workdir_lease=make_test_lease(), agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
     assert agent._build_launch_cmd() is None
 
@@ -122,7 +122,7 @@ def test_perform_refresh_no_launch_cmd_is_noop(tmp_path):
     original_log = agent._log
     agent._log = lambda event, **kw: log_calls.append(event)
 
-    agent._perform_refresh()
+    assert agent._perform_refresh() is False
 
     assert "refresh_no_launch_cmd" in log_calls
 

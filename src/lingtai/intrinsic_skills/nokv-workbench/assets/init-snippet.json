@@ -15,7 +15,8 @@
         "workbench",
         "--workbench-root",
         "/agents/{agent_id}/wb"
-      ]
+      ],
+      "template_arg_indices": [10]
     }
   }
 }

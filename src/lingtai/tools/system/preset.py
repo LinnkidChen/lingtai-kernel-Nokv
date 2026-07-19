@@ -182,21 +182,76 @@ def _refresh(agent, args: dict) -> dict:
 
     agent._log("refresh_requested", reason=reason)
 
-    # Re-spawn any init.json MCPs whose subprocess exited at boot (or has
-    # since died). The Agent subclass owns the retry — BaseAgent has no
-    # MCP machinery — so the call is gated on hasattr(). Failures are
-    # logged and swallowed so a flaky MCP cannot block refresh itself.
-    # Closes Lingtai-AI/lingtai#34.
-    retry = getattr(agent, "_retry_failed_mcps", None)
-    if callable(retry):
-        try:
-            report = retry()
-            if report.get("retried"):
-                agent._log("mcp_retry_summary", **report)
-        except Exception as e:
-            agent._log("mcp_retry_error", error=str(e))
+    # The shared lifecycle transaction requires MCP retry and exact retirement
+    # to converge before it enters `_perform_refresh`. Gate failures therefore
+    # cannot establish an ACK, request, or deferred signal; only the later
+    # watcher handoff may consume/create refresh protocol files.
+    from lingtai.kernel.base_agent.lifecycle import (
+        _get_refresh_handoff_failure,
+        _request_refresh_handoff,
+    )
 
-    agent._perform_refresh()
+    handoff_requested = _request_refresh_handoff(
+        agent,
+        context="system_refresh",
+        retain_signal_on_failure=True,
+    )
+    if handoff_requested is not True:
+        failure = _get_refresh_handoff_failure(agent) or {}
+        phase = failure.get("phase")
+        report = failure.get("report")
+        details: list[str] = []
+        error = failure.get("error")
+        if error:
+            details.append(str(error))
+        if isinstance(report, dict):
+            details.extend(str(name) for name in report.get("still_failed") or [])
+            details.extend(
+                str(item.get("error") or item)
+                for item in report.get("unresolved") or []
+                if isinstance(item, dict)
+            )
+            if report.get("converged") is not True:
+                details.append("converged=false")
+        detail = "; ".join(details)[:1000]
+
+        if phase == "mcp_retry_exception":
+            message = (
+                "refresh blocked: MCP retry/cleanup could not be verified; "
+                f"fix the MCP and retry refresh ({detail})"
+            )
+        elif phase == "mcp_retry_unresolved":
+            message = (
+                "refresh blocked: MCP retry/cleanup remains unresolved; "
+                f"fix the reported MCP state and retry refresh ({detail})"
+            )
+        elif phase == "mcp_retirement_exception":
+            message = (
+                "refresh blocked: MCP retirement could not be verified; "
+                f"retry after cleanup succeeds ({detail})"
+            )
+        elif phase == "mcp_retirement_unresolved":
+            message = (
+                "refresh blocked: MCP retirement remains unresolved; retry "
+                "refresh after all MCP calls and transports exit "
+                f"({detail})"
+            )
+        elif phase == "handoff_exception":
+            message = (
+                "refresh handoff failed; no replacement runtime was requested. "
+                "Fix the refresh watcher/handshake and retry refresh "
+                f"({detail})"
+            )
+        else:
+            message = (
+                "refresh handoff was not established; no replacement runtime "
+                "was requested. Check the workdir refresh acknowledgement and "
+                "retry refresh"
+            )
+        result = {"status": "error", "message": message}
+        if isinstance(report, dict):
+            result["mcp"] = report
+        return result
     return {
         "status": "ok",
         "message": t(agent._config.language, "system_tool.refresh_message"),

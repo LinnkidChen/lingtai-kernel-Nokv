@@ -157,3 +157,22 @@ def stop_process(record: StdioProcessRecord, *, timeout: float = 10.0) -> bool:
         if wait_for_process_exit(record, timeout=timeout):
             return True
     return wait_for_process_exit(record, timeout=0)
+def assert_stdio_client_retired(
+    client: Any,
+    record: StdioProcessRecord,
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """Assert one production stdio client retired both thread and child.
+
+    Keeping this paired assertion beside the observer prevents activation,
+    retry, and structured-result tests from drifting into different notions of
+    successful stdio teardown.
+    """
+
+    assert wait_for_thread_exit(getattr(client, "_thread", None), timeout=timeout), (
+        "MCP client thread did not retire"
+    )
+    assert wait_for_process_exit(record, timeout=timeout), (
+        f"MCP stdio child did not retire: pid={record.pid}"
+    )

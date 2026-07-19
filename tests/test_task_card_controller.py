@@ -53,6 +53,22 @@ class _FakeAgent:
         self.wakes: list = []
         self.added_tools: list = []
 
+    def _call_mcp_owned_tool(
+        self,
+        *,
+        route_name,
+        tool_name,
+        tool_args,
+        expected_client=None,
+        timeout=None,
+    ):
+        client = self._mcp_clients_by_tool.get(route_name)
+        if client is None or (
+            expected_client is not None and client is not expected_client
+        ):
+            raise RuntimeError(f"MCP route {route_name!r} is no longer active")
+        return client.call_tool(tool_name, tool_args, timeout=timeout)
+
     def _enqueue_system_notification(self, **kwargs):
         self.wakes.append(kwargs)
         return "notif-id"
@@ -259,6 +275,158 @@ def test_start_without_route_errors(tmp_path):
         {"action": "start", "renderer_path": _write_renderer(tmp_path, _OK_BODY)}
     )
     assert result["status"] == "error"
+
+
+def test_project_never_falls_back_to_private_client_map(agent, controller):
+    """The required leased-call Port is the only reverse-call path."""
+    start = controller.handle({
+        "action": "start",
+        "renderer_path": _write_renderer(agent._working_dir, _OK_BODY),
+        "interval_s": 3600,
+    })
+    watch = controller._watches[start["watch_id"]]
+    calls_before = len(agent._client.calls)
+    agent._call_mcp_owned_tool = None
+
+    result = controller._project(watch, "update", {"title": "T"})
+
+    assert result["status"] == "error"
+    assert len(agent._client.calls) == calls_before
+
+
+def test_real_agent_project_lease_depublishes_before_bounded_close(tmp_path):
+    """Task Card projection leases Telegram across exact MCP retirement."""
+    from types import SimpleNamespace
+
+    from lingtai.agent import Agent
+    from lingtai.kernel.llm.base import FunctionSchema
+    from lingtai.mcp_servers.telegram.task_card.controller import _Watch
+
+    call_started = threading.Event()
+    release_call = threading.Event()
+    close_called = threading.Event()
+
+    class BlockingClient:
+        def __init__(self):
+            self.closed = False
+            self.close_count = 0
+
+        def call_tool(self, name, args, timeout=None):
+            assert name == _TASK_CARD_TOOL
+            assert args["channel"] == "programmable"
+            call_started.set()
+            if not release_call.wait(2.0):
+                raise AssertionError("test did not release leased projection")
+            return {"status": "ok", "message_id": "acct:42:100"}
+
+        def close(self):
+            self.close_count += 1
+            self.closed = True
+            close_called.set()
+
+        def is_connected(self):
+            return not self.closed
+
+    client = BlockingClient()
+    agent = Agent.__new__(Agent)
+    agent._mcp_activation_lock = threading.Lock()
+    agent._mcp_lifecycle_lock = threading.RLock()
+    agent._mcp_call_condition = threading.Condition(agent._mcp_lifecycle_lock)
+    agent._mcp_inflight_calls = {}
+    agent._mcp_clients = [client]
+    agent._mcp_retiring_clients = []
+    agent._mcp_clients_by_tool = {"telegram": client}
+    agent._mcp_tool_names = {"telegram"}
+    agent._mcp_init_specs = {}
+    agent._mcp_inventory_sync_pending = False
+    agent._last_mcp_cleanup_report = None
+    agent._session = SimpleNamespace(chat=None)
+    agent._shutdown = threading.Event()
+    agent._token_decomp_dirty = False
+
+    controller = TaskCardController(agent)
+    agent._task_card_controller = controller
+    telegram_handler = agent._make_mcp_handler(client, "telegram")
+    agent._tool_handlers = {
+        "telegram": telegram_handler,
+        "task_card": controller.handle,
+    }
+    agent._tool_schemas = [
+        FunctionSchema(
+            name="telegram",
+            description="Telegram MCP",
+            parameters={"type": "object", "properties": {}},
+        ),
+        FunctionSchema(
+            name="task_card",
+            description="Task Card",
+            parameters={"type": "object", "properties": {}},
+        ),
+    ]
+
+    depublished = threading.Event()
+    original_depublish = agent._depublish_mcp_clients
+
+    def depublish_and_signal(clients, **kwargs):
+        names = original_depublish(clients, **kwargs)
+        depublished.set()
+        return names
+
+    agent._depublish_mcp_clients = depublish_and_signal
+    watch = _Watch(
+        "tc_lease",
+        tmp_path / "renderer.py",
+        5.0,
+        1.0,
+        "acct",
+        42,
+    )
+    projection = {}
+    retirement = {}
+
+    def project():
+        projection["result"] = controller._project(
+            watch, "update", {"title": "leased"}
+        )
+
+    def retire():
+        retirement["report"] = agent._retire_all_mcp_clients(
+            context="task_card_projection_test",
+            sync_live_inventory=False,
+        )
+
+    projector = threading.Thread(target=project)
+    retiree = threading.Thread(target=retire)
+    projector.start()
+    assert call_started.wait(2.0)
+    retiree.start()
+    assert depublished.wait(2.0)
+
+    # Synchronize after the retirement thread's short depublish section. The
+    # selected call remains leased, so transport close cannot start yet.
+    with agent._mcp_lifecycle_lock:
+        assert "telegram" not in agent._mcp_clients_by_tool
+        assert "telegram" not in agent._tool_handlers
+        assert "task_card" not in agent._tool_handlers
+        assert agent._mcp_clients == []
+        assert agent._mcp_retiring_clients == [client]
+    assert retiree.is_alive()
+    assert not close_called.is_set()
+
+    release_call.set()
+    projector.join(2.0)
+    retiree.join(2.0)
+
+    assert not projector.is_alive()
+    assert not retiree.is_alive()
+    assert projection["result"] == {"status": "ok"}
+    assert close_called.is_set()
+    assert client.close_count == 1
+    assert agent._mcp_inflight_calls == {}
+    assert agent._mcp_retiring_clients == []
+    assert retirement["report"]["transport_converged"] is True
+    assert retirement["report"]["inventory_sync_deferred"] is True
+    assert retirement["report"]["unresolved"] == []
 
 
 

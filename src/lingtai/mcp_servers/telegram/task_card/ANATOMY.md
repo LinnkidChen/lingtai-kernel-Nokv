@@ -69,7 +69,9 @@ data source. Normative promises live in the paired [`CONTRACT.md`](CONTRACT.md).
   controller when a full Agent refresh rebuilds the public tool registries
   (`controller.py:821`).
 - `TelegramTaskCardAgent` — the narrow host Protocol the controller depends on
-  instead of the concrete `Agent` (`interface.py:23`).
+  instead of the concrete `Agent` (`interface.py:25`). Its required
+  `_call_mcp_owned_tool` member is the leased reverse-call boundary that keeps a
+  selected Telegram transport alive across concurrent refresh/stop retirement.
 
 ## Connections
 
@@ -83,9 +85,11 @@ data source. Normative promises live in the paired [`CONTRACT.md`](CONTRACT.md).
   (`src/lingtai/agent.py:1020`, `src/lingtai/agent.py:1121`).
 - Renderer: `_run_renderer` runs `sys.executable <renderer>` with the agent
   workdir as `cwd`; `_validate_renderer_path` confines the path to that workdir.
-- Reverse channel: `_project` calls the private `_lingtai_telegram_task_card`
-  tool with `channel="programmable"` on the `telegram` MCP client from
-  `agent._mcp_clients_by_tool`, consumed by
+- Reverse channel: `_project` asks the host Protocol's
+  `_call_mcp_owned_tool` boundary to lease the published `telegram` route, then
+  calls the private `_lingtai_telegram_task_card` tool with
+  `channel="programmable"`. Refresh/stop can depublish the route immediately
+  but waits for this bounded lease before closing the client. The outcome is consumed by
   `TelegramManager._handle_task_card_update` (`src/lingtai/mcp_servers/telegram/manager.py`).
 - Route: `_resolve_route` reads the programmable controller's turn-local
   `agent._telegram_task_card_context` so its frames resolve to the one tracked

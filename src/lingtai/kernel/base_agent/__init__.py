@@ -404,6 +404,18 @@ class BaseAgent:
         # only once a real launch command exists and before any handshake or
         # shutdown mutation (see kernel/refresh_watcher/CONTRACT.md).
         self._refresh_watcher = refresh_watcher
+        # Refresh handoff and explicit stop share one per-agent coordination
+        # boundary. Transport retirement may wait outside the lock, while the
+        # watcher spawn + shutdown commit is serialized with stop intent.
+        self._refresh_handoff_condition = threading.Condition(threading.RLock())
+        self._refresh_handoff_inflight = False
+        self._refresh_handoff_owner: int | None = None
+        self._refresh_handoff_failure_local = threading.local()
+        self._refresh_spawn_commit_owner: object | None = None
+        self._refresh_spawn_commit_thread: int | None = None
+        self._refresh_stop_started = False
+        self._refresh_handoff_thread: threading.Thread | None = None
+        self._refresh_handoff_thread_start_done: threading.Event | None = None
         self._runtime_identity_event_fields = runtime_identity_event_fields(
             self._source_revision_port
         )
@@ -1999,9 +2011,9 @@ class BaseAgent:
         *,
         skip_chat_history_save: bool = False,
         skip_save_reason: str | None = None,
-    ) -> None:
+    ) -> bool:
         from .lifecycle import _perform_refresh
-        _perform_refresh(
+        return _perform_refresh(
             self,
             skip_chat_history_save=skip_chat_history_save,
             skip_save_reason=skip_save_reason,
@@ -2076,9 +2088,10 @@ class BaseAgent:
         description: str = "",
         system_prompt: str = "",
         glossary_package: str | None = None,
+        _allow_sealed: bool = False,
     ) -> None:
         from .tools import _add_tool
-        _add_tool(self, name, schema=schema, handler=handler, description=description, system_prompt=system_prompt, glossary_package=glossary_package)
+        _add_tool(self, name, schema=schema, handler=handler, description=description, system_prompt=system_prompt, glossary_package=glossary_package, _allow_sealed=_allow_sealed)
 
     def remove_tool(self, name: str) -> None:
         from .tools import _remove_tool

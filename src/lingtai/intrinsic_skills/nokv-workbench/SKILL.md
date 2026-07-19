@@ -31,7 +31,7 @@ manual.
 Register the MCP with a per-agent `mcp_registry.jsonl` line like:
 
 ```json
-{"name":"nokv-workbench","summary":"NoKV-controlled workbench artifact namespace.","transport":"stdio","command":"/path/to/nokv","args":["--server-bind","127.0.0.1:7777","--object-backend","rustfs","--s3-bucket","nokv-lingtai-workbench","mcp","--profile","workbench","--workbench-root","/agents/{agent_id}/wb"],"source":"local-nokv"}
+{"name":"nokv-workbench","summary":"NoKV-controlled workbench artifact namespace.","transport":"stdio","command":"/path/to/nokv","args":["--server-bind","127.0.0.1:7777","--object-backend","rustfs","--s3-bucket","nokv-lingtai-workbench","mcp","--profile","workbench","--workbench-root","/agents/{agent_id}/wb"],"template_arg_indices":[10],"source":"local-nokv"}
 ```
 
 Activate it from `init.json`:
@@ -42,7 +42,8 @@ Activate it from `init.json`:
     "nokv-workbench": {
       "type": "stdio",
       "command": "/path/to/nokv",
-      "args": ["--server-bind", "127.0.0.1:7777", "--object-backend", "rustfs", "--s3-bucket", "nokv-lingtai-workbench", "mcp", "--profile", "workbench", "--workbench-root", "/agents/{agent_id}/wb"]
+      "args": ["--server-bind", "127.0.0.1:7777", "--object-backend", "rustfs", "--s3-bucket", "nokv-lingtai-workbench", "mcp", "--profile", "workbench", "--workbench-root", "/agents/{agent_id}/wb"],
+      "template_arg_indices": [10]
     }
   }
 }
@@ -74,6 +75,14 @@ Record the resolved owner in each run manifest (for example, `"owner": "scout"`
 for agent `scout`) so provenance is explicit. Do not expect placeholders to expand
 inside committed run manifests; the committed `run_manifest.json` also embeds the
 full `workbench_path`, which already contains the owning agent id.
+
+`template_arg_indices` is a zero-based allow-list for argument placeholder
+expansion. Keep it identical in the registry record and `init.json`. A missing
+field preserves the legacy expand-every-argument behavior; `[]` makes every
+argument literal. NoKV launchers must select only the value following
+`--workbench-root`. In particular, workspace ids, actor ids, and encoded grants
+are opaque values and must never be selected even when their bytes contain a
+supported placeholder token.
 
 The MCP tools are intentionally prefixed with `workbench_` so they do not replace
 LingTai's local `read`, `write`, `edit`, `grep`, or `glob` tools.

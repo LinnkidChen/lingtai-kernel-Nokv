@@ -196,6 +196,10 @@
   //    which env vars). Activation is gated by registry membership,
   //    so a name in `mcp:` without a matching `addons:` entry would
   //    be skipped with a warning.
+  //    A stdio entry may set "template_arg_indices": [i, ...] to expand
+  //    supported per-agent placeholders only in those zero-based args. A
+  //    missing field keeps legacy expand-all behavior; [] keeps all args
+  //    literal. Keep opaque identities, capabilities, and secrets unselected.
   //
   // Default for new agents (auto-populated by the TUI wizard):
   //

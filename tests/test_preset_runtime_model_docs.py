@@ -21,6 +21,9 @@ RESIDENT_SUBSTRATE = ROOT / "src/lingtai/prompts/substrate/substrate.md"
 RESIDENT_PROCEDURES = ROOT / "src/lingtai/prompts/procedures/procedures.md"
 DAEMON_MANUAL = ROOT / "src/lingtai/tools/daemon/manual/SKILL.md"
 WRAPPER_ANATOMY = ROOT / "src/lingtai/ANATOMY.md"
+TOOLS_ANATOMY = ROOT / "src/lingtai/tools/ANATOMY.md"
+SYSTEM_ANATOMY = ROOT / "src/lingtai/tools/system/ANATOMY.md"
+SYSTEM_CONTRACT = ROOT / "src/lingtai/tools/system/CONTRACT.md"
 INIT_SCHEMA = ROOT / "src/lingtai/init_schema.py"
 KERNEL_PROMPT = ROOT / "src/lingtai/kernel/prompt.py"
 
@@ -190,15 +193,21 @@ STALE_WRAPPER_ANATOMY_ANCHORS = [
     "`_activate_preset` :915",
     "`agent._read_init` :1071",
     "`cli.load_init` :50",
-]
-
-CURRENT_WRAPPER_ANATOMY_ANCHORS = [
-    "`_read_init` :1169",
+    "`_read_init` :1192",
     "`_activate_preset` :1261",
     "`_reload_prompt_sections` :1602",
     "`_setup_from_init` :1338",
     "`agent._read_init` :1224",
     "`cli.load_init` :62",
+]
+
+CURRENT_WRAPPER_ANATOMY_ANCHORS = [
+    "`_read_init` :1770",
+    "`_activate_preset` :1813",
+    "`_reload_prompt_sections` :2157",
+    "`_setup_from_init` :1891",
+    "`Agent._read_init` :1770",
+    "`cli.load_init` :29",
 ]
 
 
@@ -234,6 +243,32 @@ def test_substrate_reference_links_back_to_wrapper_anatomy():
     text = _read(SUBSTRATE_REFERENCE)
     assert "src/lingtai/ANATOMY.md" in text
     assert "cross-check" in text.lower() or "re-check" in text.lower()
+
+
+def test_system_refresh_contract_anatomy_and_manual_are_bidirectionally_linked():
+    contract = _read(SYSTEM_CONTRACT)
+    anatomy = _read(SYSTEM_ANATOMY)
+    parent = _read(TOOLS_ANATOMY)
+    manual = _read(SUBSTRATE_REFERENCE)
+
+    assert "src/lingtai/tools/system/ANATOMY.md" in contract
+    assert "src/lingtai/tools/system/CONTRACT.md" in anatomy
+    assert "src/lingtai/tools/system/ANATOMY.md" in parent
+    for text in (contract, anatomy):
+        assert (
+            "src/lingtai/intrinsic_skills/system-manual/reference/"
+            "substrate-manual/SKILL.md"
+        ) in text
+    assert "src/lingtai/tools/system/CONTRACT.md" in manual
+    assert "src/lingtai/tools/system/ANATOMY.md" in manual
+
+
+def test_substrate_reference_documents_fail_closed_mcp_refresh_prerequisite():
+    text = _read(SUBSTRATE_REFERENCE).lower()
+    assert "best-effort retries failed mcps" not in text
+    assert "actionable" in text and "error" in text
+    assert "active/pending mcp retirement" in text
+    assert "does **not** request deferred relaunch" in text
 
 
 # ---------------------------------------------------------------------------

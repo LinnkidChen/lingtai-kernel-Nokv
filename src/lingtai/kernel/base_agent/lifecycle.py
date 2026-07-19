@@ -37,6 +37,135 @@ _FP_KEY_FILES: list[str] = [
 ]
 
 
+# Signal-file refresh work may wait for bounded MCP lease/transport cleanup.
+# Keep that work off the sole heartbeat writer while serializing one worker per
+# agent. The lock protects only lazy worker publication/clearing, never cleanup.
+_REFRESH_HANDOFF_THREAD_LOCK = threading.Lock()
+
+
+def _best_effort_agent_log(agent, event: str, **fields) -> None:
+    """Keep lifecycle outcome semantics independent of telemetry failure."""
+    try:
+        agent._log(event, **fields)
+    except Exception:
+        pass
+
+
+def _refresh_handoff_condition(agent) -> threading.Condition:
+    """Return the per-agent refresh/stop coordination condition.
+
+    BaseAgent initializes this eagerly. The guarded fallback keeps focused
+    lifecycle fakes and older composed wrappers compatible without weakening
+    the production single-flight boundary.
+    """
+    condition = getattr(agent, "_refresh_handoff_condition", None)
+    if condition is not None:
+        return condition
+    with _REFRESH_HANDOFF_THREAD_LOCK:
+        condition = getattr(agent, "_refresh_handoff_condition", None)
+        if condition is None:
+            condition = threading.Condition(threading.RLock())
+            agent._refresh_handoff_condition = condition
+            agent._refresh_handoff_inflight = False
+            agent._refresh_handoff_owner = None
+            agent._refresh_spawn_commit_owner = None
+            agent._refresh_spawn_commit_thread = None
+            agent._refresh_stop_started = False
+    return condition
+
+
+def _refresh_handoff_failure_local(agent) -> threading.local:
+    """Return per-caller failure storage without sharing race diagnostics."""
+    local = getattr(agent, "_refresh_handoff_failure_local", None)
+    if local is not None:
+        return local
+    with _REFRESH_HANDOFF_THREAD_LOCK:
+        local = getattr(agent, "_refresh_handoff_failure_local", None)
+        if local is None:
+            local = threading.local()
+            agent._refresh_handoff_failure_local = local
+    return local
+
+
+def _get_refresh_handoff_failure(agent):
+    """Read this caller's handoff failure, falling back for legacy fakes."""
+    local = getattr(agent, "_refresh_handoff_failure_local", None)
+    if local is not None and hasattr(local, "failure"):
+        return local.failure
+    return getattr(agent, "_last_refresh_handoff_failure", None)
+
+
+def _begin_refresh_handoff(agent, *, context: str) -> bool:
+    """Admit exactly one handoff unless explicit stop already owns the agent."""
+    condition = _refresh_handoff_condition(agent)
+    shutdown = getattr(agent, "_shutdown", None)
+    rejection_event = None
+    with condition:
+        if bool(getattr(agent, "_refresh_stop_started", False)) or bool(
+            shutdown is not None and shutdown.is_set()
+        ):
+            rejection_event = "refresh_handoff_cancelled_shutdown"
+        elif bool(getattr(agent, "_refresh_handoff_inflight", False)):
+            rejection_event = "refresh_handoff_already_inflight"
+        else:
+            agent._refresh_handoff_inflight = True
+            agent._refresh_handoff_owner = threading.get_ident()
+    if rejection_event is None:
+        return True
+    _best_effort_agent_log(agent, rejection_event, context=context)
+    return False
+
+
+def _finish_refresh_handoff(agent) -> None:
+    """Release one admitted handoff and wake a bounded stop waiter."""
+    condition = _refresh_handoff_condition(agent)
+    with condition:
+        if getattr(agent, "_refresh_handoff_owner", None) == threading.get_ident():
+            agent._refresh_handoff_inflight = False
+            agent._refresh_handoff_owner = None
+            condition.notify_all()
+
+
+def _mark_refresh_stop_started(agent) -> None:
+    """Linearize explicit stop against watcher spawn and signal shutdown."""
+    condition = _refresh_handoff_condition(agent)
+    with condition:
+        agent._refresh_stop_started = True
+        shutdown = getattr(agent, "_shutdown", None)
+        if shutdown is not None:
+            shutdown.set()
+        condition.notify_all()
+
+
+def _wait_for_refresh_handoff_stop(agent, *, timeout: float) -> bool:
+    """Boundedly wait until admitted and signal-worker handoffs have exited."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    condition = _refresh_handoff_condition(agent)
+    wait_failed = False
+    with condition:
+        while bool(getattr(agent, "_refresh_handoff_inflight", False)) or (
+            getattr(agent, "_refresh_spawn_commit_owner", None) is not None
+        ):
+            current_thread = threading.get_ident()
+            if (
+                getattr(agent, "_refresh_handoff_owner", None) == current_thread
+                or getattr(agent, "_refresh_spawn_commit_thread", None)
+                == current_thread
+            ):
+                wait_failed = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                wait_failed = True
+                break
+            condition.wait(remaining)
+
+    if wait_failed:
+        return False
+    remaining = max(0.0, deadline - time.monotonic())
+    return _join_refresh_handoff_thread(agent, timeout=remaining)
+
+
 def _capture_runtime_fingerprint(
     source_revision_port: SourceRevisionPort,
 ) -> dict:
@@ -261,13 +390,18 @@ def _stop(agent, timeout: float = 5.0) -> None:
     """
     agent._log("agent_stop")
     agent._cancel_soul_timer()
-    agent._shutdown.set()
+    _mark_refresh_stop_started(agent)
     # Wake a run loop blocked in inbox.get; its post-dequeue shutdown check
     # consumes this sentinel without dispatching a turn.
     inbox = getattr(agent, "inbox", None)
     if inbox is not None:
         from ..message import _make_message, MSG_TC_WAKE
         inbox.put(_make_message(MSG_TC_WAKE, "system", ""))
+    if not _wait_for_refresh_handoff_stop(agent, timeout=timeout):
+        raise RuntimeError(
+            "refresh handoff remains in flight during stop; retry stop after "
+            "the bounded MCP retirement finishes"
+        )
     # Stop any programmable Task Card watcher threads deterministically. The
     # loops also observe ``_shutdown`` (daemon threads), but this joins and
     # clears them without any filesystem deletion (Jason #7258/#7259).
@@ -402,19 +536,18 @@ def _heartbeat_loop(agent) -> None:
         # .refresh = full refresh with relaunch (identical to system(action='refresh'))
         refresh_file = agent._working_dir / ".refresh"
         if refresh_file.is_file():
-            taken_file = agent._working_dir / ".refresh.taken"
+            # Keep the source signal in place until every optional MCP
+            # reconciliation/retirement prerequisite and the watcher ACK have
+            # converged.  `_perform_refresh` owns the eventual
+            # `.refresh` -> `.refresh.taken` transition, so a failed attempt is
+            # naturally retried on a later heartbeat rather than being lost.
             try:
-                refresh_file.rename(taken_file)
-            except OSError:
-                pass
-            # Delegate to _perform_refresh which handles the full flow:
-            # save chat history, spawn watcher process, deferred relaunch.
-            _perform_refresh(agent)
-            # Signal shutdown so the heartbeat loop exits and the watcher
-            # can detect the lock release.  The _shutdown gate above
-            # prevents the heartbeat from reprocessing .refresh on the
-            # next tick.
-            agent._shutdown.set()
+                _start_signal_refresh_handoff(agent)
+            except Exception as exc:
+                agent._log(
+                    "refresh_signal_worker_start_failed",
+                    error=(str(exc) or repr(exc))[:300],
+                )
 
         # .suspend = SUSPENDED (full process death, external only)
         suspend_file = agent._working_dir / ".suspend"
@@ -690,26 +823,80 @@ def _write_heartbeat_tick(agent) -> None:
         pass
 
 
+def _establish_refresh_handshake(
+    refresh_path: Path,
+    taken_path: Path,
+) -> str:
+    """Establish the watcher ACK while the refresh/stop commit lock is held."""
+    if taken_path.exists():
+        source = "preexisting_taken"
+    elif refresh_path.exists():
+        try:
+            refresh_path.rename(taken_path)
+            source = "renamed_refresh"
+        except OSError:
+            try:
+                taken_path.touch()
+                source = "synthesized_after_rename_failed"
+            except OSError:
+                source = "ack_write_failed"
+    else:
+        try:
+            taken_path.touch()
+            source = "synthesized_direct_call"
+        except OSError:
+            source = "ack_write_failed"
+
+    return source
+
+
+def _rollback_refresh_handshake(
+    agent,
+    refresh_path: Path,
+    taken_path: Path,
+) -> None:
+    """Turn a failed watcher ACK back into one durable retry signal."""
+    try:
+        if refresh_path.exists():
+            taken_path.unlink(missing_ok=True)
+        elif taken_path.exists():
+            taken_path.rename(refresh_path)
+        else:
+            refresh_path.touch()
+    except OSError as exc:
+        _best_effort_agent_log(
+            agent,
+            "refresh_handshake_rollback_failed",
+            error=(str(exc) or repr(exc))[:300],
+        )
+
+
 def _perform_refresh(
     agent,
     *,
     skip_chat_history_save: bool = False,
     skip_save_reason: str | None = None,
-) -> None:
+) -> bool:
     """Refresh = .refresh handshake + deferred relaunch.
 
-    Self-sufficient across all call sites — heartbeat, tool-call (intrinsic
-    ``system(action='refresh')``), and AED preset-fallback in ``turn.py`` all
-    call directly. Two filesystem signals drive the watcher subprocess:
+    This is the final ACK/watcher commit step. Production heartbeat,
+    ``system(action='refresh')``, AED fallback, worker recovery, and stop-aware
+    callers first route through ``_request_refresh_handoff``, which owns the
+    single-flight admission plus MCP retry and exact-retirement prerequisites.
+    Once admitted, this helper reserves the watcher commit against explicit
+    stop before changing either protocol file. Two filesystem signals drive
+    the watcher subprocess:
 
       1. ``.refresh.taken`` must exist before the watcher's ack deadline.
       2. ``.agent.lock`` must clear before the watcher's lock deadline.
 
-    The heartbeat path renames ``.refresh`` → ``.refresh.taken`` before
-    invoking us and sets ``agent._shutdown`` immediately after. Direct
-    callers do neither — so we normalize the handshake here and then set
-    ``_shutdown`` / ``_cancel_event`` ourselves so the watcher's second
-    phase can complete.
+    The heartbeat path leaves ``.refresh`` in place until the owning handoff
+    transaction's prerequisites converge; direct test callers may have neither
+    signal file. We normalize the handshake here and then set ``_shutdown`` /
+    ``_cancel_event`` ourselves so the watcher's second phase can complete.
+    Returns ``True`` only after the detached watcher has been requested and
+    the shutdown signals have been set; returns ``False`` when no launch
+    command exists or the on-disk acknowledgement cannot be established.
     """
     # When the worker interface is poisoned, the in-memory ChatInterface may
     # still be mutated by a stuck worker thread — saving it would serialize
@@ -737,7 +924,7 @@ def _perform_refresh(
     cmd = agent._build_launch_cmd()
     if cmd is None:
         agent._log("refresh_no_launch_cmd")
-        return
+        return False
 
     # A real launch command means this refresh will actually spawn a watcher.
     # Fail loudly here, before any handshake or shutdown mutation, if the
@@ -756,49 +943,6 @@ def _perform_refresh(
     working_dir = agent._working_dir
     refresh_path = working_dir / ".refresh"
     taken_path_obj = working_dir / ".refresh.taken"
-    # Handshake normalization — make the on-disk state look the same
-    # regardless of caller. The watcher polls for `.refresh.taken`; we
-    # guarantee it exists before spawning the watcher, then remove any
-    # remaining `.refresh` so the heartbeat doesn't fire a duplicate
-    # watcher on its next tick.
-    handshake_source = None
-    if taken_path_obj.exists():
-        handshake_source = "preexisting_taken"
-    elif refresh_path.exists():
-        try:
-            refresh_path.rename(taken_path_obj)
-            handshake_source = "renamed_refresh"
-        except OSError:
-            # Rename failed (e.g. cross-device, race). Fall back to a
-            # synthesized ack so the watcher can still proceed.
-            try:
-                taken_path_obj.touch()
-                handshake_source = "synthesized_after_rename_failed"
-            except OSError:
-                handshake_source = "ack_write_failed"
-    else:
-        try:
-            taken_path_obj.touch()
-            handshake_source = "synthesized_direct_call"
-        except OSError:
-            handshake_source = "ack_write_failed"
-    if not taken_path_obj.exists():
-        # Do not spawn a watcher or shut the agent down unless the ack
-        # invariant is actually established. Otherwise an unusual
-        # filesystem failure could turn a failed refresh into a dead
-        # agent with no relaunch. If .refresh still exists, leave it for
-        # the heartbeat path or a later retry rather than consuming it.
-        agent._log("refresh_ack_failed", handshake=handshake_source)
-        return
-
-    # If both files happen to exist (heartbeat renamed but a later
-    # consumer rewrote .refresh), remove the stale .refresh so the
-    # heartbeat does not spawn a second watcher.
-    try:
-        refresh_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
     taken_path = str(taken_path_obj)
     lock_path = str(working_dir / ".agent.lock")
     events_path = str(working_dir / "logs" / "events.jsonl")
@@ -824,29 +968,402 @@ def _perform_refresh(
         address=address,
         identity_fields_json=identity_fields_json,
     )
-    agent._refresh_watcher.spawn_detached(request)
-    agent._log("refresh_deferred_relaunch",
-               cmd=cmd[0], handshake=handshake_source)
-    # Lock-clear signaling — direct callers (intrinsic system tool call,
-    # AED preset fallback) reach this function without going through the
-    # heartbeat's `_shutdown.set()` step at lifecycle.py:212. Without
-    # `_shutdown` set the run loop never exits and `.agent.lock` never
-    # releases, so the watcher times out at phase='lock'. Setting these
-    # events here makes the watcher's second phase complete uniformly
-    # regardless of caller; the heartbeat path's redundant `_shutdown.set()`
-    # is idempotent.
-    cancel_event = getattr(agent, "_cancel_event", None)
-    if cancel_event is not None:
+    # Reserve the watcher commit relative to explicit stop, then perform the
+    # external Port call without holding the condition. This keeps stop's mark
+    # step promptly acquirable: a stalled OS spawn remains an observable,
+    # bounded handoff wait instead of blocking before stop's timeout begins.
+    condition = _refresh_handoff_condition(agent)
+    commit_owner = object()
+    reservation_rejection = None
+    with condition:
+        shutdown_event = getattr(agent, "_shutdown", None)
+        if bool(getattr(agent, "_refresh_stop_started", False)) or bool(
+            shutdown_event is not None and shutdown_event.is_set()
+        ):
+            reservation_rejection = "refresh_spawn_cancelled_stop"
+        elif getattr(agent, "_refresh_spawn_commit_owner", None) is not None:
+            reservation_rejection = "refresh_spawn_already_committing"
+        else:
+            agent._refresh_spawn_commit_owner = commit_owner
+            agent._refresh_spawn_commit_thread = threading.get_ident()
+    if reservation_rejection is not None:
+        _best_effort_agent_log(agent, reservation_rejection)
+        return False
+
+    try:
+        # Reservation is the linearization point: stop that won earlier leaves
+        # the source signal untouched; stop that begins now boundedly waits for
+        # this already-committed spawn attempt.
+        handshake_source = _establish_refresh_handshake(
+            refresh_path, taken_path_obj
+        )
+        if not taken_path_obj.exists():
+            _best_effort_agent_log(
+                agent, "refresh_ack_failed", handshake=handshake_source
+            )
+            return False
+        if refresh_path.exists():
+            try:
+                refresh_path.unlink()
+            except OSError as exc:
+                _rollback_refresh_handshake(
+                    agent,
+                    refresh_path,
+                    taken_path_obj,
+                )
+                _best_effort_agent_log(
+                    agent,
+                    "refresh_source_signal_clear_failed",
+                    error=(str(exc) or repr(exc))[:300],
+                )
+                return False
         try:
-            cancel_event.set()
-        except Exception:
-            pass
-    shutdown_event = getattr(agent, "_shutdown", None)
-    if shutdown_event is not None:
+            agent._refresh_watcher.spawn_detached(request)
+        except BaseException:
+            _rollback_refresh_handshake(
+                agent,
+                refresh_path,
+                taken_path_obj,
+            )
+            raise
+
+        with condition:
+            if getattr(agent, "_refresh_spawn_commit_owner", None) is not commit_owner:
+                _rollback_refresh_handshake(
+                    agent,
+                    refresh_path,
+                    taken_path_obj,
+                )
+                raise RuntimeError("refresh spawn commit ownership changed")
+            # Lock-clear signaling is owned here, after the detached handoff
+            # succeeds. A stop that began after reservation may already have
+            # set shutdown; setting both events again is intentionally safe.
+            cancel_event = getattr(agent, "_cancel_event", None)
+            if cancel_event is not None:
+                try:
+                    cancel_event.set()
+                except Exception:
+                    pass
+            if shutdown_event is not None:
+                try:
+                    shutdown_event.set()
+                except Exception:
+                    pass
+        _best_effort_agent_log(
+            agent,
+            "refresh_deferred_relaunch",
+            cmd=cmd[0],
+            handshake=handshake_source,
+        )
+        return True
+    finally:
+        with condition:
+            if getattr(agent, "_refresh_spawn_commit_owner", None) is commit_owner:
+                agent._refresh_spawn_commit_owner = None
+                agent._refresh_spawn_commit_thread = None
+                condition.notify_all()
+
+
+def _request_refresh_handoff(
+    agent,
+    *,
+    context: str,
+    skip_chat_history_save: bool = False,
+    skip_save_reason: str | None = None,
+    reconcile_failed_mcps: bool = True,
+    sync_live_inventory: bool = True,
+    retain_signal_on_failure: bool = False,
+    create_signal_on_prerequisite_failure: bool = False,
+) -> bool:
+    """Request one refresh only after optional MCP ownership converges.
+
+    ``Agent`` supplies the MCP hooks while a raw ``BaseAgent`` does not. Each
+    non-system caller uses this helper so no
+    watcher/shutdown handoff starts while an MCP retry or retirement remains
+    unresolved. An explicit ``True`` from ``_perform_refresh`` is the sole
+    success acknowledgement; every other outcome leaves the caller retryable.
+    """
+    failure_local = _refresh_handoff_failure_local(agent)
+    failure_local.failure = None
+    owns_handoff = False
+
+    # A stuck worker may still mutate the ChatInterface. Never retry/publish a
+    # candidate or sync live tool inventory through that poisoned object.
+    if bool(getattr(agent, "_llm_worker_interface_poisoned", False)):
+        reconcile_failed_mcps = False
+        sync_live_inventory = False
+
+    retry = getattr(agent, "_retry_failed_mcps", None)
+    retire = getattr(agent, "_retire_all_mcp_clients", None)
+    shutdown = getattr(agent, "_shutdown", None)
+
+    def _set_failure(phase: str, **fields) -> None:
+        failure = {"phase": phase, **fields}
+        failure_local.failure = failure
+        # Shared state remains useful as last-owner diagnostics, but a rejected
+        # concurrent caller must never overwrite the admitted caller's report.
+        if owns_handoff:
+            agent._last_refresh_handoff_failure = failure
+
+    def _shutdown_started() -> bool:
+        return bool(shutdown is not None and shutdown.is_set())
+
+    if not _begin_refresh_handoff(agent, context=context):
+        phase = "shutdown" if _shutdown_started() else "handoff_inflight"
+        _set_failure(phase)
+        return False
+    owns_handoff = True
+    agent._last_refresh_handoff_failure = None
+
+    def _retain_retry_signal() -> None:
+        if retain_signal_on_failure and not _shutdown_started():
+            _restore_refresh_signal_for_retry(agent, create_if_missing=True)
+
+    try:
+        if _shutdown_started():
+            _set_failure("shutdown")
+            _best_effort_agent_log(
+                agent, "refresh_handoff_cancelled_shutdown", context=context
+            )
+            return False
+
+        # MCP retry is a system-refresh precondition, not part of the
+        # filesystem handoff. Failure here must not call `_perform_refresh`
+        # (which can establish `.refresh.taken`) or synthesize a signal that a
+        # heartbeat refresh would consume without repeating this gate.
+        if reconcile_failed_mcps and callable(retry):
+            try:
+                report = retry()
+            except Exception as exc:
+                error = (str(exc) or repr(exc))[:300]
+                _set_failure("mcp_retry_exception", error=error)
+                if create_signal_on_prerequisite_failure:
+                    _retain_retry_signal()
+                _best_effort_agent_log(
+                    agent,
+                    "refresh_mcp_retry_failed",
+                    context=context,
+                    error=error,
+                )
+                return False
+            if (
+                not isinstance(report, dict)
+                or report.get("converged") is not True
+                or bool(report.get("still_failed"))
+                or bool(report.get("unresolved"))
+            ):
+                _set_failure("mcp_retry_unresolved", report=report)
+                if create_signal_on_prerequisite_failure:
+                    _retain_retry_signal()
+                _best_effort_agent_log(
+                    agent,
+                    "refresh_mcp_retry_unresolved",
+                    context=context,
+                    report=report,
+                )
+                return False
+
+        if _shutdown_started():
+            _set_failure("shutdown")
+            _best_effort_agent_log(
+                agent, "refresh_handoff_cancelled_shutdown", context=context
+            )
+            return False
+
+        # Exact MCP retirement is a hard precondition of `_perform_refresh`.
+        # A failure here must not establish ACK/request/deferred signal state;
+        # system callers return an actionable error and retry the whole gate.
+        if callable(retire):
+            try:
+                retire_kwargs = {"context": context}
+                if not sync_live_inventory:
+                    retire_kwargs["sync_live_inventory"] = False
+                cleanup = retire(**retire_kwargs)
+            except Exception as exc:
+                error = (str(exc) or repr(exc))[:300]
+                _set_failure("mcp_retirement_exception", error=error)
+                if create_signal_on_prerequisite_failure:
+                    _retain_retry_signal()
+                _best_effort_agent_log(
+                    agent,
+                    "refresh_mcp_retirement_failed",
+                    context=context,
+                    error=error,
+                )
+                return False
+            cleanup_converged = (
+                cleanup.get("transport_converged") is True
+                if isinstance(cleanup, dict) and not sync_live_inventory
+                else isinstance(cleanup, dict) and cleanup.get("converged") is True
+            )
+            if (
+                not cleanup_converged
+                or not isinstance(cleanup, dict)
+                or bool(cleanup.get("unresolved"))
+            ):
+                _set_failure("mcp_retirement_unresolved", report=cleanup)
+                if create_signal_on_prerequisite_failure:
+                    _retain_retry_signal()
+                _best_effort_agent_log(
+                    agent,
+                    "refresh_mcp_retirement_unresolved",
+                    context=context,
+                    report=cleanup,
+                )
+                return False
+
+        if _shutdown_started():
+            _set_failure("shutdown")
+            _best_effort_agent_log(
+                agent, "refresh_handoff_cancelled_shutdown", context=context
+            )
+            return False
+
+        perform_kwargs = {}
+        if skip_chat_history_save:
+            perform_kwargs["skip_chat_history_save"] = True
+        if skip_save_reason is not None:
+            perform_kwargs["skip_save_reason"] = skip_save_reason
         try:
-            shutdown_event.set()
-        except Exception:
-            pass
+            requested = agent._perform_refresh(**perform_kwargs)
+        except Exception as exc:
+            error = (str(exc) or repr(exc))[:300]
+            _set_failure("handoff_exception", error=error)
+            _retain_retry_signal()
+            _best_effort_agent_log(
+                agent,
+                "refresh_handoff_failed",
+                context=context,
+                error=error,
+            )
+            return False
+        if requested is not True:
+            if _get_refresh_handoff_failure(agent) is None:
+                _set_failure("handoff_not_established")
+            _retain_retry_signal()
+            _best_effort_agent_log(
+                agent, "refresh_handoff_not_established", context=context
+            )
+            return False
+        return True
+    finally:
+        _finish_refresh_handoff(agent)
+
+
+def _restore_refresh_signal_for_retry(
+    agent,
+    *,
+    create_if_missing: bool = False,
+) -> bool:
+    """Restore a consumed ACK to the source signal after a failed handoff."""
+    refresh_path = agent._working_dir / ".refresh"
+    if refresh_path.exists():
+        return True
+    taken_path = agent._working_dir / ".refresh.taken"
+    if not taken_path.exists():
+        if not create_if_missing:
+            _best_effort_agent_log(agent, "refresh_signal_retry_missing")
+            return False
+        try:
+            refresh_path.touch()
+        except OSError as exc:
+            _best_effort_agent_log(
+                agent,
+                "refresh_signal_retry_create_failed",
+                error=(str(exc) or repr(exc))[:300],
+            )
+            return False
+        _best_effort_agent_log(agent, "refresh_signal_retry_created")
+        return True
+    try:
+        taken_path.rename(refresh_path)
+    except OSError as exc:
+        _best_effort_agent_log(
+            agent,
+            "refresh_signal_retry_restore_failed",
+            error=(str(exc) or repr(exc))[:300],
+        )
+        return False
+    return True
+
+
+def _run_signal_refresh_handoff(agent) -> None:
+    """Background single-flight for one heartbeat-detected refresh signal."""
+    current = threading.current_thread()
+    try:
+        requested = _request_refresh_handoff(
+            agent,
+            context="heartbeat_refresh",
+            # A replacement boot will load current config. Signal refresh only
+            # needs old runtime resources to converge; starting a candidate
+            # here would mutate the live ChatInterface from this worker thread.
+            reconcile_failed_mcps=False,
+            sync_live_inventory=False,
+            retain_signal_on_failure=True,
+        )
+        if requested is not True:
+            _best_effort_agent_log(
+                agent,
+                "refresh_signal_retry_retained",
+                source="signal_file",
+            )
+    finally:
+        with _REFRESH_HANDOFF_THREAD_LOCK:
+            if getattr(agent, "_refresh_handoff_thread", None) is current:
+                agent._refresh_handoff_thread = None
+                agent._refresh_handoff_thread_start_done = None
+
+
+def _start_signal_refresh_handoff(agent) -> bool:
+    """Start at most one signal-refresh worker without pausing heartbeat."""
+    start_done = threading.Event()
+    with _REFRESH_HANDOFF_THREAD_LOCK:
+        existing = getattr(agent, "_refresh_handoff_thread", None)
+        if existing is not None:
+            return False
+        worker = threading.Thread(
+            target=_run_signal_refresh_handoff,
+            args=(agent,),
+            daemon=True,
+            name=f"refresh-handoff-{agent.agent_name or agent._working_dir.name}",
+        )
+        agent._refresh_handoff_thread = worker
+        agent._refresh_handoff_thread_start_done = start_done
+    try:
+        worker.start()
+    except Exception:
+        with _REFRESH_HANDOFF_THREAD_LOCK:
+            if getattr(agent, "_refresh_handoff_thread", None) is worker:
+                agent._refresh_handoff_thread = None
+                agent._refresh_handoff_thread_start_done = None
+        raise
+    finally:
+        start_done.set()
+    return True
+
+
+def _join_refresh_handoff_thread(agent, *, timeout: float) -> bool:
+    """Return only after the signal-refresh worker has provably exited."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _REFRESH_HANDOFF_THREAD_LOCK:
+        worker = getattr(agent, "_refresh_handoff_thread", None)
+        start_done = getattr(agent, "_refresh_handoff_thread_start_done", None)
+    if worker is None or worker is threading.current_thread():
+        return True
+    if start_done is not None:
+        if not start_done.wait(max(0.0, deadline - time.monotonic())):
+            return False
+    with _REFRESH_HANDOFF_THREAD_LOCK:
+        if getattr(agent, "_refresh_handoff_thread", None) is not worker:
+            return True
+    worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        return False
+    with _REFRESH_HANDOFF_THREAD_LOCK:
+        if getattr(agent, "_refresh_handoff_thread", None) is worker:
+            agent._refresh_handoff_thread = None
+            agent._refresh_handoff_thread_start_done = None
+    return True
 
 
 def _can_fallback_preset(agent) -> bool:

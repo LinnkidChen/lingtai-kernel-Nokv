@@ -138,10 +138,19 @@ def test_materialize_no_preset_field_unchanged(tmp_path):
     assert data["manifest"]["llm"]["provider"] == "deepseek"  # original
 
 
-def test_refresh_preset_thinking_reaches_session_path(tmp_path):
+def test_refresh_preset_thinking_reaches_session_path(tmp_path, monkeypatch):
     from unittest.mock import MagicMock
     from lingtai.agent import Agent
     from lingtai.kernel.config import AgentConfig
+
+    tui = tmp_path / "tui"
+    tui.mkdir()
+    (tui / "codex-auth.json").write_text(json.dumps({
+        "access_token": "fake-access",
+        "refresh_token": "fake-refresh",
+        "expires_at": 4102444800,
+    }))
+    monkeypatch.setenv("LINGTAI_TUI_DIR", str(tui))
 
     plib = _make_preset_lib(tmp_path, {
         "codex": {
@@ -736,11 +745,14 @@ def test_refresh_preset_omitting_mcp_keeps_channel_reply_surface(tmp_path, monke
     )
 
     class FakeClient:
+        def __init__(self):
+            self.connected = True
+
         def close(self):
-            pass
+            self.connected = False
 
         def is_connected(self):
-            return True
+            return self.connected
 
     def fake_connect_mcp(self, command, args=None, env=None):
         self.add_tool("telegram", schema={}, handler=lambda _args: {"status": "ok"})

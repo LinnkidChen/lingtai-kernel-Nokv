@@ -1,11 +1,12 @@
 """Tests for `_perform_refresh` filesystem handshake and lifecycle signaling.
 
-Three call sites reach `_perform_refresh` directly:
+Three refresh paths reach the same handoff implementation:
 
-  1. Heartbeat — has already renamed `.refresh` → `.refresh.taken` and
-     intends to call `_shutdown.set()` immediately after our return.
+  1. Heartbeat — keeps `.refresh` retryable while MCP prerequisites or the
+     watcher acknowledgement remain unresolved.
   2. `system(action='refresh')` intrinsic — has done neither.
-  3. AED preset-fallback in `turn.py` — has done neither.
+  3. Worker-hang recovery — skips the poisoned chat-history save and latches
+     its one-shot request only after an explicit successful handoff.
 
 `_perform_refresh` therefore normalizes the on-disk handshake itself
 (making `.refresh.taken` present and clearing `.refresh`) and signals
@@ -26,6 +27,8 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -75,9 +78,32 @@ def _make_agent_with_launch_cmd(tmp_path, agent_name="alice", launch_cmd=None):
 
 
 def _capture_watcher_script(agent):
-    agent._perform_refresh()
+    assert agent._perform_refresh() is True
     assert agent._refresh_watcher.spawned
     return agent._refresh_watcher.last_script
+
+
+def _run_single_heartbeat_tick(agent):
+    """Run one signal-processing tick without real heartbeat side effects."""
+    from lingtai.kernel.base_agent import lifecycle as lifecycle_mod
+
+    agent._heartbeat_thread = object()
+    heartbeat_stop = MagicMock()
+    heartbeat_stop.wait.side_effect = lambda _seconds: setattr(
+        agent, "_heartbeat_thread", None
+    )
+    agent._heartbeat_stop = heartbeat_stop
+    with patch.object(lifecycle_mod, "_write_heartbeat_tick"), patch.object(
+        lifecycle_mod, "_check_rules_file"
+    ), patch.object(
+        lifecycle_mod, "_maybe_sleep_after_idle_timeout"
+    ), patch(
+        "lingtai.kernel.nudge.run_checks"
+    ), patch(
+        "lingtai.kernel.nudge.run_system_notifications"
+    ):
+        lifecycle_mod._heartbeat_loop(agent)
+    assert lifecycle_mod._join_refresh_handoff_thread(agent, timeout=2.0)
 
 
 def _fast_watcher_script(script: str) -> str:
@@ -564,6 +590,187 @@ def test_perform_refresh_removes_stale_refresh_if_both_exist(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_heartbeat_ack_failure_keeps_signal_and_retries_without_shutdown(tmp_path):
+    """A failed signal ACK keeps the live runtime and original retry input."""
+    agent = _make_agent_with_launch_cmd(tmp_path)
+    wd = agent._working_dir
+    refresh = wd / ".refresh"
+    refresh.write_text("retry me", encoding="utf-8")
+    agent._save_chat_history = MagicMock()
+    log_events: list[tuple[str, dict]] = []
+    agent._log = lambda event, **fields: log_events.append((event, fields))
+
+    with patch("pathlib.Path.rename", side_effect=OSError("rename blocked")), patch(
+        "pathlib.Path.touch", side_effect=OSError("ack blocked")
+    ):
+        _run_single_heartbeat_tick(agent)
+
+    assert refresh.read_text(encoding="utf-8") == "retry me"
+    assert not (wd / ".refresh.taken").exists()
+    assert not agent._shutdown.is_set()
+    assert not agent._cancel_event.is_set()
+    assert agent._refresh_watcher.calls == []
+    assert any(event == "refresh_ack_failed" for event, _ in log_events)
+    assert any(event == "refresh_signal_retry_retained" for event, _ in log_events)
+
+    _run_single_heartbeat_tick(agent)
+
+    assert not refresh.exists()
+    assert (wd / ".refresh.taken").read_text(encoding="utf-8") == "retry me"
+    assert agent._shutdown.is_set()
+    assert agent._cancel_event.is_set()
+    assert len(agent._refresh_watcher.calls) == 1
+
+
+def test_heartbeat_spawn_failure_restores_consumed_signal_for_retry(tmp_path):
+    """Failure after ACK rename must not strand only ``.refresh.taken``."""
+    agent = _make_agent_with_launch_cmd(tmp_path)
+    wd = agent._working_dir
+    refresh = wd / ".refresh"
+    refresh.write_text("restore payload", encoding="utf-8")
+    agent._save_chat_history = MagicMock()
+    agent._refresh_watcher.spawn_detached = MagicMock(
+        side_effect=RuntimeError("watcher spawn rejected")
+    )
+    log_events: list[tuple[str, dict]] = []
+    agent._log = lambda event, **fields: log_events.append((event, fields))
+
+    _run_single_heartbeat_tick(agent)
+
+    assert refresh.read_text(encoding="utf-8") == "restore payload"
+    assert not (wd / ".refresh.taken").exists()
+    assert not agent._shutdown.is_set()
+    assert not agent._cancel_event.is_set()
+    assert agent._refresh_watcher.spawn_detached.call_count == 1
+    assert any(event == "refresh_handoff_failed" for event, _ in log_events)
+    assert any(event == "refresh_signal_retry_retained" for event, _ in log_events)
+
+
+def test_spawn_failure_collapses_both_markers_to_one_retry_signal(tmp_path):
+    """Presence-only refresh state rolls back to one retry marker."""
+    agent = _make_agent_with_launch_cmd(tmp_path)
+    wd = agent._working_dir
+    refresh = wd / ".refresh"
+    taken = wd / ".refresh.taken"
+    refresh.write_text("fresh retry intent", encoding="utf-8")
+    taken.write_text("stale acknowledged intent", encoding="utf-8")
+    agent._save_chat_history = MagicMock()
+    agent._refresh_watcher.spawn_detached = MagicMock(
+        side_effect=RuntimeError("watcher spawn rejected")
+    )
+
+    _run_single_heartbeat_tick(agent)
+
+    assert refresh.exists()
+    assert not taken.exists()
+    assert not agent._shutdown.is_set()
+    assert agent._refresh_watcher.spawn_detached.call_count == 1
+
+
+def test_heartbeat_unresolved_mcp_retirement_retains_signal_without_handoff(tmp_path):
+    """Signal refresh cannot bypass the Agent MCP convergence barrier."""
+    agent = _make_agent_with_launch_cmd(tmp_path)
+    refresh = agent._working_dir / ".refresh"
+    refresh.write_text("blocked", encoding="utf-8")
+    agent._retry_failed_mcps = MagicMock()
+    agent._retire_all_mcp_clients = MagicMock(return_value={
+        "context": "heartbeat_refresh",
+        "attempted": ["BlockedClient"],
+        "retired": [],
+        "unresolved": [{
+            "client": "BlockedClient",
+            "phase": "heartbeat_refresh",
+            "error": "transport thread remains alive",
+        }],
+        "transport_converged": False,
+        "inventory_sync_deferred": True,
+        "converged": False,
+    })
+    agent._save_chat_history = MagicMock()
+    log_events: list[tuple[str, dict]] = []
+    agent._log = lambda event, **fields: log_events.append((event, fields))
+
+    _run_single_heartbeat_tick(agent)
+
+    agent._retry_failed_mcps.assert_not_called()
+    agent._retire_all_mcp_clients.assert_called_once_with(
+        context="heartbeat_refresh",
+        sync_live_inventory=False,
+    )
+    assert refresh.read_text(encoding="utf-8") == "blocked"
+    assert not agent._shutdown.is_set()
+    assert agent._refresh_watcher.calls == []
+    assert any(
+        event == "refresh_mcp_retirement_unresolved"
+        for event, _ in log_events
+    )
+    assert any(event == "refresh_signal_retry_retained" for event, _ in log_events)
+
+
+def test_heartbeat_keeps_beating_while_mcp_retirement_waits(tmp_path):
+    """A bounded MCP close cannot pause the sole heartbeat writer."""
+    from lingtai.kernel.base_agent import lifecycle as lifecycle_mod
+
+    agent = _make_agent_with_launch_cmd(tmp_path)
+    (agent._working_dir / ".refresh").write_text("slow close", encoding="utf-8")
+    retirement_started = threading.Event()
+    allow_retirement = threading.Event()
+
+    def retire(**_kwargs):
+        retirement_started.set()
+        assert allow_retirement.wait(2.0)
+        return {
+            "context": "heartbeat_refresh",
+            "attempted": ["SlowClient"],
+            "retired": ["SlowClient"],
+            "unresolved": [],
+            "transport_converged": True,
+            "inventory_sync_deferred": True,
+            "converged": False,
+        }
+
+    agent._retire_all_mcp_clients = retire
+    agent._save_chat_history = MagicMock()
+    agent._refresh_watcher.spawn_detached = MagicMock(
+        side_effect=RuntimeError("spawn remains unavailable")
+    )
+    agent._heartbeat_thread = object()
+    heartbeat_stop = MagicMock()
+    cadence_calls = 0
+
+    def cadence(_seconds):
+        nonlocal cadence_calls
+        cadence_calls += 1
+        if cadence_calls == 1:
+            assert retirement_started.wait(1.0)
+        if cadence_calls == 3:
+            agent._heartbeat_thread = None
+
+    heartbeat_stop.wait.side_effect = cadence
+    agent._heartbeat_stop = heartbeat_stop
+    heartbeat_ticks = MagicMock()
+
+    with patch.object(lifecycle_mod, "_write_heartbeat_tick", heartbeat_ticks), patch.object(
+        lifecycle_mod, "_check_rules_file"
+    ), patch.object(
+        lifecycle_mod, "_maybe_sleep_after_idle_timeout"
+    ), patch(
+        "lingtai.kernel.nudge.run_checks"
+    ), patch(
+        "lingtai.kernel.nudge.run_system_notifications"
+    ):
+        lifecycle_mod._heartbeat_loop(agent)
+
+    assert retirement_started.is_set()
+    assert heartbeat_ticks.call_count == 3
+    worker = agent._refresh_handoff_thread
+    assert worker is not None and worker.is_alive()
+
+    allow_retirement.set()
+    assert lifecycle_mod._join_refresh_handoff_thread(agent, timeout=2.0)
+    assert agent._refresh_watcher.spawn_detached.call_count == 1
+
+
 
 def test_perform_refresh_ack_write_failure_does_not_shutdown(tmp_path):
     """If the ack file cannot be established, fail safe: do not spawn
@@ -585,7 +792,7 @@ def test_perform_refresh_ack_write_failure_does_not_shutdown(tmp_path):
     agent._log = lambda event, **kw: log_events.append((event, kw))
 
     with patch("pathlib.Path.touch", touch_side_effect):
-        agent._perform_refresh()
+        assert agent._perform_refresh() is False
 
     assert not agent._refresh_watcher.spawned
     assert not (wd / ".refresh.taken").exists()
@@ -1099,13 +1306,33 @@ def test_refresh_watcher_cleanup_then_success_does_not_write_failure_alert(tmp_p
     agent = _make_agent_with_launch_cmd(tmp_path)
     wd = agent._working_dir
     fake_console = tmp_path / "lingtai-agent"
-    fake_console.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+    fake_console.write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
     fake_console.chmod(0o755)
     duplicate = subprocess.Popen(
         [str(fake_console), "run", str(wd)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    identity_deadline = time.monotonic() + 2.0
+    observed_command = ""
+    while time.monotonic() < identity_deadline:
+        observed_command = subprocess.run(
+            ["ps", "-p", str(duplicate.pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if str(fake_console) in observed_command and str(wd) in observed_command:
+            break
+        time.sleep(0.01)
+    assert str(fake_console) in observed_command
+    assert str(wd) in observed_command
     launch_code = textwrap.dedent(
         f"""
         import pathlib

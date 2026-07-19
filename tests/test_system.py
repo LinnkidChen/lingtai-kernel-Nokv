@@ -204,19 +204,12 @@ def test_system_self_sleep(tmp_path):
 
 
 def test_system_refresh(tmp_path):
-    """refresh action: returns ok and writes a ``.refresh`` signal file
-    that the live agent's heartbeat loop consumes to drive the deferred
-    relaunch. (Older versions also set ``agent._refresh_requested`` and
-    ``agent._shutdown`` synchronously — both retired in favor of the
-    signal-file + watcher-subprocess pattern.)
-    """
+    """A raw BaseAgent cannot report refresh success without a launch command."""
     agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test", workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
     result = agent._intrinsics["system"]({"action": "refresh", "reason": "new tools"})
-    assert result["status"] == "ok"
-    # The signal file is the contract; the heartbeat loop keys off it.
-    # Note: BaseAgent._build_launch_cmd returns None by default, so no
-    # actual .refresh file may be written here (only Agent overrides it).
-    # The OK return is the only universally-true signal.
+    assert result["status"] == "error"
+    assert "handoff" in result["message"]
+    assert "not established" in result["message"]
     agent.stop(timeout=1.0)
 
 
@@ -306,6 +299,18 @@ def _make_test_agent_for_presets(tmp_path, presets_path=None, active_preset=None
     from lingtai.agent import load_preset as _workspace_load_preset
     agent._preset_loader = _workspace_load_preset
     return agent
+
+
+def _successful_refresh_hook(calls):
+    """A test handoff that honors the private retirement callback contract."""
+    def perform_refresh(**kwargs):
+        before_spawn = kwargs.get("_before_spawn")
+        if callable(before_spawn) and before_spawn() is not True:
+            return False
+        calls.append(True)
+        return True
+
+    return perform_refresh
 
 
 def test_base_agent_load_preset_hook_fails_loud_when_uncomposed(tmp_path):
@@ -444,7 +449,7 @@ def test_refresh_with_known_preset_calls_activate_then_perform(tmp_path, monkeyp
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({"action": "refresh",
                                            "preset": "minimax"})
@@ -463,7 +468,7 @@ def test_refresh_no_preset_arg_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     agent._intrinsics["system"]({"action": "refresh"})
 
@@ -486,7 +491,7 @@ def test_refresh_empty_preset_is_no_swap(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({"action": "refresh", "preset": ""})
     assert result["status"] == "ok"
@@ -503,7 +508,7 @@ def test_refresh_whitespace_preset_is_no_swap(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({"action": "refresh", "preset": "   \t\n"})
     assert result["status"] == "ok"
@@ -656,7 +661,7 @@ def test_refresh_revert_preset_swaps_to_default(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_default_preset",
                         lambda: activate_default_calls.append(True))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({"action": "refresh", "revert_preset": True})
 
@@ -714,7 +719,7 @@ def test_refresh_empty_preset_with_revert_preset_treats_empty_as_absent(
     monkeypatch.setattr(agent, "_activate_default_preset",
                         lambda: activate_default_calls.append(True))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({
         "action": "refresh",
@@ -776,7 +781,7 @@ def test_refresh_revert_preset_false_is_noop(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({"action": "refresh", "revert_preset": False})
 
@@ -808,7 +813,7 @@ def test_refresh_revert_preset_when_active_equals_default_still_succeeds(tmp_pat
     monkeypatch.setattr(agent, "_activate_default_preset",
                         lambda: activate_default_calls.append(True))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: perform_calls.append(True))
+                        _successful_refresh_hook(perform_calls))
 
     result = agent._intrinsics["system"]({"action": "refresh", "revert_preset": True})
 

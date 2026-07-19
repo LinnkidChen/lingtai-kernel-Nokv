@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import pytest
 
-from lingtai.services.mcp import MCPClient
+from lingtai.services import mcp as mcp_module
+from lingtai.services.mcp import HTTPMCPClient, MCPClient
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,92 @@ class _FakeFuture:
         if self._exc is not None:
             raise self._exc
         return self._value
+
+
+@pytest.mark.parametrize(
+    "client_factory",
+    [
+        lambda: MCPClient(command="fake"),
+        lambda: HTTPMCPClient(url="http://fake"),
+    ],
+)
+def test_start_timeout_is_reported_and_candidate_thread_is_joined(
+    monkeypatch, client_factory
+):
+    """A readiness timeout is a failed start, never permission to list/restart."""
+
+    class NeverReady:
+        def wait(self, timeout=None):
+            return False
+
+        def clear(self):
+            pass
+
+    class FakeThread:
+        instances = []
+
+        def __init__(self, target, daemon):
+            self.target = target
+            self.daemon = daemon
+            self.started = False
+            self.joined = False
+            self.alive = False
+            type(self).instances.append(self)
+
+        def start(self):
+            self.started = True
+            self.alive = True
+
+        def join(self, timeout=None):
+            self.joined = True
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(mcp_module.threading, "Thread", FakeThread)
+    client = client_factory()
+    client._ready = NeverReady()
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        client.start()
+
+    assert len(FakeThread.instances) == 1
+    assert FakeThread.instances[0].started is True
+    assert FakeThread.instances[0].joined is True
+
+
+@pytest.mark.parametrize(
+    "client_factory",
+    [
+        lambda: MCPClient(command="fake"),
+        lambda: HTTPMCPClient(url="http://fake"),
+    ],
+)
+def test_close_join_timeout_is_reported_and_repeated_close_can_converge(
+    client_factory,
+):
+    """The first bounded join may fail; a later close must retry and succeed."""
+
+    class EventuallyStops:
+        def __init__(self):
+            self.joins = 0
+
+        def join(self, timeout=None):
+            self.joins += 1
+
+        def is_alive(self):
+            return self.joins < 2
+
+    client = client_factory()
+    thread = EventuallyStops()
+    client._thread = thread
+
+    with pytest.raises(RuntimeError, match="thread did not retire"):
+        client.close()
+    client.close()
+
+    assert thread.joins == 2
 
 
 def _install_fake_loop(client: MCPClient):
@@ -158,7 +245,7 @@ def test_call_tool_restarts_and_retries_once_on_stale_error(monkeypatch):
     monkeypatch.setattr(
         "asyncio.run_coroutine_threadsafe", fake_run)
 
-    def fake_restart():
+    def fake_restart(**_kwargs):
         restarts["n"] += 1
         _install_fake_loop(client)
 
@@ -182,7 +269,9 @@ def test_call_tool_failed_retry_returns_helpful_error_not_blank(monkeypatch):
         return _FakeFuture(exc=ClosedResourceError())  # always stale
 
     monkeypatch.setattr("asyncio.run_coroutine_threadsafe", fake_run)
-    monkeypatch.setattr(client, "restart", lambda: _install_fake_loop(client))
+    monkeypatch.setattr(
+        client, "restart", lambda **_kwargs: _install_fake_loop(client)
+    )
 
     result = client.call_tool("send_message", {"text": "hi"})
 

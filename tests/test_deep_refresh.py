@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def test_resolve_env_fields_resolves_env_var(monkeypatch):
     """_resolve_env_fields replaces *_env keys with env var values."""
@@ -1140,10 +1142,10 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
         agent._workdir_lease.release()
 
 
-def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_reconnect(
+def test_telegram_registration_rejects_reserved_and_healthy_mcp_collisions(
     tmp_path, monkeypatch
 ):
-    """Telegram-owned registration wins over a colliding MCP tool in either order."""
+    """Reserved and already healthy names fail closed without replacement."""
     from lingtai.agent import Agent
     from lingtai.kernel.config import AgentConfig
     from lingtai.mcp_servers.telegram.task_card import get_description, get_schema
@@ -1156,13 +1158,17 @@ def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_recon
             self.command = command
             self.args = args
             self.env = env
+            self.closed = False
             type(self).instances.append(self)
 
         def start(self):
             pass
 
         def close(self):
-            pass
+            self.closed = True
+
+        def is_connected(self):
+            return not self.closed
 
         def list_tools(self):
             if self.command == "fake-foreign":
@@ -1202,30 +1208,35 @@ def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_recon
         config=AgentConfig(),
     )
     try:
-        # A foreign MCP may claim the public name before Telegram connects.
-        agent.connect_mcp(command="fake-foreign")
-        foreign_handler = agent._tool_handlers["task_card"]
+        # The Telegram-owned public name is reserved even before Telegram
+        # connects; a foreign candidate cannot claim it.
+        with pytest.raises(RuntimeError, match="task_card.*reserved"):
+            agent.connect_mcp(command="fake-foreign")
+        assert "task_card" not in agent._tool_handlers
         assert not hasattr(agent, "_task_card_controller")
 
         agent.connect_mcp(command="fake-telegram")
         controller = agent._task_card_controller
+        telegram_client = agent._mcp_clients_by_tool["telegram"]
         schema = [s for s in agent._tool_schemas if s.name == "task_card"]
         assert getattr(agent._tool_handlers["task_card"], "__self__", None) is controller
-        assert agent._tool_handlers["task_card"] is not foreign_handler
         assert len(schema) == 1
         assert schema[0].parameters == get_schema()
         assert schema[0].description == get_description()
 
-        # A later foreign collision must be reclaimed immediately; a Telegram
-        # reconnect must preserve the same controller and exact public surface.
-        agent.connect_mcp(command="fake-foreign")
-        agent.connect_mcp(command="fake-telegram")
+        # Neither the reserved public controller nor a healthy MCP owner may be
+        # overwritten by an unrelated public connect. Exact predecessor
+        # replacement is available only through the same init-spec retry path.
+        with pytest.raises(RuntimeError, match="task_card.*reserved"):
+            agent.connect_mcp(command="fake-foreign")
+        with pytest.raises(RuntimeError, match="telegram.*healthy foreign MCP"):
+            agent.connect_mcp(command="fake-telegram")
         schema = [s for s in agent._tool_schemas if s.name == "task_card"]
         assert agent._task_card_controller is controller
         assert getattr(agent._tool_handlers["task_card"], "__self__", None) is controller
         assert len(schema) == 1
         assert schema[0].parameters == get_schema()
         assert schema[0].description == get_description()
-        assert agent._mcp_clients_by_tool["telegram"] is _FakeMCPClient.instances[-1]
+        assert agent._mcp_clients_by_tool["telegram"] is telegram_client
     finally:
         agent._workdir_lease.release()

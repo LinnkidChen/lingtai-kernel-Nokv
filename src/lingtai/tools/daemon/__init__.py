@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import yaml
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -2210,6 +2211,20 @@ class DaemonManager:
         ``preset_surface`` is None, the parent's currently registered regular
         capability surface is used, again plus only task-scoped MCP tools.
         """
+        lifecycle_lock = getattr(self._agent, "_mcp_lifecycle_lock", None)
+        lifecycle_guard = (
+            lifecycle_lock if lifecycle_lock is not None else nullcontext()
+        )
+        with lifecycle_guard:
+            # Refresh/stop depublish by copy-swapping all three projections.
+            # Capture one coherent generation before doing any validation or
+            # dispatch construction so a concurrent retirement cannot pair an
+            # old schema with a new handler (or trigger a membership/indexing
+            # race on the handler mapping).
+            parent_mcp_names = self._parent_mcp_tool_names()
+            parent_tool_schemas = list(self._agent._tool_schemas)
+            parent_tool_handlers = dict(self._agent._tool_handlers)
+
         tool_names = self._expand_requested_tools(requested)
         # LingTai daemon self-compact is an always-available daemon runtime
         # tool. It is not a parent capability, preset capability, MCP tool, or
@@ -2219,15 +2234,14 @@ class DaemonManager:
 
         intrinsic_schemas, intrinsic_handlers = self._daemon_intrinsic_surface()
         mcp_schemas, mcp_handlers = mcp_surface or ({}, {})
-        parent_mcp_names = self._parent_mcp_tool_names()
-        reserved_names = ({s.name for s in self._agent._tool_schemas} - parent_mcp_names) | set(intrinsic_schemas)
+        reserved_names = ({s.name for s in parent_tool_schemas} - parent_mcp_names) | set(intrinsic_schemas)
         mcp_collisions = set(mcp_schemas) & reserved_names
         if mcp_collisions:
             raise ValueError(
                 "Task MCP tools collide with existing parent/daemon tools: "
                 f"{sorted(mcp_collisions)}"
             )
-        parent_mcp_requested = (tool_names & self._parent_mcp_tool_names()) - set(mcp_schemas)
+        parent_mcp_requested = (tool_names & parent_mcp_names) - set(mcp_schemas)
         if parent_mcp_requested:
             raise ValueError(
                 "Parent MCP tools must be provided as task mcp registrations, "
@@ -2250,7 +2264,7 @@ class DaemonManager:
             # NOT auto-inherit (they must come through task `mcp` registrations);
             # that exclusion is enforced by the ``parent_mcp_requested`` guard
             # above and by the floor's exclusion of `mcp`.
-            parent_schema_map = {s.name: s for s in self._agent._tool_schemas}
+            parent_schema_map = {s.name: s for s in parent_tool_schemas}
             parent_host_names = (set(parent_schema_map)
                                  & _parent_host_tool_floor()) - parent_mcp_names
             # Available surface = preset capabilities ∪ parent host-floor tools
@@ -2289,8 +2303,8 @@ class DaemonManager:
                         dispatch[n] = mcp_handlers[n]
                 elif n in parent_schema_map:
                     schemas.append(parent_schema_map[n])
-                    if n in self._agent._tool_handlers:
-                        dispatch[n] = self._agent._tool_handlers[n]
+                    if n in parent_tool_handlers:
+                        dispatch[n] = parent_tool_handlers[n]
             return schemas, dispatch
 
         # Default path: emanation runs on the parent's capability surface plus
@@ -2298,14 +2312,14 @@ class DaemonManager:
         tool_names |= set(mcp_schemas)
 
         # Validate requested tools exist
-        available = ({s.name for s in self._agent._tool_schemas}
+        available = ({s.name for s in parent_tool_schemas}
                      | set(intrinsic_schemas) | set(mcp_schemas))
         missing = tool_names - available
         if missing:
             raise ValueError(f"Unknown tools for emanation: {missing}")
 
         # Build schemas and dispatch
-        schema_map = {s.name: s for s in self._agent._tool_schemas}
+        schema_map = {s.name: s for s in parent_tool_schemas}
         schemas = []
         for n in sorted(tool_names):
             if n in intrinsic_schemas:
@@ -2314,8 +2328,8 @@ class DaemonManager:
                 schemas.append(mcp_schemas[n])
             elif n in schema_map:
                 schemas.append(schema_map[n])
-        dispatch = {n: self._agent._tool_handlers[n]
-                    for n in tool_names if n in self._agent._tool_handlers}
+        dispatch = {n: parent_tool_handlers[n]
+                    for n in tool_names if n in parent_tool_handlers}
         for n in tool_names:
             if n in mcp_handlers:
                 dispatch[n] = mcp_handlers[n]

@@ -80,11 +80,60 @@ class _FakeAgent:
             "skip_chat_history_save": skip_chat_history_save,
             "skip_save_reason": skip_save_reason,
         })
+        return True
 
 
 # ---------------------------------------------------------------------------
 # WorkerStillRunningError fail-closed handling in the AED loop
 # ---------------------------------------------------------------------------
+
+
+def test_worker_hang_refresh_false_ack_remains_retryable_then_latches(tmp_path):
+    """A failed handoff must not consume the worker recovery retry budget."""
+    from lingtai.kernel.base_agent.worker_recovery import request_worker_hang_refresh
+
+    agent = _FakeAgent(tmp_path)
+    agent._llm_worker_refresh_requested = False
+    agent._llm_worker_refresh_source = None
+    outcomes = iter([False, True])
+
+    def perform_refresh(*, skip_chat_history_save=False, skip_save_reason=None):
+        agent.refresh_calls.append({
+            "skip_chat_history_save": skip_chat_history_save,
+            "skip_save_reason": skip_save_reason,
+        })
+        return next(outcomes)
+
+    agent._perform_refresh = perform_refresh
+    artifact = "history/unfinished_turns/worker_still_running_ack.json"
+
+    request_worker_hang_refresh(agent, artifact_relpath=artifact, source="run_loop")
+
+    assert agent._llm_worker_refresh_requested is False
+    assert len(agent.refresh_calls) == 1
+    assert (tmp_path / ".refresh").is_file()
+    assert any(
+        event == "worker_hang_refresh_retry_retained"
+        for event, _ in agent._logs
+    )
+
+    request_worker_hang_refresh(agent, artifact_relpath=artifact, source="sync")
+
+    assert agent._llm_worker_refresh_requested is True
+    assert agent._llm_worker_refresh_source == "sync"
+    assert len(agent.refresh_calls) == 2
+    assert all(call == {
+        "skip_chat_history_save": True,
+        "skip_save_reason": "worker_still_running_interface_unsafe",
+    } for call in agent.refresh_calls)
+
+    request_worker_hang_refresh(agent, artifact_relpath=artifact, source="later_guard")
+
+    assert len(agent.refresh_calls) == 2
+    assert any(
+        event == "worker_hang_refresh_already_requested"
+        for event, _ in agent._logs
+    )
 
 
 def test_run_loop_skips_chat_history_save_after_worker_still_running(tmp_path, monkeypatch):

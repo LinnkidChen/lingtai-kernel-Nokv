@@ -4,6 +4,7 @@ related_files:
   - src/lingtai/ANATOMY.md
   - src/lingtai/kernel/ANATOMY.md
   - src/lingtai/tools/notification/ANATOMY.md
+  - src/lingtai/tools/system/ANATOMY.md
   - src/lingtai/tools/registry.py
   - src/lingtai/tools/glossary_validator.py
   - src/lingtai/tools/i18n/__init__.py

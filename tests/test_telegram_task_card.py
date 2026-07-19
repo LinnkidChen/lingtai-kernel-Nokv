@@ -714,7 +714,23 @@ def test_connect_mcp_http_maps_client_by_tool_name():
     from lingtai.services.mcp import HTTPMCPClient
 
     agent = Agent.__new__(Agent)
+    agent._mcp_activation_lock = threading.Lock()
+    agent._mcp_connector_context = threading.local()
+    agent._mcp_lifecycle_lock = threading.RLock()
+    agent._mcp_call_condition = threading.Condition(agent._mcp_lifecycle_lock)
+    agent._mcp_inflight_calls = {}
     agent._mcp_clients = []
+    agent._mcp_clients_by_tool = {}
+    agent._mcp_retiring_clients = []
+    agent._mcp_tool_names = set()
+    agent._mcp_inventory_sync_pending = False
+    agent._intrinsics = {}
+    agent._tool_handlers = {}
+    agent._tool_schemas = []
+    agent._session = MagicMock()
+    agent._token_decomp_dirty = False
+    agent._chat = None
+    agent._sealed = False
     agent.add_tool = MagicMock()  # prevent side effects
 
     mock_client = MagicMock(spec=HTTPMCPClient)
@@ -747,7 +763,23 @@ def test_connect_mcp_stdio_maps_client_by_tool_name():
     from lingtai.services.mcp import MCPClient
 
     agent = Agent.__new__(Agent)
+    agent._mcp_activation_lock = threading.Lock()
+    agent._mcp_connector_context = threading.local()
+    agent._mcp_lifecycle_lock = threading.RLock()
+    agent._mcp_call_condition = threading.Condition(agent._mcp_lifecycle_lock)
+    agent._mcp_inflight_calls = {}
     agent._mcp_clients = []
+    agent._mcp_clients_by_tool = {}
+    agent._mcp_retiring_clients = []
+    agent._mcp_tool_names = set()
+    agent._mcp_inventory_sync_pending = False
+    agent._intrinsics = {}
+    agent._tool_handlers = {}
+    agent._tool_schemas = []
+    agent._session = MagicMock()
+    agent._token_decomp_dirty = False
+    agent._chat = None
+    agent._sealed = False
     agent._expand_agent_placeholders = lambda x: x
     agent.add_tool = MagicMock()
 

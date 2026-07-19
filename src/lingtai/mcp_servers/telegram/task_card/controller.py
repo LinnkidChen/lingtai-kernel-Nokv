@@ -707,9 +707,6 @@ class TaskCardController:
                 outcome["backend_error"] = reason
             return outcome
 
-        client = getattr(self._agent, "_mcp_clients_by_tool", {}).get("telegram")
-        if client is None:
-            return rejected("Telegram client is unavailable")
         payload: dict[str, Any] = {
             "sub_action": sub_action,
             "channel": "programmable",
@@ -719,10 +716,15 @@ class TaskCardController:
         if frame is not None:
             payload["card"] = frame
         try:
-            result = client.call_tool(
-                _TASK_CARD_TOOL, payload, timeout=_REVERSE_CALL_TIMEOUT_S
+            result = self._agent._call_mcp_owned_tool(
+                route_name="telegram",
+                tool_name=_TASK_CARD_TOOL,
+                tool_args=payload,
+                timeout=_REVERSE_CALL_TIMEOUT_S,
             )
         except Exception as exc:
+            if str(exc).startswith("MCP route "):
+                return rejected("Telegram client is unavailable")
             return rejected(type(exc).__name__)
         if not isinstance(result, dict) or result.get("status") != "ok":
             return rejected(result.get("error") if isinstance(result, dict) else None)
@@ -860,6 +862,7 @@ def setup(
     agent: TelegramTaskCardAgent,
     *,
     controller: TaskCardController | None = None,
+    allow_sealed: bool = False,
 ) -> TaskCardController:
     """Register the public ``task_card`` controller tool on *agent*.
 
@@ -869,11 +872,15 @@ def setup(
     tool surface; in that case the Composition Root supplies it for re-registration.
     """
     mgr = controller if controller is not None else TaskCardController(agent)
+    registration_kwargs: dict[str, Any] = {}
+    if allow_sealed:
+        registration_kwargs["_allow_sealed"] = True
     agent.add_tool(
         "task_card",
         schema=get_schema(),
         handler=mgr.handle,
         description=get_description(),
         glossary_package=None,
+        **registration_kwargs,
     )
     return mgr

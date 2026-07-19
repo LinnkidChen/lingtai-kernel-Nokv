@@ -2,7 +2,7 @@
 related_files:
 - src/lingtai/intrinsic_skills/nokv-workbench/SKILL.md
 maintenance: |
-  Developer-facing TUI deployment preflight pointed to by nokv-workbench/SKILL.md:49; update it whenever the workbench MCP tool surface (9-tool vs 16-tool, checkpoint-lifecycle fields) or the runtime-version compatibility check changes.
+  Developer-facing TUI deployment preflight pointed to by nokv-workbench/SKILL.md:49; update it whenever the workbench MCP tool surface, selective argument-template contract, checkpoint-lifecycle fields, or runtime-version compatibility check changes.
 ---
 
 # TUI runtime preflight (developer-facing)
@@ -19,6 +19,24 @@ import importlib.metadata as md
 print(md.version("lingtai"))
 PY
 ```
+
+For a NoKV-generated `template_arg_indices` configuration, verify capability
+instead of trusting the package version string alone:
+
+```bash
+~/.lingtai-tui/runtime/venv/bin/python - <<'PY'
+from inspect import signature
+from lingtai.agent import Agent
+assert "template_arg_indices" in signature(Agent.connect_mcp).parameters
+print("selective MCP argument templates: supported")
+PY
+```
+
+Do not activate the generated configuration when this check fails. An older
+kernel ignores the new field and expands placeholder-looking bytes in every
+argument, including opaque workspace and actor identities. Roll back the NoKV
+configuration/lock and kernel as one unit; never downgrade only the kernel
+while a selective-template configuration remains active.
 
 Do not install a source branch that is older than the runtime package already
 used by TUI. Rebase or cherry-pick the workbench skill onto the matching or
