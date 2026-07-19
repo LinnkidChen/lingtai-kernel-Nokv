@@ -208,6 +208,7 @@ def test_nokv_workbench_registry_example_is_valid():
         encoding="utf-8"
     )
     assert "workbench_snapshot_retire" in skill_body
+    assert "lifecycle `state`" in skill_body
     assert "`retired` requires an acknowledged explicit retirement" in skill_body
     assert "workbench_restore" in skill_body
     assert "exact\n18-tool Workbench contract" in preflight_body

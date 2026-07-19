@@ -220,7 +220,7 @@ shorten the lease is ignored. Address the checkpoint by `name` or `snapshot_id`.
 Do not rely on a `snapshot_id` you remembered in a note — that note is exactly
 what goes stale. `workbench_snapshot_list {"id":"spedas-task-001"}` enumerates
 every checkpoint of the workbench with its `name`, `snapshot_id`,
-`lease_expires_at`, and lifecycle `status` (`alive`, `expired`, `retired`, or
+`lease_expires_at`, and lifecycle `state` (`alive`, `expired`, `retired`, or
 `reaped`). `retired` requires an acknowledged explicit retirement; an absent
 pin without that proof remains `reaped`. Use the list to see what is still
 restorable before you try to read history.
