@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -140,6 +142,41 @@ def _validate_junit_evidence(path: Path) -> None:
         raise ValueError("pytest JUnit real smoke did not prove the reader role")
 
 
+def _lexical_absolute_path(value: str) -> Path:
+    """Make a path absolute without dereferencing its final component."""
+
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+def _require_replaceable_destination(path: Path) -> None:
+    """Allow only entries that an evidence file may safely replace."""
+
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ValueError(f"cannot inspect pytest JUnit destination: {error}") from error
+    if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+        return
+    raise ValueError(
+        "pytest JUnit destination must be absent, a regular file, or a symlink"
+    )
+
+
+def _validate_private_junit_evidence(path: Path) -> None:
+    """Reject missing or non-regular staged output before parsing it."""
+
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise ValueError(f"cannot read pytest JUnit evidence: {error}") from error
+    if not stat.S_ISREG(mode):
+        raise ValueError("pytest JUnit evidence is not a private regular file")
+    _validate_junit_evidence(path)
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if not args.nokv_source:
@@ -151,9 +188,13 @@ def main(argv: list[str]) -> int:
     required = (source / "Cargo.toml", source / "Cargo.lock")
     if not source.joinpath(".git").exists() or not all(path.is_file() for path in required):
         raise SystemExit(f"--nokv-source is not a usable NoKV checkout: {source}")
-    junit_xml = Path(args.junit_xml).expanduser().resolve()
-    junit_xml.parent.mkdir(parents=True, exist_ok=True)
-    junit_xml.unlink(missing_ok=True)
+    junit_xml = _lexical_absolute_path(args.junit_xml)
+    try:
+        junit_xml.parent.mkdir(parents=True, exist_ok=True)
+        _require_replaceable_destination(junit_xml)
+    except (OSError, ValueError) as error:
+        print(f"cannot prepare pytest JUnit destination: {error}", file=sys.stderr)
+        return 2
 
     kernel_root = Path(__file__).resolve().parents[1]
     environment = dict(os.environ)
@@ -162,29 +203,45 @@ def main(argv: list[str]) -> int:
     environment.pop("PYTEST_ADDOPTS", None)
     environment["NOKV_LINGTAI_MCP_SMOKE"] = "1"
     environment["NOKV_LINGTAI_MCP_SOURCE"] = str(source)
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-o",
-            "addopts=",
-            "-o",
-            "junit_family=legacy",
-            f"--junitxml={junit_xml}",
-            "tests/test_nokv_lingtai_mcp_smoke.py",
-        ],
-        cwd=kernel_root,
-        env=environment,
-        check=False,
-    )
-    if completed.returncode != 0:
-        return completed.returncode
     try:
-        _validate_junit_evidence(junit_xml)
-    except ValueError as error:
-        print(f"invalid smoke evidence: {error}", file=sys.stderr)
+        with tempfile.TemporaryDirectory(
+            dir=junit_xml.parent,
+            prefix=".nokv-lingtai-mcp-smoke-",
+        ) as temporary_directory:
+            staging_directory = Path(temporary_directory)
+            os.chmod(staging_directory, 0o700)
+            staging_mode = staging_directory.lstat().st_mode
+            if not stat.S_ISDIR(staging_mode) or stat.S_IMODE(staging_mode) != 0o700:
+                raise ValueError("pytest JUnit staging directory is not private")
+            private_junit_xml = staging_directory / "evidence.xml"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "-o",
+                    "addopts=",
+                    "-o",
+                    "junit_family=legacy",
+                    f"--junitxml={private_junit_xml}",
+                    "tests/test_nokv_lingtai_mcp_smoke.py",
+                ],
+                cwd=kernel_root,
+                env=environment,
+                check=False,
+            )
+            if completed.returncode != 0:
+                return completed.returncode
+            try:
+                _validate_private_junit_evidence(private_junit_xml)
+            except ValueError as error:
+                print(f"invalid smoke evidence: {error}", file=sys.stderr)
+                return 2
+            _require_replaceable_destination(junit_xml)
+            os.replace(private_junit_xml, junit_xml)
+    except (OSError, ValueError) as error:
+        print(f"cannot publish pytest JUnit evidence: {error}", file=sys.stderr)
         return 2
     print(f"evidence_junit_xml: {junit_xml}")
     return 0
