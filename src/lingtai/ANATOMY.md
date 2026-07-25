@@ -145,7 +145,14 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
 - **Addon decompression** runs BEFORE capability setup so `mcp` capability sees populated `mcp_registry.jsonl` on first reconcile (`Agent.__init__` :33, `_setup_from_init` :1338).
 - **MCP activation/retry contract (issue #34):** `_load_mcp_from_workdir`
   records every registered init.json MCP entry as
-  `{cfg, source, client}`. Initial stdio/HTTP candidates remain unpublished
+  `{cfg, source, client, reserved_provenance}`. `reserved_provenance` is the
+  frozen result of `services.mcp_registry.materialize_curated_provenance`;
+  initial load and retry both require its exact canonical
+  source/transport/command/args/env materialization. Telegram permits only
+  `LINGTAI_TELEGRAM_CONFIG` in the configured env, while runtime-owned
+  `LINGTAI_AGENT_DIR`/`LINGTAI_MCP_NAME` and Python/dynamic-loader variables
+  cannot confer reserved authority; the runtime-owned values are injected
+  last so ordinary registrations cannot override them. Initial stdio/HTTP candidates remain unpublished
   through startup, full tools/list preparation, schema validation, duplicate
   detection, and ownership preflight. `_retry_failed_mcps` accepts a
   predecessor only after validating its complete handler/owner/schema/name-set,
@@ -153,10 +160,17 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
   depublishing does not discard association, and a failed close remains in
   `_mcp_pending_retirements` plus the spec until close/thread retirement is
   verified on a later retry. `MCPActivationOutcome` carries the exact committed
-  replacement identity, which must match the spec, client list, handlers,
-  schemas, owner map, and name set. Activation, retry, stop, and deep refresh
+  replacement identity, whose duplicate-free tool-name set must exactly equal
+  the complete client-owned handlers, schemas, owner map, and name set.
+  Publication failure restores every in-memory projection and compensates the
+  live chat adapter with the restored schema set; a compensation failure is
+  reported together with the original activation failure. Activation, retry, stop, and deep refresh
   share one lifecycle `RLock`; a generation plus teardown barrier invalidates
   waiters and prevents a candidate from publishing after stop/refresh begins.
+  A monotonic stop-request event is set before stop waits for that lock.
+  System refresh holds explicit ownership from MCP precondition through preset
+  mutation and relaunch handoff, rechecking the stop event at each boundary;
+  deep refresh never clears a stop-owned barrier or overwrites `stopping`.
   Reserved `telegram`/`task_card` claims require the explicit Telegram loader
   identity rather than a name-only collision bypass. `system(action="refresh")`
   validates the entire four-list retry report and blocks preset mutation and

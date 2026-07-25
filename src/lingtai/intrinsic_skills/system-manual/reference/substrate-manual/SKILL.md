@@ -297,6 +297,14 @@ WeChat, WhatsApp) own their own setup details; do not guess field names from
 memory. If you are an avatar without admin ownership of an MCP, do not
 reconfigure the orchestrator-owned integration; escalate or ask the orchestrator.
 
+Reserved Telegram runtime tools are available only when the registry and
+`init.json` entry still match the shipped curated stdio launch exactly. Its
+configured environment may contain `LINGTAI_TELEGRAM_CONFIG` only; runtime
+routing keys (`LINGTAI_AGENT_DIR`, `LINGTAI_MCP_NAME`) and Python or dynamic
+loader overrides are rejected for reserved authority. A mismatch is a
+configuration error to fix, not a reason to rename a user registration
+`telegram` or forge `source: lingtai-curated`.
+
 ## 9. Idle and soul
 
 When there is no concrete task, go idle/asleep rather than spinning, polling, or
@@ -448,6 +456,10 @@ requires both `active` and `default` to be members of `allowed`.
    a named swap activate and persist its selected path, followed by runtime
    reconstruction (LLM/config/capabilities/MCP/prompts, preserving conversation
    history where a live session exists).
+   Refresh owns this sequence atomically through the relaunch request. A stop
+   request is monotonic and wins even when it arrives after the MCP precondition:
+   preset mutation and relaunch are then refused, and deep reconstruction never
+   clears the stop-owned barrier or changes `stopping` back to `active`.
 4. A config, prompt, MCP, or capability edit needs `refresh` to take effect;
    `system(action="summarize")` alone does not reconstruct the runtime and
    must not be used as a refresh substitute.

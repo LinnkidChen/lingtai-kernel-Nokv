@@ -166,6 +166,7 @@ class Agent(BaseAgent):
         self._mcp_lifecycle_generation = 0
         self._mcp_lifecycle_state = "active"
         self._mcp_lifecycle_barrier = threading.Event()
+        self._mcp_stop_requested = threading.Event()
         self._mcp_refresh_owner_thread: int | None = None
         self._mcp_pending_retirements: dict[str, Any] = {}
         self._mcp_reserved_activation_tokens: set[object] = set()
@@ -617,35 +618,19 @@ class Agent(BaseAgent):
             activeness=self._config.activeness,
         )
 
-    @staticmethod
-    def _is_curated_telegram_registration(
-        name: str, cfg: dict, source: str, registry_record: dict
-    ) -> bool:
-        """Grant reserved names only to the exact shipped Telegram transport."""
-        if name != "telegram" or source != "init.json:mcp":
-            return False
-        from .services.mcp_registry import _load_catalog
-
-        template = _load_catalog().get("telegram")
-        if not isinstance(template, dict):
-            return False
-        import sys
-
-        expected_command = (
-            sys.executable
-            if template.get("command") == "{python}"
-            else template.get("command")
-        )
-        expected_args = template.get("args", [])
-        return (
-            registry_record.get("source") == "lingtai-curated"
-            and registry_record.get("transport") == "stdio"
-            and registry_record.get("command") == expected_command
-            and registry_record.get("args", []) == expected_args
-            and cfg.get("type", "stdio") == "stdio"
-            and cfg.get("command") == expected_command
-            and cfg.get("args", []) == expected_args
-        )
+    def _build_mcp_launch_env(self, name: str, cfg: dict) -> dict:
+        """Merge user env without allowing runtime routing-key overrides."""
+        runtime_owned = {"LINGTAI_AGENT_DIR", "LINGTAI_MCP_NAME"}
+        user_env = {
+            key: value
+            for key, value in (cfg.get("env") or {}).items()
+            if key.upper() not in runtime_owned
+        }
+        return {
+            **user_env,
+            "LINGTAI_AGENT_DIR": str(self._working_dir),
+            "LINGTAI_MCP_NAME": name,
+        }
 
     def _load_mcp_from_workdir(self) -> None:
         """Auto-load MCP servers from two sources, in order:
@@ -695,17 +680,13 @@ class Agent(BaseAgent):
         # LICC env injection — every spawned MCP gets these so it can
         # locate the agent's working dir + know its own registry name and
         # write events into the LICC inbox. User-supplied env in cfg wins.
-        licc_env = {
-            "LINGTAI_AGENT_DIR": str(self._working_dir),
-        }
-
         def _spawn(
             name: str,
             cfg: dict,
             source: str,
             *,
             init_spec_name: str | None = None,
-            reserved_provenance: bool = False,
+            reserved_provenance: object | None = None,
         ) -> object | None:
             """Return the MCPClient/HTTPMCPClient on success, None on failure."""
             try:
@@ -724,18 +705,16 @@ class Agent(BaseAgent):
                     # Merge: LICC defaults < per-MCP env (user-supplied).
                     # Add LINGTAI_MCP_NAME per-spawn so each MCP knows its
                     # own registry name without needing to be told elsewhere.
-                    merged_env = {
-                        **licc_env,
-                        "LINGTAI_MCP_NAME": name,
-                        **(cfg.get("env") or {}),
-                    }
+                    merged_env = self._build_mcp_launch_env(name, cfg)
                     connector = self.connect_mcp
                     connector_args = {
                         "command": cfg["command"],
                         "args": cfg.get("args"),
                         "env": merged_env,
                     }
-                reserved_token = object() if reserved_provenance else None
+                reserved_token = (
+                    object() if reserved_provenance is not None else None
+                )
                 if reserved_token is not None:
                     self._mcp_reserved_activation_tokens.add(reserved_token)
                 try:
@@ -798,7 +777,10 @@ class Agent(BaseAgent):
 
         # Cross-reference against the registry.
         try:
-            from .services.mcp_registry import read_registry
+            from .services.mcp_registry import (
+                materialize_curated_provenance,
+                read_registry,
+            )
             registered, _problems = read_registry(self._working_dir)
             registered_records = {r["name"]: r for r in registered}
         except Exception as e:
@@ -819,8 +801,11 @@ class Agent(BaseAgent):
             # Record every registered init.json mcp entry — failures (client
             # is None) and successes alike — so `_retry_failed_mcps` can
             # tell which ones to re-attempt vs leave alone.
-            reserved_provenance = self._is_curated_telegram_registration(
-                name, cfg, "init.json:mcp", registered_records[name]
+            reserved_provenance = materialize_curated_provenance(
+                name,
+                cfg,
+                "init.json:mcp",
+                registry_record=registered_records[name],
             )
             self._mcp_init_specs[name] = {
                 "cfg": cfg,
@@ -828,6 +813,18 @@ class Agent(BaseAgent):
                 "client": None,
                 "reserved_provenance": reserved_provenance,
             }
+            if (
+                name == "telegram"
+                and registered_records[name].get("source") == "lingtai-curated"
+                and reserved_provenance is None
+            ):
+                logger.warning(
+                    "[%s] init.json mcp %r: skipped — curated provenance "
+                    "does not match the canonical launch and safe env policy",
+                    self.agent_name,
+                    name,
+                )
+                continue
             _spawn(
                 name,
                 cfg,
@@ -843,6 +840,7 @@ class Agent(BaseAgent):
             if (
                 self._mcp_lifecycle_state == "stopping"
                 or self._mcp_lifecycle_barrier.is_set()
+                or self._mcp_stop_requested.is_set()
             ):
                 failed = set(self._mcp_init_specs)
                 failed.update(self._mcp_pending_retirements)
@@ -862,6 +860,46 @@ class Agent(BaseAgent):
                     "healthy": [],
                 }
             return self._retry_failed_mcps_locked()
+
+    def _begin_mcp_refresh_ownership(self) -> bool:
+        """Hold refresh ownership through preflight, mutation, and handoff."""
+        self._ensure_mcp_activation_state()
+        self._mcp_activation_lock.acquire()
+        if (
+            self._mcp_stop_requested.is_set()
+            or self._mcp_lifecycle_barrier.is_set()
+            or self._mcp_lifecycle_state == "stopping"
+        ):
+            self._mcp_activation_lock.release()
+            return False
+        self._mcp_lifecycle_generation += 1
+        self._mcp_lifecycle_state = "refreshing"
+        self._mcp_refresh_owner_thread = threading.get_ident()
+        return True
+
+    def _assert_mcp_refresh_ownership(self) -> None:
+        """Fail if stop was requested after refresh acquired ownership."""
+        if (
+            self._mcp_refresh_owner_thread != threading.get_ident()
+            or self._mcp_lifecycle_state != "refreshing"
+            or self._mcp_stop_requested.is_set()
+            or self._mcp_lifecycle_barrier.is_set()
+        ):
+            raise RuntimeError("refresh invalidated by pending stop")
+
+    def _end_mcp_refresh_ownership(self) -> None:
+        """Release refresh without ever clearing a stop-owned barrier."""
+        try:
+            if self._mcp_refresh_owner_thread != threading.get_ident():
+                raise RuntimeError("refresh ownership is not held by this thread")
+            self._mcp_refresh_owner_thread = None
+            if self._mcp_stop_requested.is_set():
+                self._mcp_lifecycle_state = "stopping"
+                self._mcp_lifecycle_barrier.set()
+            else:
+                self._mcp_lifecycle_state = "active"
+        finally:
+            self._mcp_activation_lock.release()
 
     def _retry_failed_mcps_locked(self) -> dict:
         """Re-spawn any init.json MCP whose subprocess is dead or never started.
@@ -897,11 +935,6 @@ class Agent(BaseAgent):
         still_failed: list[str] = []
         healthy: list[str] = []
 
-        # LICC env (must mirror _load_mcp_from_workdir).
-        licc_env = {
-            "LINGTAI_AGENT_DIR": str(self._working_dir),
-        }
-
         for name, spec in list(specs.items()):
             client = spec.get("client")
             cfg = spec.get("cfg") or {}
@@ -929,11 +962,7 @@ class Agent(BaseAgent):
                 else:
                     if "command" not in cfg:
                         raise ValueError("stdio transport requires 'command'")
-                    merged_env = {
-                        **licc_env,
-                        "LINGTAI_MCP_NAME": name,
-                        **(cfg.get("env") or {}),
-                    }
+                    merged_env = self._build_mcp_launch_env(name, cfg)
                     connector = self.connect_mcp
                     connector_args = {
                         "command": cfg["command"],
@@ -941,19 +970,30 @@ class Agent(BaseAgent):
                         "env": merged_env,
                     }
 
-                provenance_record = {
-                    "source": "lingtai-curated",
-                    "transport": cfg.get("type", "stdio"),
-                    "command": cfg.get("command"),
-                    "args": cfg.get("args", []),
-                }
-                reserved_token = (
-                    object()
-                    if spec.get("reserved_provenance") is True
-                    and self._is_curated_telegram_registration(
-                        name, cfg, source, provenance_record
+                from .services.mcp_registry import (
+                    CuratedMCPProvenance,
+                    materialize_curated_provenance,
+                )
+                stored_provenance = spec.get("reserved_provenance")
+                current_provenance = (
+                    materialize_curated_provenance(
+                        name,
+                        cfg,
+                        source,
+                        expected=stored_provenance,
                     )
+                    if isinstance(stored_provenance, CuratedMCPProvenance)
                     else None
+                )
+                if (
+                    isinstance(stored_provenance, CuratedMCPProvenance)
+                    and current_provenance is None
+                ):
+                    raise RuntimeError(
+                        "curated MCP provenance changed since initial load"
+                    )
+                reserved_token = (
+                    object() if current_provenance is not None else None
                 )
                 if reserved_token is not None:
                     self._mcp_reserved_activation_tokens.add(reserved_token)
@@ -981,7 +1021,10 @@ class Agent(BaseAgent):
                 logger.warning("[%s] MCP %s (%s): retry failed: %s",
                                self.agent_name, name, source, e)
                 self._log("mcp_retry_failed", name=name, error=str(e))
-                if name not in self._mcp_pending_retirements:
+                if (
+                    client is None
+                    and name not in self._mcp_pending_retirements
+                ):
                     spec["client"] = None
                 still_failed.append(name)
                 continue
@@ -1149,6 +1192,8 @@ class Agent(BaseAgent):
             self._mcp_lifecycle_state = "active"
         if not hasattr(self, "_mcp_lifecycle_barrier"):
             self._mcp_lifecycle_barrier = threading.Event()
+        if not hasattr(self, "_mcp_stop_requested"):
+            self._mcp_stop_requested = threading.Event()
         if not hasattr(self, "_mcp_refresh_owner_thread"):
             self._mcp_refresh_owner_thread = None
         if not hasattr(self, "_mcp_pending_retirements"):
@@ -1430,21 +1475,35 @@ class Agent(BaseAgent):
     def _assert_mcp_activation_outcome(
         self, spec_name: str, outcome: MCPActivationOutcome
     ) -> None:
-        """Require every committed projection to share exact client identity."""
+        """Require exact, duplicate-free equality across every projection."""
         client = outcome.client
         spec = self._mcp_init_specs.get(spec_name)
         if not isinstance(spec, dict) or spec.get("client") is not client:
             raise RuntimeError("MCP activation outcome does not own its init spec")
         if self._mcp_clients.count(client) != 1:
             raise RuntimeError("MCP activation outcome client-list mismatch")
-        for name in outcome.tool_names:
-            if self._mcp_clients_by_tool.get(name) is not client:
-                raise RuntimeError(f"MCP activation owner mismatch for {name!r}")
-            handler = self._tool_handlers.get(name)
-            if getattr(handler, "_lingtai_mcp_client", None) is not client:
-                raise RuntimeError(f"MCP activation handler mismatch for {name!r}")
-            if name not in self._mcp_tool_names:
-                raise RuntimeError(f"MCP activation name-set mismatch for {name!r}")
+        outcome_names = tuple(outcome.tool_names)
+        if len(outcome_names) != len(set(outcome_names)):
+            raise RuntimeError("MCP activation outcome contains duplicate tool names")
+        expected = set(outcome_names)
+        owner_names = {
+            name
+            for name, owner in self._mcp_clients_by_tool.items()
+            if owner is client
+        }
+        handler_names = {
+            name
+            for name, handler in self._tool_handlers.items()
+            if getattr(handler, "_lingtai_mcp_client", None) is client
+        }
+        name_names = owner_names & self._mcp_tool_names
+        if not (
+            expected == owner_names == handler_names == name_names
+        ):
+            raise RuntimeError(
+                "MCP activation outcome/projection tool-name mismatch"
+            )
+        for name in expected:
             if sum(schema.name == name for schema in self._tool_schemas) != 1:
                 raise RuntimeError(f"MCP activation schema mismatch for {name!r}")
 
@@ -1474,7 +1533,10 @@ class Agent(BaseAgent):
                     self._mcp_lifecycle_state == "refreshing"
                     and self._mcp_refresh_owner_thread == threading.get_ident()
                 )
-                if self._mcp_lifecycle_state != "active" and not refresh_owner:
+                if (
+                    self._mcp_stop_requested.is_set()
+                    or self._mcp_lifecycle_state != "active" and not refresh_owner
+                ):
                     raise RuntimeError(
                         f"MCP activation blocked while lifecycle is "
                         f"{self._mcp_lifecycle_state}"
@@ -1536,6 +1598,7 @@ class Agent(BaseAgent):
                 )
                 if (
                     self._mcp_lifecycle_barrier.is_set()
+                    or self._mcp_stop_requested.is_set()
                     or requested_generation != self._mcp_lifecycle_generation
                 ):
                     raise RuntimeError(
@@ -1822,6 +1885,7 @@ class Agent(BaseAgent):
         self._ensure_mcp_activation_state()
         # Signal before waiting on the lifecycle lock so an in-flight candidate
         # cannot cross its publication boundary after stop was requested.
+        self._mcp_stop_requested.set()
         self._mcp_lifecycle_barrier.set()
         with self._mcp_activation_lock:
             self._mcp_lifecycle_generation += 1
@@ -1996,19 +2060,27 @@ class Agent(BaseAgent):
         self._ensure_mcp_activation_state()
         self._mcp_lifecycle_barrier.set()
         with self._mcp_activation_lock:
+            if self._mcp_stop_requested.is_set():
+                raise RuntimeError("deep refresh blocked by pending stop")
             self._mcp_lifecycle_generation += 1
             self._mcp_lifecycle_state = "refreshing"
             self._mcp_refresh_owner_thread = threading.get_ident()
             # The generation invalidates waiters. The owning refresh may now
             # activate replacement clients while holding the same RLock.
+            if self._mcp_stop_requested.is_set():
+                self._mcp_lifecycle_state = "stopping"
+                raise RuntimeError("deep refresh invalidated by pending stop")
             self._mcp_lifecycle_barrier.clear()
             try:
                 self._setup_from_init_locked()
             finally:
                 self._mcp_refresh_owner_thread = None
-                if self._mcp_lifecycle_state != "stopping":
+                if self._mcp_stop_requested.is_set():
+                    self._mcp_lifecycle_state = "stopping"
+                    self._mcp_lifecycle_barrier.set()
+                elif self._mcp_lifecycle_state != "stopping":
                     self._mcp_lifecycle_state = "active"
-                self._mcp_lifecycle_barrier.clear()
+                    self._mcp_lifecycle_barrier.clear()
 
     def _setup_from_init_locked(self) -> None:
         """Full construct/reconstruct from init.json."""

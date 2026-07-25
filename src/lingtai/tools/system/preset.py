@@ -175,6 +175,29 @@ def _refresh(agent, args: dict) -> dict:
                     "message": "no default preset configured — manifest.preset.default is missing"}
         preset_name = default_name
 
+    def _claim_refresh() -> tuple[bool, dict | None]:
+        begin = getattr(agent, "_begin_mcp_refresh_ownership", None)
+        if not callable(begin):
+            return False, None
+        if begin():
+            return True, None
+        return False, {
+            "status": "error",
+            "message": "refresh blocked: agent stop is pending",
+        }
+
+    def _assert_refresh() -> None:
+        verify = getattr(agent, "_assert_mcp_refresh_ownership", None)
+        if callable(verify):
+            verify()
+
+    def _finish_refresh(owned: bool) -> None:
+        if not owned:
+            return
+        end = getattr(agent, "_end_mcp_refresh_ownership", None)
+        if callable(end):
+            end()
+
     if preset_name is not None:
         # Guard: refuse swap if the requested preset is not in the agent's
         # `allowed` list. Authorization is declared up front in init.json;
@@ -215,44 +238,70 @@ def _refresh(agent, args: dict) -> dict:
             agent._log("preset_swap_refused_oversize", **log_extra)
             return {"status": "error", "message": refuse_msg}
 
+        owned, ownership_error = _claim_refresh()
+        if ownership_error is not None:
+            return ownership_error
         try:
-            if revert_preset:
-                activate = agent._activate_default_preset
-            else:
-                activate = lambda: agent._activate_preset(preset_name)
+            try:
+                if revert_preset:
+                    activate = agent._activate_default_preset
+                else:
+                    activate = lambda: agent._activate_preset(preset_name)
+                precondition_error = _mcp_refresh_precondition(agent)
+                if precondition_error is not None:
+                    return precondition_error
+                _assert_refresh()
+                activate()
+                _assert_refresh()
+                if not revert_preset:
+                    # Persist only after the MCP precondition and runtime swap.
+                    _update_default_preset(agent, preset_name)
+            except KeyError:
+                agent._log("preset_swap_failed",
+                           requested=preset_name,
+                           reason="not_found")
+                return {"status": "error",
+                        "message": f"preset {preset_name!r} not found — call system(action='presets') to see what's available"}
+            except (ValueError, OSError, NotImplementedError, RuntimeError) as e:
+                agent._log("preset_swap_failed",
+                           requested=preset_name,
+                           reason=str(e))
+                return {"status": "error",
+                        "message": f"failed to activate preset {preset_name!r}: {e}"}
+            agent._log("preset_swap_started",
+                       preset=preset_name, reason=reason, revert=revert_preset)
+            _assert_refresh()
+            agent._log("refresh_requested", reason=reason)
+            agent._perform_refresh()
+            return {
+                "status": "ok",
+                "message": t(agent._config.language, "system_tool.refresh_message"),
+            }
+        finally:
+            _finish_refresh(owned)
+    else:
+        owned, ownership_error = _claim_refresh()
+        if ownership_error is not None:
+            return ownership_error
+        try:
             precondition_error = _mcp_refresh_precondition(agent)
             if precondition_error is not None:
                 return precondition_error
-            activate()
-            if not revert_preset:
-                # Persist only after the MCP precondition and runtime swap.
-                _update_default_preset(agent, preset_name)
-        except KeyError:
-            agent._log("preset_swap_failed",
-                       requested=preset_name,
-                       reason="not_found")
-            return {"status": "error",
-                    "message": f"preset {preset_name!r} not found — call system(action='presets') to see available presets"}
-        except (ValueError, OSError, NotImplementedError, RuntimeError) as e:
-            agent._log("preset_swap_failed",
-                       requested=preset_name,
-                       reason=str(e))
-            return {"status": "error",
-                    "message": f"failed to activate preset {preset_name!r}: {e}"}
-        agent._log("preset_swap_started",
-                   preset=preset_name, reason=reason, revert=revert_preset)
-    else:
-        precondition_error = _mcp_refresh_precondition(agent)
-        if precondition_error is not None:
-            return precondition_error
-
-    agent._log("refresh_requested", reason=reason)
-
-    agent._perform_refresh()
-    return {
-        "status": "ok",
-        "message": t(agent._config.language, "system_tool.refresh_message"),
-    }
+            try:
+                _assert_refresh()
+                agent._log("refresh_requested", reason=reason)
+                agent._perform_refresh()
+            except RuntimeError as exc:
+                return {
+                    "status": "error",
+                    "message": f"refresh blocked: {exc}",
+                }
+            return {
+                "status": "ok",
+                "message": t(agent._config.language, "system_tool.refresh_message"),
+            }
+        finally:
+            _finish_refresh(owned)
 
 
 def _presets(agent, args: dict) -> dict:
