@@ -1498,11 +1498,36 @@ class Agent(BaseAgent):
         if len(outcome_names) != len(set(outcome_names)):
             raise RuntimeError("MCP activation outcome contains duplicate tool names")
         expected = set(outcome_names)
-        if set(self._mcp_clients_by_tool) != self._mcp_tool_names:
+        global_names = set(self._mcp_tool_names)
+        owner_names = set(self._mcp_clients_by_tool)
+        tagged_handlers = {
+            name: handler
+            for name, handler in self._tool_handlers.items()
+            if getattr(handler, "_lingtai_mcp_client", None) is not None
+        }
+        live_client_ids = {id(existing) for existing in self._mcp_clients}
+        if len(live_client_ids) != len(self._mcp_clients):
+            raise RuntimeError("MCP activation global client-list identity mismatch")
+        if not (
+            owner_names == global_names == set(tagged_handlers)
+        ):
             raise RuntimeError(
-                "MCP activation global owner/name-set projection mismatch"
+                "MCP activation global owner/handler/name-set projection mismatch"
             )
-        owner_names = {
+        for name in global_names:
+            owner = self._mcp_clients_by_tool[name]
+            handler_owner = getattr(
+                tagged_handlers[name], "_lingtai_mcp_client", None
+            )
+            if (
+                id(owner) not in live_client_ids
+                or handler_owner is not owner
+                or sum(schema.name == name for schema in self._tool_schemas) != 1
+            ):
+                raise RuntimeError(
+                    f"MCP activation global schema/client mismatch for {name!r}"
+                )
+        outcome_owner_names = {
             name
             for name, owner in self._mcp_clients_by_tool.items()
             if owner is client
@@ -1512,9 +1537,9 @@ class Agent(BaseAgent):
             for name, handler in self._tool_handlers.items()
             if getattr(handler, "_lingtai_mcp_client", None) is client
         }
-        name_names = owner_names & self._mcp_tool_names
+        name_names = outcome_owner_names & self._mcp_tool_names
         if not (
-            expected == owner_names == handler_names == name_names
+            expected == outcome_owner_names == handler_names == name_names
         ):
             raise RuntimeError(
                 "MCP activation outcome/projection tool-name mismatch"

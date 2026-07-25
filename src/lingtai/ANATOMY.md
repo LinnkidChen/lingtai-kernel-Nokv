@@ -164,12 +164,16 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
   the complete client-owned handlers, schemas, owner map, and name set.
   Publication failure restores every in-memory projection and compensates the
   live chat adapter with the restored schema set; a compensation failure is
-  reported together with the original activation failure. Activation, retry, stop, and deep refresh
-  share one lifecycle `RLock`; a generation plus teardown barrier invalidates
-  waiters and prevents a candidate from publishing after stop/refresh begins.
-  A monotonic stop-request event is set before stop waits for that lock.
-  System refresh holds explicit ownership from MCP precondition through preset
-  mutation and relaunch handoff, rechecking the stop event at each boundary;
+  reported together with the original activation failure. Activation, retry,
+  stop, and deep refresh share one lifecycle `RLock`; a generation plus
+  teardown barrier invalidates waiters and prevents a candidate from publishing
+  after stop/refresh begins. Stop and System refresh linearize when the first
+  caller acquires that `RLock`: stop-first blocks mutation, while refresh-first
+  completes its mutation and handoff attempt before stop proceeds.
+  `_perform_refresh` returns a typed handoff outcome; only detached watcher
+  spawn plus successful shutdown signaling commits the old process to terminal
+  `relaunching`. No-launch, ACK, watcher-spawn, and shutdown-signal failures
+  return an actionable error and release refresh ownership back to `active`;
   deep refresh never clears a stop-owned barrier or overwrites `stopping`.
   Reserved `telegram`/`task_card` claims require the explicit Telegram loader
   identity rather than a name-only collision bypass. `system(action="refresh")`

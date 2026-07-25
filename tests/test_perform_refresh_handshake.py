@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 from unittest.mock import MagicMock, patch
+from lingtai.agent import Agent
+from lingtai.kernel.base_agent.lifecycle import RefreshHandoffStatus
 from tests._workdir_lease_helpers import make_test_lease
 from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
 from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
@@ -465,7 +467,6 @@ def test_agent_explicit_none_still_composes_production_watcher(monkeypatch, tmp_
     means "not supplied", not an opt-out that violates the composition invariant.
     """
     from lingtai.adapters.posix.refresh_watcher import PosixRefreshWatcherAdapter
-    from lingtai.agent import Agent
 
     captured = {}
 
@@ -585,8 +586,9 @@ def test_perform_refresh_ack_write_failure_does_not_shutdown(tmp_path):
     agent._log = lambda event, **kw: log_events.append((event, kw))
 
     with patch("pathlib.Path.touch", touch_side_effect):
-        agent._perform_refresh()
+        outcome = agent._perform_refresh()
 
+    assert outcome.status is RefreshHandoffStatus.ACK_FAILED
     assert not agent._refresh_watcher.spawned
     assert not (wd / ".refresh.taken").exists()
     assert not agent._shutdown.is_set()
@@ -604,8 +606,9 @@ def test_perform_refresh_sets_shutdown_and_cancel(tmp_path):
     assert not agent._shutdown.is_set()
     assert not agent._cancel_event.is_set()
 
-    agent._perform_refresh()
+    outcome = agent._perform_refresh()
 
+    assert outcome.status is RefreshHandoffStatus.COMMITTED
     assert agent._shutdown.is_set(), \
         "_perform_refresh must set _shutdown so the run loop exits and the lock releases"
     assert agent._cancel_event.is_set(), \

@@ -1999,9 +1999,9 @@ class BaseAgent:
         *,
         skip_chat_history_save: bool = False,
         skip_save_reason: str | None = None,
-    ) -> None:
+    ) -> "RefreshHandoffOutcome":
         from .lifecycle import _perform_refresh
-        _perform_refresh(
+        return _perform_refresh(
             self,
             skip_chat_history_save=skip_chat_history_save,
             skip_save_reason=skip_save_reason,

@@ -317,11 +317,16 @@ def request_worker_hang_refresh(
     except Exception:
         pass
     try:
-        agent._perform_refresh(
+        outcome = agent._perform_refresh(
             skip_chat_history_save=True,
             skip_save_reason="worker_still_running_interface_unsafe",
         )
+        if not outcome.committed:
+            raise RuntimeError(
+                f"refresh handoff {outcome.status.value}: {outcome.message}"
+            )
     except Exception as refresh_err:
+        agent._llm_worker_refresh_requested = False
         try:
             agent._log(
                 "worker_hang_refresh_request_failed",

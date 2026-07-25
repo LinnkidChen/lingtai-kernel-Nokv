@@ -13,7 +13,9 @@ import os
 import sys
 import time
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 from ..config import IDLE_SLEEP_TIMEOUT_SECONDS
@@ -35,6 +37,28 @@ _FP_KEY_FILES: list[str] = [
     "notifications.py",
     "workdir.py",
 ]
+
+
+class RefreshHandoffStatus(str, Enum):
+    """Terminal truth for one deferred relaunch request."""
+
+    COMMITTED = "committed"
+    NO_LAUNCH_COMMAND = "no_launch_command"
+    ACK_FAILED = "ack_failed"
+    WATCHER_SPAWN_FAILED = "watcher_spawn_failed"
+    SHUTDOWN_SIGNAL_FAILED = "shutdown_signal_failed"
+
+
+@dataclass(frozen=True)
+class RefreshHandoffOutcome:
+    """Explicit result of attempting to hand refresh to a detached watcher."""
+
+    status: RefreshHandoffStatus
+    message: str
+
+    @property
+    def committed(self) -> bool:
+        return self.status is RefreshHandoffStatus.COMMITTED
 
 
 def _capture_runtime_fingerprint(
@@ -409,12 +433,13 @@ def _heartbeat_loop(agent) -> None:
                 pass
             # Delegate to _perform_refresh which handles the full flow:
             # save chat history, spawn watcher process, deferred relaunch.
-            _perform_refresh(agent)
-            # Signal shutdown so the heartbeat loop exits and the watcher
-            # can detect the lock release.  The _shutdown gate above
-            # prevents the heartbeat from reprocessing .refresh on the
-            # next tick.
-            agent._shutdown.set()
+            handoff = _perform_refresh(agent)
+            if not handoff.committed:
+                agent._log(
+                    "refresh_handoff_failed",
+                    status=handoff.status.value,
+                    message=handoff.message,
+                )
 
         # .suspend = SUSPENDED (full process death, external only)
         suspend_file = agent._working_dir / ".suspend"
@@ -695,7 +720,7 @@ def _perform_refresh(
     *,
     skip_chat_history_save: bool = False,
     skip_save_reason: str | None = None,
-) -> None:
+) -> RefreshHandoffOutcome:
     """Refresh = .refresh handshake + deferred relaunch.
 
     Self-sufficient across all call sites — heartbeat, tool-call (intrinsic
@@ -705,11 +730,11 @@ def _perform_refresh(
       1. ``.refresh.taken`` must exist before the watcher's ack deadline.
       2. ``.agent.lock`` must clear before the watcher's lock deadline.
 
-    The heartbeat path renames ``.refresh`` → ``.refresh.taken`` before
-    invoking us and sets ``agent._shutdown`` immediately after. Direct
-    callers do neither — so we normalize the handshake here and then set
-    ``_shutdown`` / ``_cancel_event`` ourselves so the watcher's second
-    phase can complete.
+    The heartbeat path may rename ``.refresh`` → ``.refresh.taken`` before
+    invoking us. Every caller receives an explicit outcome; only a committed
+    result means the watcher spawned and shutdown signaling completed. We
+    normalize the handshake here and set ``_shutdown`` / ``_cancel_event``
+    ourselves so the watcher's second phase can complete.
     """
     # When the worker interface is poisoned, the in-memory ChatInterface may
     # still be mutated by a stuck worker thread — saving it would serialize
@@ -737,7 +762,10 @@ def _perform_refresh(
     cmd = agent._build_launch_cmd()
     if cmd is None:
         agent._log("refresh_no_launch_cmd")
-        return
+        return RefreshHandoffOutcome(
+            RefreshHandoffStatus.NO_LAUNCH_COMMAND,
+            "no relaunch command is available for this agent",
+        )
 
     # A real launch command means this refresh will actually spawn a watcher.
     # Fail loudly here, before any handshake or shutdown mutation, if the
@@ -789,7 +817,10 @@ def _perform_refresh(
         # agent with no relaunch. If .refresh still exists, leave it for
         # the heartbeat path or a later retry rather than consuming it.
         agent._log("refresh_ack_failed", handshake=handshake_source)
-        return
+        return RefreshHandoffOutcome(
+            RefreshHandoffStatus.ACK_FAILED,
+            "could not establish the .refresh.taken acknowledgment",
+        )
 
     # If both files happen to exist (heartbeat renamed but a later
     # consumer rewrote .refresh), remove the stale .refresh so the
@@ -824,7 +855,17 @@ def _perform_refresh(
         address=address,
         identity_fields_json=identity_fields_json,
     )
-    agent._refresh_watcher.spawn_detached(request)
+    try:
+        agent._refresh_watcher.spawn_detached(request)
+    except Exception as exc:
+        agent._log(
+            "refresh_watcher_spawn_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return RefreshHandoffOutcome(
+            RefreshHandoffStatus.WATCHER_SPAWN_FAILED,
+            f"detached refresh watcher failed to start: {exc}",
+        )
     agent._log("refresh_deferred_relaunch",
                cmd=cmd[0], handshake=handshake_source)
     # Lock-clear signaling — direct callers (intrinsic system tool call,
@@ -833,20 +874,31 @@ def _perform_refresh(
     # `_shutdown` set the run loop never exits and `.agent.lock` never
     # releases, so the watcher times out at phase='lock'. Setting these
     # events here makes the watcher's second phase complete uniformly
-    # regardless of caller; the heartbeat path's redundant `_shutdown.set()`
-    # is idempotent.
-    cancel_event = getattr(agent, "_cancel_event", None)
-    if cancel_event is not None:
-        try:
+    # regardless of caller. The heartbeat consumes this explicit outcome
+    # instead of independently asserting shutdown.
+    try:
+        cancel_event = getattr(agent, "_cancel_event", None)
+        if cancel_event is not None:
             cancel_event.set()
-        except Exception:
-            pass
-    shutdown_event = getattr(agent, "_shutdown", None)
-    if shutdown_event is not None:
-        try:
-            shutdown_event.set()
-        except Exception:
-            pass
+        shutdown_event = getattr(agent, "_shutdown", None)
+        if shutdown_event is None:
+            raise RuntimeError("agent has no shutdown event")
+        shutdown_event.set()
+        if not shutdown_event.is_set():
+            raise RuntimeError("agent shutdown event did not become set")
+    except Exception as exc:
+        agent._log(
+            "refresh_shutdown_signal_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return RefreshHandoffOutcome(
+            RefreshHandoffStatus.SHUTDOWN_SIGNAL_FAILED,
+            f"watcher started but agent shutdown signaling failed: {exc}",
+        )
+    return RefreshHandoffOutcome(
+        RefreshHandoffStatus.COMMITTED,
+        "detached refresh watcher started and shutdown was signaled",
+    )
 
 
 def _can_fallback_preset(agent) -> bool:

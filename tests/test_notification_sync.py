@@ -2383,10 +2383,19 @@ def _make_poisoned_sync_agent(tmp_path: Path, state):
             raise AssertionError("poisoned sync must not reset uptime")
 
         def _perform_refresh(self, *, skip_chat_history_save=False, skip_save_reason=None):
+            from lingtai.kernel.base_agent.lifecycle import (
+                RefreshHandoffOutcome,
+                RefreshHandoffStatus,
+            )
+
             self.refresh_calls.append({
                 "skip_chat_history_save": skip_chat_history_save,
                 "skip_save_reason": skip_save_reason,
             })
+            return RefreshHandoffOutcome(
+                RefreshHandoffStatus.COMMITTED,
+                "test handoff committed",
+            )
 
     return _Agent(tmp_path)
 

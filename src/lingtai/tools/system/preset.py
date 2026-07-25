@@ -1,6 +1,8 @@
 """Preset management — refresh, swap, list presets."""
 from __future__ import annotations
 
+from lingtai.kernel.base_agent.lifecycle import RefreshHandoffOutcome
+
 # Compatibility re-export — callers/tests import `_preset_ref_in` from here.
 # The implementation lives in the kernel so system and daemon share one
 # normalization primitive; see `lingtai.kernel.presets._preset_ref_in`.
@@ -205,6 +207,29 @@ def _refresh(agent, args: dict) -> dict:
         if callable(commit):
             commit()
 
+    def _perform_refresh_handoff() -> dict | None:
+        try:
+            outcome = agent._perform_refresh()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": f"refresh handoff failed: {exc}",
+            }
+        if not isinstance(outcome, RefreshHandoffOutcome):
+            return {
+                "status": "error",
+                "message": (
+                    "refresh handoff returned no typed outcome; "
+                    "the running agent remains active"
+                ),
+            }
+        if not outcome.committed:
+            return {
+                "status": "error",
+                "message": f"refresh handoff failed: {outcome.message}",
+            }
+        return None
+
     if preset_name is not None:
         # Guard: refuse swap if the requested preset is not in the agent's
         # `allowed` list. Authorization is declared up front in init.json;
@@ -279,7 +304,9 @@ def _refresh(agent, args: dict) -> dict:
                        preset=preset_name, reason=reason, revert=revert_preset)
             _assert_refresh()
             agent._log("refresh_requested", reason=reason)
-            agent._perform_refresh()
+            handoff_error = _perform_refresh_handoff()
+            if handoff_error is not None:
+                return handoff_error
             _commit_refresh(owned)
             return {
                 "status": "ok",
@@ -298,7 +325,9 @@ def _refresh(agent, args: dict) -> dict:
             try:
                 _assert_refresh()
                 agent._log("refresh_requested", reason=reason)
-                agent._perform_refresh()
+                handoff_error = _perform_refresh_handoff()
+                if handoff_error is not None:
+                    return handoff_error
                 _commit_refresh(owned)
             except RuntimeError as exc:
                 return {

@@ -55,7 +55,7 @@ Dispatch is the `handle()` table in `src/lingtai/tools/system/__init__.py`.
 
 | Action | Required inputs | Optional inputs | Success output | Error shapes |
 |---|---|---|---|---|
-| `refresh` | — | `reason`, `preset`, `revert_preset` | `{status: "ok", message}` | `{status: "error", message}` on preset/revert conflict, unauthorized preset, oversize context, activation failure, or unverifiable/unresolved MCP retry cleanup |
+| `refresh` | — | `reason`, `preset`, `revert_preset` | `{status: "ok", message}` only after a committed typed watcher/shutdown handoff | `{status: "error", message}` on preset/revert conflict, unauthorized preset, oversize context, activation failure, unverifiable/unresolved MCP retry cleanup, missing/untyped handoff outcome, no launch command, ACK failure, watcher-start failure, or shutdown-signal failure |
 | `sleep` | — | `reason`, `force` | `{status: "ok", message}` (self-sleep; refuses with an ok+message when notifications pending and not `force`) | — |
 | `lull` | `address` | `reason` | `{status: "asleep", address}` | `{error: True, message}` (no karma, no/invalid address, self-target, target not running) |
 | `suspend` | `address` | `reason` | `{status: "suspended", address}` | `{error: True, message}` (as above) |
@@ -106,9 +106,15 @@ signal is requested. Empty/no-spec and all-healthy reports preserve success.
 Stop and refresh are linearized by the agent's MCP lifecycle lock. If stop
 acquires ownership first, refresh fails before preset/default bytes change and
 before `_perform_refresh()`. If refresh owns the lock first, its preset
-mutation and relaunch handoff complete as one unit before stop proceeds. A
-successful handoff leaves the old process in terminal `relaunching` state with
-the lifecycle barrier set; it never reopens MCP activation as `active`.
+mutation and relaunch handoff attempt complete as one unit before stop
+proceeds. A successful handoff leaves the old process in terminal `relaunching`
+state with the lifecycle barrier set; it never reopens MCP activation as
+`active`.
+`_perform_refresh()` returns a typed lifecycle outcome. System commits only a
+`committed` result, produced after detached watcher spawn and shutdown
+signaling. Every normal failure outcome becomes an actionable tool error and
+releases refresh ownership back to `active`; a legacy `None` result is an
+error, never implicit success.
 
 ## Cross-platform invariants
 
