@@ -55,7 +55,7 @@ Dispatch is the `handle()` table in `src/lingtai/tools/system/__init__.py`.
 
 | Action | Required inputs | Optional inputs | Success output | Error shapes |
 |---|---|---|---|---|
-| `refresh` | — | `reason`, `preset`, `revert_preset` | `{status: "ok", message}` only after a normal committed typed watcher/shutdown handoff | `{status: "error", message}` on preset/revert conflict, unauthorized preset, oversize context, activation failure, unverifiable/unresolved MCP retry cleanup, missing/untyped handoff outcome, no launch command, ACK failure, watcher-start failure, or committed-degraded shutdown signaling |
+| `refresh` | — | `reason`, `preset`, `revert_preset` | `{status: "ok", message}` only after a normal committed typed watcher/shutdown handoff | `{status: "error", message}` on preset/revert conflict, unauthorized preset, oversize context, activation failure, unverifiable/unresolved MCP retry cleanup, missing/untyped handoff outcome, no launch command, ACK failure, watcher-start failure, or any committed-degraded post-spawn step |
 | `sleep` | — | `reason`, `force` | `{status: "ok", message}` (self-sleep; refuses with an ok+message when notifications pending and not `force`) | — |
 | `lull` | `address` | `reason` | `{status: "asleep", address}` | `{error: True, message}` (no karma, no/invalid address, self-target, target not running) |
 | `suspend` | `address` | `reason` | `{status: "suspended", address}` | `{error: True, message}` (as above) |
@@ -113,9 +113,9 @@ relaunch handoff attempt complete as one unit before stop proceeds.
 `_perform_refresh()` returns the public typed lifecycle outcome. Pre-spawn
 failures become actionable tool errors and release ownership back to `active`;
 a legacy `None` result is an error, never implicit success. Detached watcher
-spawn is irreversible. Normal shutdown signaling produces `committed` and the
-only success response; a signaling failure produces `committed-degraded` and
-an actionable error, but both terminal outcomes leave the old process in
+spawn is irreversible. Successful telemetry and shutdown signaling produce
+`committed` and the only success response; any later exception produces
+`committed-degraded` and an actionable error, but both terminal outcomes leave the old process in
 `relaunching` with the barrier set. Neither can reopen activation or spawn a
 second watcher.
 

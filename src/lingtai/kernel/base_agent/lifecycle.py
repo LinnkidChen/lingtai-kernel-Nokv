@@ -929,16 +929,23 @@ def _perform_refresh_uncoordinated(
             RefreshHandoffStatus.WATCHER_SPAWN_FAILED,
             f"detached refresh watcher failed to start: {exc}",
         )
-    agent._log("refresh_deferred_relaunch",
-               cmd=cmd[0], handshake=handshake_source)
-    # Lock-clear signaling — System and worker recovery reach this operation
-    # without going through a heartbeat-owned `_shutdown.set()` step. Without
-    # `_shutdown` set the run loop never exits and `.agent.lock` never
-    # releases, so the watcher times out at phase='lock'. Setting these
-    # events here makes the watcher's second phase complete uniformly
-    # regardless of caller. The heartbeat consumes this explicit outcome
-    # instead of independently asserting shutdown.
+    # ``spawn_detached`` returning is the absolute irreversible boundary.
+    # Telemetry and shutdown signaling both happen inside this post-spawn
+    # region so no later exception can be mistaken for a reversible operation
+    # failure by the lifecycle coordinator.
+    post_spawn_phase = "deferred-relaunch telemetry"
     try:
+        agent._log(
+            "refresh_deferred_relaunch",
+            cmd=cmd[0],
+            handshake=handshake_source,
+        )
+        # Lock-clear signaling — System and worker recovery reach this
+        # operation without going through a heartbeat-owned `_shutdown.set()`
+        # step. Without `_shutdown` set the run loop never exits and
+        # `.agent.lock` never releases, so the watcher times out at
+        # phase='lock'.
+        post_spawn_phase = "agent shutdown signaling"
         cancel_event = getattr(agent, "_cancel_event", None)
         if cancel_event is not None:
             cancel_event.set()
@@ -949,15 +956,24 @@ def _perform_refresh_uncoordinated(
         if not shutdown_event.is_set():
             raise RuntimeError("agent shutdown event did not become set")
     except Exception as exc:
-        agent._log(
-            "refresh_shutdown_signal_failed",
-            error=f"{type(exc).__name__}: {exc}",
-        )
+        try:
+            failure_event = (
+                "refresh_shutdown_signal_failed"
+                if post_spawn_phase == "agent shutdown signaling"
+                else "refresh_post_spawn_degraded"
+            )
+            agent._log(
+                failure_event,
+                phase=post_spawn_phase,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
         return RefreshHandoffOutcome(
             RefreshHandoffStatus.COMMITTED_DEGRADED,
             (
-                "detached watcher started, but agent shutdown signaling "
-                f"failed: {exc}"
+                "detached watcher started, but post-spawn "
+                f"{post_spawn_phase} failed: {exc}"
             ),
         )
     return RefreshHandoffOutcome(

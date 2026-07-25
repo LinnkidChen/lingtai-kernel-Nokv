@@ -74,9 +74,9 @@ The observable refresh behavior is unchanged. A successful `_perform_refresh`
 constructs one immutable `RefreshWatcherRequest`, waits for/normalizes the
 existing handshake, calls `RefreshWatcherPort.spawn_detached` exactly once,
 and then signals the existing cancellation/shutdown path. Failed ACK setup does
-not spawn. Once `spawn_detached` returns, the handoff is irreversible:
-shutdown-signal failure is a typed `committed-degraded` terminal outcome, not a
-pre-spawn failure. The shared lifecycle coordinator therefore preserves
+not spawn. Once `spawn_detached` returns, the handoff is irreversible: any
+later telemetry, shutdown-signal, or future-step exception is a typed
+`committed-degraded` terminal outcome, not a pre-spawn failure. The shared lifecycle coordinator therefore preserves
 `relaunching` plus its barrier and blocks any second watcher/activation attempt.
 A watcher runs the rendered policy with the exact copied environment
 from `build_watcher_env(request)`, including authoritative true/false handling

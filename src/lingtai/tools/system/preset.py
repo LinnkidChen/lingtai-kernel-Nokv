@@ -201,7 +201,8 @@ def _refresh(agent, args: dict) -> dict:
             return {
                 "status": "error",
                 "message": (
-                    "refresh handoff committed with degraded shutdown: "
+                    "refresh handoff committed with degraded post-spawn "
+                    "completion: "
                     f"{outcome.message}"
                 ),
             }

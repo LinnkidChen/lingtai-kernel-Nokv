@@ -41,7 +41,8 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
     coordinator owns begin, the System preparation callback, raw handoff,
     terminal commit, and end for System, heartbeat, and worker recovery.
     Pre-spawn typed failures restore `active`; watcher spawn followed by failed
-    shutdown signaling is `committed-degraded`, remains terminal
+    telemetry, shutdown signaling, or any later step is `committed-degraded`
+    and remains terminal
     `relaunching` with the barrier set, and returns an actionable System error
     without permitting a second watcher/activation.
   - `_presets()` (`preset.py:202-282`) — list available presets with LLM connectivity probing.

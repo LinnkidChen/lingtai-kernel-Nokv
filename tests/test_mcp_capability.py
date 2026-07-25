@@ -1114,8 +1114,35 @@ def test_system_refresh_shutdown_signal_failure_is_terminal_and_not_respawned(tm
     second = agent._intrinsics["system"]({"action": "refresh"})
 
     assert first["status"] == "error"
-    assert "committed with degraded shutdown" in first["message"]
+    assert "committed with degraded post-spawn completion" in first["message"]
     assert "shutdown signaling failed" in first["message"]
+    assert second["status"] == "error"
+    assert "terminal lifecycle transition is pending" in second["message"]
+    assert len(agent._refresh_watcher.calls) == 1
+    assert agent._mcp_lifecycle_state == "relaunching"
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
+def test_system_refresh_post_spawn_log_failure_is_terminal_and_not_respawned(
+    tmp_path,
+):
+    agent, _ = _mk_agent(tmp_path)
+    agent._refresh_watcher = make_test_refresh_watcher()
+    real_log = agent._log
+
+    def fail_deferred_relaunch_log(event, **fields):
+        if event == "refresh_deferred_relaunch":
+            raise RuntimeError("simulated post-spawn telemetry failure")
+        return real_log(event, **fields)
+
+    agent._log = fail_deferred_relaunch_log
+
+    first = agent._intrinsics["system"]({"action": "refresh"})
+    second = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert first["status"] == "error"
+    assert "committed with degraded post-spawn completion" in first["message"]
+    assert "post-spawn deferred-relaunch telemetry failed" in first["message"]
     assert second["status"] == "error"
     assert "terminal lifecycle transition is pending" in second["message"]
     assert len(agent._refresh_watcher.calls) == 1
@@ -1617,7 +1644,8 @@ def test_activation_outcome_requires_exact_complete_projection(tmp_path, damage)
             )
         )
     elif damage == "duplicate_client_identity":
-        agent._mcp_clients.append(client)
+        foreign = _ActivationClient([])
+        agent._mcp_clients.extend([foreign, foreign])
     elif damage in {
         "owner_absent_live",
         "zero_schema_foreign",
@@ -1646,7 +1674,12 @@ def test_activation_outcome_requires_exact_complete_projection(tmp_path, damage)
         agent._mcp_clients_by_tool["owner_only"] = client
         agent._mcp_tool_names.add("owner_only")
 
-    with pytest.raises(RuntimeError, match="duplicate|projection|mismatch"):
+    expected_error = (
+        "global client-list identity mismatch"
+        if damage == "duplicate_client_identity"
+        else "duplicate|projection|mismatch"
+    )
+    with pytest.raises(RuntimeError, match=expected_error):
         agent._assert_mcp_activation_outcome(
             "candidate",
             MCPActivationOutcome(client=client, tool_names=tuple(names)),

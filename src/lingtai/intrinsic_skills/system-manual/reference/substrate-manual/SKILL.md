@@ -463,9 +463,10 @@ requires both `active` and `default` to be members of `allowed`.
    handoff attempt before stop proceeds. Refresh reports success only when a
    detached watcher starts and shutdown signaling succeeds. Missing launch
    commands, ACK creation failure, and watcher-start failure return an error
-   and restore the old process to `active`. Once the watcher starts, a later
-   shutdown-signal failure is instead `committed-degraded`: it returns an
-   actionable error but preserves terminal `relaunching` plus the barrier, so a
+   and restore the old process to `active`. Once the watcher starts, any later
+   telemetry, shutdown-signal, or future-step exception is instead
+   `committed-degraded`: it returns an actionable error but preserves terminal
+   `relaunching` plus the barrier, so a
    second watcher or activation cannot start. Deep reconstruction never clears
    a stop-owned or committed-handoff barrier.
 4. A config, prompt, MCP, or capability edit needs `refresh` to take effect;

@@ -40,8 +40,8 @@ data afterward.
    already computed and calls `spawn_detached(request)` exactly once, after
    the ACK invariant is established and before setting `_cancel_event`/`_shutdown`.
    Returning from that outer spawn is the irreversible boundary. The shared
-   lifecycle coordinator records later shutdown-signaling failure as
-   `committed-degraded`, keeps terminal `relaunching` plus the barrier, and
+   lifecycle coordinator records any later telemetry, shutdown-signaling, or
+   future-step exception as `committed-degraded`, keeps terminal `relaunching` plus the barrier, and
    blocks a second watcher/activation; only failures before spawn restore
    `active`.
    The agent's runtime-identity fields (`agent._runtime_identity_event_fields`)

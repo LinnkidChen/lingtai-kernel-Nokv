@@ -174,9 +174,9 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
   coordinator cover System, heartbeat, and worker-hang recovery callers.
   Pre-spawn failures return actionable errors and release ownership back to
   `active`. Once detached watcher spawn succeeds the handoff is irreversible:
-  successful shutdown signaling is `committed`, while signaling failure is
-  `committed-degraded`; both keep terminal `relaunching` plus the barrier and
-  block a second watcher/activation attempt;
+  successful post-spawn telemetry and shutdown signaling is `committed`, while
+  any exception after spawn is `committed-degraded`; both keep terminal
+  `relaunching` plus the barrier and block a second watcher/activation attempt;
   deep refresh never clears a stop-owned barrier or overwrites `stopping`.
   Reserved `telegram`/`task_card` claims require the explicit Telegram loader
   identity rather than a name-only collision bypass. `system(action="refresh")`
