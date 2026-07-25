@@ -1150,6 +1150,31 @@ def test_system_refresh_post_spawn_log_failure_is_terminal_and_not_respawned(
     assert agent._mcp_lifecycle_barrier.is_set()
 
 
+def test_system_refresh_terminal_commit_failure_stays_terminal_and_not_respawned(
+    tmp_path,
+):
+    agent, _ = _mk_agent(tmp_path)
+    agent._refresh_watcher = make_test_refresh_watcher()
+
+    def fail_terminal_commit():
+        raise RuntimeError("simulated terminal commit failure")
+
+    agent._commit_mcp_refresh_handoff = fail_terminal_commit
+
+    first = agent._intrinsics["system"]({"action": "refresh"})
+    second = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert first["status"] == "error"
+    assert "committed with degraded post-spawn completion" in first["message"]
+    assert "lifecycle terminal commit failed" in first["message"]
+    assert second["status"] == "error"
+    assert "terminal lifecycle transition is pending" in second["message"]
+    assert len(agent._refresh_watcher.calls) == 1
+    assert agent._mcp_refresh_handoff_committed is True
+    assert agent._mcp_lifecycle_state == "relaunching"
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
 def test_stop_winning_before_preset_refresh_preserves_exact_init_bytes(
     tmp_path, monkeypatch
 ):

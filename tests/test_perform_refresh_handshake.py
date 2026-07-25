@@ -603,7 +603,7 @@ def test_perform_refresh_ack_write_failure_does_not_shutdown(tmp_path):
 
 
 def test_perform_refresh_sets_shutdown_and_cancel(tmp_path):
-    """Direct callers (tool-call refresh, AED preset fallback) don't go
+    """Direct callers (tool-call refresh, worker-hang recovery) don't go
     through the heartbeat's shutdown-set step. `_perform_refresh` must
     set both `_shutdown` and `_cancel_event` itself so the run loop
     exits, the lock releases, and the watcher's second phase completes.

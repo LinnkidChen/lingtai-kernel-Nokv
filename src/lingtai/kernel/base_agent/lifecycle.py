@@ -718,6 +718,7 @@ def _coordinate_refresh_handoff(
     end = getattr(agent, "_end_mcp_refresh_ownership", None)
     commit = getattr(agent, "_commit_mcp_refresh_handoff", None)
     owned = False
+    terminal_handoff = False
     if callable(begin):
         if not begin():
             return RefreshHandoffOutcome(
@@ -739,16 +740,50 @@ def _coordinate_refresh_handoff(
                 "refresh operation returned no typed handoff outcome",
             )
         if outcome.committed and owned:
+            # The raw outcome is authoritative: watcher spawn has already
+            # crossed the irreversible boundary. Carry that fact into
+            # finalization even when the optional terminal commit hook fails
+            # before setting its own marker.
+            terminal_handoff = True
             if not callable(commit):
                 return RefreshHandoffOutcome(
                     RefreshHandoffStatus.COMMITTED_DEGRADED,
                     "watcher started, but lifecycle has no terminal commit hook",
                 )
-            commit()
+            try:
+                commit()
+            except Exception as exc:
+                try:
+                    agent._log(
+                        "refresh_terminal_commit_failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    pass
+                return RefreshHandoffOutcome(
+                    RefreshHandoffStatus.COMMITTED_DEGRADED,
+                    (
+                        "watcher started, but lifecycle terminal commit "
+                        f"failed: {exc}"
+                    ),
+                )
         return outcome
     finally:
-        if owned and callable(end):
-            end()
+        if owned:
+            try:
+                if terminal_handoff:
+                    # Finalization is independent of the hook's success. Set
+                    # the marker/state/barrier before `_end_*` releases the
+                    # lifecycle lock so it can only preserve the terminal
+                    # disposition, never reopen `active`.
+                    agent._mcp_refresh_handoff_committed = True
+                    agent._mcp_lifecycle_state = "relaunching"
+                    barrier = getattr(agent, "_mcp_lifecycle_barrier", None)
+                    if barrier is not None:
+                        barrier.set()
+            finally:
+                if callable(end):
+                    end()
 
 
 def _perform_refresh(
@@ -794,10 +829,11 @@ def _perform_refresh_uncoordinated(
 
     The heartbeat path may rename ``.refresh`` → ``.refresh.taken`` before
     invoking us. Every caller receives an explicit outcome. A normal committed
-    result means watcher spawn and shutdown signaling completed; a
-    committed-degraded result means spawn completed but shutdown signaling
-    failed. We normalize the handshake here and set ``_shutdown`` /
-    ``_cancel_event`` ourselves so the watcher's second phase can complete.
+    result means watcher spawn and all post-spawn steps completed; a
+    committed-degraded result means spawn completed but some later telemetry,
+    shutdown-signaling, or terminal-commit step failed. We normalize the
+    handshake here and set ``_shutdown`` / ``_cancel_event`` ourselves so the
+    watcher's second phase can complete.
     """
     # When the worker interface is poisoned, the in-memory ChatInterface may
     # still be mutated by a stuck worker thread — saving it would serialize
