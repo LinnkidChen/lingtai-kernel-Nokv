@@ -17,7 +17,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from lingtai.kernel.base_agent import turn
+from lingtai.kernel.base_agent import (
+    RefreshHandoffOutcome,
+    RefreshHandoffStatus,
+    turn,
+)
+from lingtai.kernel.base_agent.worker_recovery import request_worker_hang_refresh
 from lingtai.kernel.llm import LLMResponse
 from lingtai.kernel.llm.base import UsageMetadata
 from lingtai.kernel.llm_utils import WorkerStillRunningError
@@ -77,7 +82,7 @@ class _FakeAgent:
         return event_id
 
     def _perform_refresh(self, *, skip_chat_history_save=False, skip_save_reason=None):
-        from lingtai.kernel.base_agent.lifecycle import (
+        from lingtai.kernel.base_agent import (
             RefreshHandoffOutcome,
             RefreshHandoffStatus,
         )
@@ -90,6 +95,46 @@ class _FakeAgent:
             RefreshHandoffStatus.COMMITTED,
             "test handoff committed",
         )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "requested"),
+    [
+        (
+            RefreshHandoffOutcome(
+                RefreshHandoffStatus.COMMITTED, "committed"
+            ),
+            True,
+        ),
+        (
+            RefreshHandoffOutcome(
+                RefreshHandoffStatus.NO_LAUNCH_COMMAND, "failed"
+            ),
+            False,
+        ),
+        (None, False),
+    ],
+)
+def test_worker_hang_refresh_typed_outcome_controls_retry(outcome, requested):
+    calls = []
+    logs = []
+    agent = SimpleNamespace(
+        _llm_worker_refresh_requested=False,
+        _perform_refresh=lambda **kwargs: calls.append(kwargs) or outcome,
+        _log=lambda event, **fields: logs.append((event, fields)),
+    )
+
+    request_worker_hang_refresh(agent, source="test")
+    request_worker_hang_refresh(agent, source="test")
+
+    assert agent._llm_worker_refresh_requested is requested
+    assert len(calls) == (1 if requested else 2)
+    expected_event = (
+        "worker_hang_refresh_already_requested"
+        if requested
+        else "worker_hang_refresh_request_failed"
+    )
+    assert any(event == expected_event for event, _ in logs)
 
 
 # ---------------------------------------------------------------------------

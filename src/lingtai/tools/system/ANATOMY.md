@@ -36,7 +36,14 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 - `preset.py` — Preset management and refresh.
   - `_preset_ref_in()` (`preset.py:9-36`) — normalized membership test for preset path strings (~/foo vs absolute).
   - `_check_context_fits()` (`preset.py:39-76`) — verify agent's current context fits within target preset's context_limit.
-  - `_refresh()` (`preset.py`) — stop, reload config + MCP servers, restart. Handles preset swap (named or revert) with authorization gate and context-limit guard. **Empty-string normalization:** `args.get('preset')` returning `''` or whitespace-only is treated as absent (`preset_name = None`) before any conflict/swap logic. **MCP retry precondition (issue #34):** before preset activation/default persistence or `agent._perform_refresh()`, invokes `agent._retry_failed_mcps()` if present and requires all four report fields (`retried`, `recovered`, `still_failed`, `healthy`) to be lists of strings. Missing/malformed reports, exceptions, or unresolved entries fail closed without changing `init.json` or requesting relaunch; healthy/no-spec reports preserve success. **Lifecycle handoff:** refresh claims the agent MCP lifecycle lock across preflight, preset/default mutation, and `_perform_refresh()`. Stop that owns the lock first prevents all mutation; refresh that owns it first completes its handoff attempt. `_perform_refresh()` returns a typed lifecycle outcome; only detached watcher spawn plus shutdown signaling commits terminal `relaunching`. No-launch, ACK, watcher-start, shutdown-signal, and legacy untyped/`None` results return errors and release back to `active`.
+  - `_refresh()` (`preset.py`) — handles named/revert preset swaps with authorization, context-limit, and exact four-list MCP retry gates. Empty/whitespace preset names are absent. Missing/malformed retry evidence and pre-spawn handoff failures fail closed without mutation or relaunch.
+  - **Current refresh handoff boundary:** the single BaseAgent lifecycle
+    coordinator owns begin, the System preparation callback, raw handoff,
+    terminal commit, and end for System, heartbeat, and worker recovery.
+    Pre-spawn typed failures restore `active`; watcher spawn followed by failed
+    shutdown signaling is `committed-degraded`, remains terminal
+    `relaunching` with the barrier set, and returns an actionable System error
+    without permitting a second watcher/activation.
   - `_presets()` (`preset.py:202-282`) — list available presets with LLM connectivity probing.
 
 - `karma.py` — Karma-gated lifecycle actions.

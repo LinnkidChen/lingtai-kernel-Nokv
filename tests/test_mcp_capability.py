@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from lingtai.agent import Agent, MCPActivationOutcome
-from lingtai.kernel.base_agent.lifecycle import (
+from lingtai.kernel.base_agent import (
     RefreshHandoffOutcome,
     RefreshHandoffStatus,
 )
@@ -55,7 +55,18 @@ def _mk_agent(tmp_path: Path, *, addons=None, capabilities=None):
     ), workdir
 
 
-def _committed_refresh(calls: list | None = None) -> RefreshHandoffOutcome:
+def _committed_refresh(
+    calls: list | None = None,
+    *,
+    prepare=None,
+) -> RefreshHandoffOutcome:
+    if prepare is not None:
+        preparation_error = prepare()
+        if preparation_error is not None:
+            return RefreshHandoffOutcome(
+                RefreshHandoffStatus.PREPARATION_FAILED,
+                preparation_error,
+            )
     if calls is not None:
         calls.append(True)
     return RefreshHandoffOutcome(
@@ -903,15 +914,14 @@ def test_public_refresh_that_owns_lifecycle_lock_wins_race_with_stop(
     tmp_path, monkeypatch
 ):
     agent, _ = _mk_agent(tmp_path)
-    performed = []
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: _committed_refresh(performed))
+    agent._refresh_watcher = make_test_refresh_watcher()
     agent._mcp_activation_lock.acquire()
     stopping = threading.Thread(target=agent.stop)
     stopping.start()
     try:
         result = agent._intrinsics["system"]({"action": "refresh"})
         assert result["status"] == "ok"
-        assert performed == [True]
+        assert len(agent._refresh_watcher.calls) == 1
         assert agent._mcp_lifecycle_state == "relaunching"
         assert agent._mcp_lifecycle_barrier.is_set()
     finally:
@@ -940,7 +950,11 @@ def test_refresh_stop_after_precondition_completes_refresh_before_stop(
     activated = []
     performed = []
     monkeypatch.setattr(agent, "_activate_preset", activated.append)
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: _committed_refresh(performed))
+    monkeypatch.setattr(
+        agent,
+        "_perform_refresh",
+        lambda **kwargs: _committed_refresh(performed, **kwargs),
+    )
     stop_thread = None
 
     def retry_then_request_stop():
@@ -1084,7 +1098,7 @@ def test_system_refresh_watcher_failure_restores_active(
     assert not agent._mcp_lifecycle_barrier.is_set()
 
 
-def test_system_refresh_shutdown_signal_failure_restores_active(tmp_path):
+def test_system_refresh_shutdown_signal_failure_is_terminal_and_not_respawned(tmp_path):
     agent, _ = _mk_agent(tmp_path)
     agent._refresh_watcher = make_test_refresh_watcher()
 
@@ -1096,13 +1110,17 @@ def test_system_refresh_shutdown_signal_failure_restores_active(tmp_path):
             return False
 
     agent._shutdown = _BrokenShutdown()
-    result = agent._intrinsics["system"]({"action": "refresh"})
+    first = agent._intrinsics["system"]({"action": "refresh"})
+    second = agent._intrinsics["system"]({"action": "refresh"})
 
-    assert result["status"] == "error"
-    assert "shutdown signaling failed" in result["message"]
-    assert agent._refresh_watcher.spawned
-    assert agent._mcp_lifecycle_state == "active"
-    assert not agent._mcp_lifecycle_barrier.is_set()
+    assert first["status"] == "error"
+    assert "committed with degraded shutdown" in first["message"]
+    assert "shutdown signaling failed" in first["message"]
+    assert second["status"] == "error"
+    assert "terminal lifecycle transition is pending" in second["message"]
+    assert len(agent._refresh_watcher.calls) == 1
+    assert agent._mcp_lifecycle_state == "relaunching"
+    assert agent._mcp_lifecycle_barrier.is_set()
 
 
 def test_stop_winning_before_preset_refresh_preserves_exact_init_bytes(
@@ -1121,7 +1139,11 @@ def test_stop_winning_before_preset_refresh_preserves_exact_init_bytes(
         "load_preset",
         lambda name: {"manifest": {"llm": {}, "capabilities": {}}},
     )
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: _committed_refresh(performed))
+    monkeypatch.setattr(
+        agent,
+        "_perform_refresh",
+        lambda **kwargs: _committed_refresh(performed, **kwargs),
+    )
 
     agent.stop()
     result = agent._intrinsics["system"](
@@ -1129,7 +1151,7 @@ def test_stop_winning_before_preset_refresh_preserves_exact_init_bytes(
     )
 
     assert result["status"] == "error"
-    assert "stop is pending" in result["message"]
+    assert "lifecycle:stopping" in result["message"]
     assert init_path.read_bytes() == before
     assert performed == []
     assert agent._mcp_lifecycle_barrier.is_set()
@@ -1171,7 +1193,11 @@ def test_stop_during_preset_mutation_linearizes_after_complete_refresh(
         },
     )
     performed = []
-    monkeypatch.setattr(agent, "_perform_refresh", lambda: _committed_refresh(performed))
+    monkeypatch.setattr(
+        agent,
+        "_perform_refresh",
+        lambda **kwargs: _committed_refresh(performed, **kwargs),
+    )
     stopping = None
     stop_attempted = threading.Event()
 
@@ -1541,6 +1567,11 @@ def test_mcp_activation_publication_failure_exact_restores_initial_state(
         "name_set_only",
         "foreign_owner_name",
         "handler_schema_client_mismatch",
+        "duplicate_client_identity",
+        "owner_absent_live",
+        "zero_schema_foreign",
+        "duplicate_schema_foreign",
+        "handler_capture_mismatch",
     ],
 )
 def test_activation_outcome_requires_exact_complete_projection(tmp_path, damage):
@@ -1585,6 +1616,32 @@ def test_activation_outcome_requires_exact_complete_projection(tmp_path, damage)
                 parameters={"type": "object", "properties": {}},
             )
         )
+    elif damage == "duplicate_client_identity":
+        agent._mcp_clients.append(client)
+    elif damage in {
+        "owner_absent_live",
+        "zero_schema_foreign",
+        "duplicate_schema_foreign",
+    }:
+        foreign = _ActivationClient([])
+        if damage != "owner_absent_live":
+            agent._mcp_clients.append(foreign)
+        agent._mcp_clients_by_tool["foreign"] = foreign
+        agent._mcp_tool_names.add("foreign")
+        agent._tool_handlers["foreign"] = agent._make_mcp_handler(
+            foreign, "foreign"
+        )
+        if damage != "zero_schema_foreign":
+            schema = FunctionSchema(
+                name="foreign",
+                description="foreign",
+                parameters={"type": "object", "properties": {}},
+            )
+            agent._tool_schemas.append(schema)
+            if damage == "duplicate_schema_foreign":
+                agent._tool_schemas.append(schema)
+    elif damage == "handler_capture_mismatch":
+        agent._tool_handlers["one"]._lingtai_mcp_tool_name = "wrong"
     else:
         agent._mcp_clients_by_tool["owner_only"] = client
         agent._mcp_tool_names.add("owner_only")

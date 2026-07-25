@@ -170,10 +170,13 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
   after stop/refresh begins. Stop and System refresh linearize when the first
   caller acquires that `RLock`: stop-first blocks mutation, while refresh-first
   completes its mutation and handoff attempt before stop proceeds.
-  `_perform_refresh` returns a typed handoff outcome; only detached watcher
-  spawn plus successful shutdown signaling commits the old process to terminal
-  `relaunching`. No-launch, ACK, watcher-spawn, and shutdown-signal failures
-  return an actionable error and release refresh ownership back to `active`;
+  the public `base_agent.RefreshHandoffOutcome` contract and one lifecycle
+  coordinator cover System, heartbeat, and worker-hang recovery callers.
+  Pre-spawn failures return actionable errors and release ownership back to
+  `active`. Once detached watcher spawn succeeds the handoff is irreversible:
+  successful shutdown signaling is `committed`, while signaling failure is
+  `committed-degraded`; both keep terminal `relaunching` plus the barrier and
+  block a second watcher/activation attempt;
   deep refresh never clears a stop-owned barrier or overwrites `stopping`.
   Reserved `telegram`/`task_card` claims require the explicit Telegram loader
   identity rather than a name-only collision bypass. `system(action="refresh")`

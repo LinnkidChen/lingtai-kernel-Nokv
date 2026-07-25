@@ -1,11 +1,11 @@
 """Tests for `_perform_refresh` filesystem handshake and lifecycle signaling.
 
-Three call sites reach `_perform_refresh` directly:
+Three call sites reach the centralized `_perform_refresh` coordinator:
 
   1. Heartbeat — has already renamed `.refresh` → `.refresh.taken` and
      intends to call `_shutdown.set()` immediately after our return.
   2. `system(action='refresh')` intrinsic — has done neither.
-  3. AED preset-fallback in `turn.py` — has done neither.
+  3. WorkerStillRunning recovery in `worker_recovery.py` — has done neither.
 
 `_perform_refresh` therefore normalizes the on-disk handshake itself
 (making `.refresh.taken` present and clearing `.refresh`) and signals
@@ -26,12 +26,18 @@ import os
 import subprocess
 import sys
 import textwrap
+import typing
 from pathlib import Path
 
 import pytest
 from unittest.mock import MagicMock, patch
 from lingtai.agent import Agent
-from lingtai.kernel.base_agent.lifecycle import RefreshHandoffStatus
+from lingtai.kernel.base_agent import (
+    BaseAgent,
+    RefreshHandoffOutcome,
+    RefreshHandoffStatus,
+)
+from lingtai.kernel.base_agent.lifecycle import _log_heartbeat_refresh_outcome
 from tests._workdir_lease_helpers import make_test_lease
 from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
 from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
@@ -615,6 +621,35 @@ def test_perform_refresh_sets_shutdown_and_cancel(tmp_path):
         "_perform_refresh must set _cancel_event so in-flight turn work yields"
 
 
+def test_perform_refresh_type_hints_resolve_public_outcome():
+    hints = typing.get_type_hints(BaseAgent._perform_refresh)
+
+    assert hints["return"] is RefreshHandoffOutcome
+
+
+@pytest.mark.parametrize(
+    ("status", "event"),
+    [
+        (RefreshHandoffStatus.COMMITTED, "refresh_handoff_committed"),
+        (RefreshHandoffStatus.COMMITTED_DEGRADED, "refresh_handoff_degraded"),
+        (RefreshHandoffStatus.NO_LAUNCH_COMMAND, "refresh_handoff_failed"),
+    ],
+)
+def test_heartbeat_logs_typed_refresh_terminal_outcome(status, event):
+    logs = []
+    agent = type(
+        "HeartbeatLogAgent",
+        (),
+        {"_log": lambda self, name, **fields: logs.append((name, fields))},
+    )()
+    outcome = RefreshHandoffOutcome(status, "test outcome")
+
+    _log_heartbeat_refresh_outcome(agent, outcome)
+
+    assert logs[0][0] == event
+    assert logs[0][1]["status"] == status.value
+
+
 def test_perform_refresh_skips_chat_history_save_when_interface_poisoned(tmp_path):
     """A poisoned interface must not be serialized: `_perform_refresh` skips
     the chat-history save and logs the skip reason, but still relaunches."""
@@ -696,7 +731,7 @@ def test_perform_refresh_no_launch_cmd_works_without_refresh_watcher(tmp_path):
     assert not agent._shutdown.is_set()
 
 
-def test_perform_refresh_real_launch_cmd_without_watcher_raises_before_handshake(tmp_path):
+def test_perform_refresh_real_launch_cmd_without_watcher_fails_before_handshake(tmp_path):
     """A real launch command with no injected `refresh_watcher` must fail
     loudly — but only before any handshake or shutdown mutation, so a missing
     Port never orphans the agent mid-handshake."""
@@ -714,9 +749,10 @@ def test_perform_refresh_real_launch_cmd_without_watcher_raises_before_handshake
     )
     agent._build_launch_cmd = lambda: ["python", "-c", "print('relaunch sentinel')"]
 
-    with pytest.raises(RuntimeError, match="RefreshWatcherPort"):
-        agent._perform_refresh()
+    outcome = agent._perform_refresh()
 
+    assert outcome.status is RefreshHandoffStatus.OPERATION_FAILED
+    assert "RefreshWatcherPort" in outcome.message
     assert not (wd / ".refresh").exists()
     assert not (wd / ".refresh.taken").exists(), \
         "missing-Port failure must precede handshake mutation"

@@ -1,7 +1,9 @@
 """Preset management — refresh, swap, list presets."""
 from __future__ import annotations
 
-from lingtai.kernel.base_agent.lifecycle import RefreshHandoffOutcome
+from typing import Callable
+
+from lingtai.kernel.base_agent import RefreshHandoffOutcome
 
 # Compatibility re-export — callers/tests import `_preset_ref_in` from here.
 # The implementation lives in the kernel so system and daemon share one
@@ -177,39 +179,11 @@ def _refresh(agent, args: dict) -> dict:
                     "message": "no default preset configured — manifest.preset.default is missing"}
         preset_name = default_name
 
-    def _claim_refresh() -> tuple[bool, dict | None]:
-        begin = getattr(agent, "_begin_mcp_refresh_ownership", None)
-        if not callable(begin):
-            return False, None
-        if begin():
-            return True, None
-        return False, {
-            "status": "error",
-            "message": "refresh blocked: agent stop is pending",
-        }
-
-    def _assert_refresh() -> None:
-        verify = getattr(agent, "_assert_mcp_refresh_ownership", None)
-        if callable(verify):
-            verify()
-
-    def _finish_refresh(owned: bool) -> None:
-        if not owned:
-            return
-        end = getattr(agent, "_end_mcp_refresh_ownership", None)
-        if callable(end):
-            end()
-
-    def _commit_refresh(owned: bool) -> None:
-        if not owned:
-            return
-        commit = getattr(agent, "_commit_mcp_refresh_handoff", None)
-        if callable(commit):
-            commit()
-
-    def _perform_refresh_handoff() -> dict | None:
+    def _perform_refresh_handoff(
+        prepare: Callable[[], str | None],
+    ) -> dict | None:
         try:
-            outcome = agent._perform_refresh()
+            outcome = agent._perform_refresh(prepare=prepare)
         except Exception as exc:
             return {
                 "status": "error",
@@ -221,6 +195,14 @@ def _refresh(agent, args: dict) -> dict:
                 "message": (
                     "refresh handoff returned no typed outcome; "
                     "the running agent remains active"
+                ),
+            }
+        if outcome.degraded:
+            return {
+                "status": "error",
+                "message": (
+                    "refresh handoff committed with degraded shutdown: "
+                    f"{outcome.message}"
                 ),
             }
         if not outcome.committed:
@@ -270,10 +252,7 @@ def _refresh(agent, args: dict) -> dict:
             agent._log("preset_swap_refused_oversize", **log_extra)
             return {"status": "error", "message": refuse_msg}
 
-        owned, ownership_error = _claim_refresh()
-        if ownership_error is not None:
-            return ownership_error
-        try:
+        def _prepare_preset_refresh() -> str | None:
             try:
                 if revert_preset:
                     activate = agent._activate_default_preset
@@ -281,10 +260,8 @@ def _refresh(agent, args: dict) -> dict:
                     activate = lambda: agent._activate_preset(preset_name)
                 precondition_error = _mcp_refresh_precondition(agent)
                 if precondition_error is not None:
-                    return precondition_error
-                _assert_refresh()
+                    return precondition_error["message"]
                 activate()
-                _assert_refresh()
                 if not revert_preset:
                     # Persist only after the MCP precondition and runtime swap.
                     _update_default_preset(agent, preset_name)
@@ -292,54 +269,42 @@ def _refresh(agent, args: dict) -> dict:
                 agent._log("preset_swap_failed",
                            requested=preset_name,
                            reason="not_found")
-                return {"status": "error",
-                        "message": f"preset {preset_name!r} not found — call system(action='presets') to see what's available"}
+                return (
+                    f"preset {preset_name!r} not found — call "
+                    "system(action='presets') to see what's available"
+                )
             except (ValueError, OSError, NotImplementedError, RuntimeError) as e:
                 agent._log("preset_swap_failed",
                            requested=preset_name,
                            reason=str(e))
-                return {"status": "error",
-                        "message": f"failed to activate preset {preset_name!r}: {e}"}
+                return f"failed to activate preset {preset_name!r}: {e}"
             agent._log("preset_swap_started",
                        preset=preset_name, reason=reason, revert=revert_preset)
-            _assert_refresh()
             agent._log("refresh_requested", reason=reason)
-            handoff_error = _perform_refresh_handoff()
-            if handoff_error is not None:
-                return handoff_error
-            _commit_refresh(owned)
-            return {
-                "status": "ok",
-                "message": t(agent._config.language, "system_tool.refresh_message"),
-            }
-        finally:
-            _finish_refresh(owned)
+            return None
+
+        handoff_error = _perform_refresh_handoff(_prepare_preset_refresh)
+        if handoff_error is not None:
+            return handoff_error
+        return {
+            "status": "ok",
+            "message": t(agent._config.language, "system_tool.refresh_message"),
+        }
     else:
-        owned, ownership_error = _claim_refresh()
-        if ownership_error is not None:
-            return ownership_error
-        try:
+        def _prepare_plain_refresh() -> str | None:
             precondition_error = _mcp_refresh_precondition(agent)
             if precondition_error is not None:
-                return precondition_error
-            try:
-                _assert_refresh()
-                agent._log("refresh_requested", reason=reason)
-                handoff_error = _perform_refresh_handoff()
-                if handoff_error is not None:
-                    return handoff_error
-                _commit_refresh(owned)
-            except RuntimeError as exc:
-                return {
-                    "status": "error",
-                    "message": f"refresh blocked: {exc}",
-                }
-            return {
-                "status": "ok",
-                "message": t(agent._config.language, "system_tool.refresh_message"),
-            }
-        finally:
-            _finish_refresh(owned)
+                return precondition_error["message"]
+            agent._log("refresh_requested", reason=reason)
+            return None
+
+        handoff_error = _perform_refresh_handoff(_prepare_plain_refresh)
+        if handoff_error is not None:
+            return handoff_error
+        return {
+            "status": "ok",
+            "message": t(agent._config.language, "system_tool.refresh_message"),
+        }
 
 
 def _presets(agent, args: dict) -> dict:

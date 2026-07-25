@@ -13,14 +13,14 @@ import os
 import sys
 import time
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from ..config import IDLE_SLEEP_TIMEOUT_SECONDS
 from ..refresh_watcher import RefreshWatcherRequest
 from ..snapshot import SourceRevisionPort
+from .refresh_handoff import RefreshHandoffOutcome, RefreshHandoffStatus
 
 
 # Key source files to hash for the runtime fingerprint.  A small curated
@@ -37,28 +37,6 @@ _FP_KEY_FILES: list[str] = [
     "notifications.py",
     "workdir.py",
 ]
-
-
-class RefreshHandoffStatus(str, Enum):
-    """Terminal truth for one deferred relaunch request."""
-
-    COMMITTED = "committed"
-    NO_LAUNCH_COMMAND = "no_launch_command"
-    ACK_FAILED = "ack_failed"
-    WATCHER_SPAWN_FAILED = "watcher_spawn_failed"
-    SHUTDOWN_SIGNAL_FAILED = "shutdown_signal_failed"
-
-
-@dataclass(frozen=True)
-class RefreshHandoffOutcome:
-    """Explicit result of attempting to hand refresh to a detached watcher."""
-
-    status: RefreshHandoffStatus
-    message: str
-
-    @property
-    def committed(self) -> bool:
-        return self.status is RefreshHandoffStatus.COMMITTED
 
 
 def _capture_runtime_fingerprint(
@@ -389,6 +367,27 @@ def _stop_heartbeat(agent) -> None:
     agent._log("heartbeat_stop", heartbeat=agent._heartbeat)
 
 
+def _log_heartbeat_refresh_outcome(agent, handoff: RefreshHandoffOutcome) -> None:
+    """Record the typed terminal disposition of a heartbeat refresh request."""
+    if handoff.degraded:
+        agent._log(
+            "refresh_handoff_degraded",
+            status=handoff.status.value,
+            message=handoff.message,
+        )
+    elif handoff.committed:
+        agent._log(
+            "refresh_handoff_committed",
+            status=handoff.status.value,
+        )
+    else:
+        agent._log(
+            "refresh_handoff_failed",
+            status=handoff.status.value,
+            message=handoff.message,
+        )
+
+
 def _heartbeat_loop(agent) -> None:
     """Beat every 1 second. AED if agent is STUCK.
 
@@ -434,12 +433,7 @@ def _heartbeat_loop(agent) -> None:
             # Delegate to _perform_refresh which handles the full flow:
             # save chat history, spawn watcher process, deferred relaunch.
             handoff = _perform_refresh(agent)
-            if not handoff.committed:
-                agent._log(
-                    "refresh_handoff_failed",
-                    status=handoff.status.value,
-                    message=handoff.message,
-                )
+            _log_heartbeat_refresh_outcome(agent, handoff)
 
         # .suspend = SUSPENDED (full process death, external only)
         suspend_file = agent._working_dir / ".suspend"
@@ -715,7 +709,75 @@ def _write_heartbeat_tick(agent) -> None:
         pass
 
 
+def _coordinate_refresh_handoff(
+    agent,
+    operation: Callable[[], RefreshHandoffOutcome],
+) -> RefreshHandoffOutcome:
+    """Own the complete refresh lifecycle for every caller."""
+    begin = getattr(agent, "_begin_mcp_refresh_ownership", None)
+    end = getattr(agent, "_end_mcp_refresh_ownership", None)
+    commit = getattr(agent, "_commit_mcp_refresh_handoff", None)
+    owned = False
+    if callable(begin):
+        if not begin():
+            return RefreshHandoffOutcome(
+                RefreshHandoffStatus.LIFECYCLE_BLOCKED,
+                "agent stop or another terminal lifecycle transition is pending",
+            )
+        owned = True
+    try:
+        try:
+            outcome = operation()
+        except Exception as exc:
+            return RefreshHandoffOutcome(
+                RefreshHandoffStatus.OPERATION_FAILED,
+                f"refresh operation failed: {exc}",
+            )
+        if not isinstance(outcome, RefreshHandoffOutcome):
+            return RefreshHandoffOutcome(
+                RefreshHandoffStatus.INVALID_OUTCOME,
+                "refresh operation returned no typed handoff outcome",
+            )
+        if outcome.committed and owned:
+            if not callable(commit):
+                return RefreshHandoffOutcome(
+                    RefreshHandoffStatus.COMMITTED_DEGRADED,
+                    "watcher started, but lifecycle has no terminal commit hook",
+                )
+            commit()
+        return outcome
+    finally:
+        if owned and callable(end):
+            end()
+
+
 def _perform_refresh(
+    agent,
+    *,
+    skip_chat_history_save: bool = False,
+    skip_save_reason: str | None = None,
+    prepare: Callable[[], str | None] | None = None,
+) -> RefreshHandoffOutcome:
+    """Coordinate optional preparation and the irreversible watcher handoff."""
+
+    def operation() -> RefreshHandoffOutcome:
+        if prepare is not None:
+            preparation_error = prepare()
+            if preparation_error is not None:
+                return RefreshHandoffOutcome(
+                    RefreshHandoffStatus.PREPARATION_FAILED,
+                    preparation_error,
+                )
+        return _perform_refresh_uncoordinated(
+            agent,
+            skip_chat_history_save=skip_chat_history_save,
+            skip_save_reason=skip_save_reason,
+        )
+
+    return _coordinate_refresh_handoff(agent, operation)
+
+
+def _perform_refresh_uncoordinated(
     agent,
     *,
     skip_chat_history_save: bool = False,
@@ -723,18 +785,19 @@ def _perform_refresh(
 ) -> RefreshHandoffOutcome:
     """Refresh = .refresh handshake + deferred relaunch.
 
-    Self-sufficient across all call sites — heartbeat, tool-call (intrinsic
-    ``system(action='refresh')``), and AED preset-fallback in ``turn.py`` all
-    call directly. Two filesystem signals drive the watcher subprocess:
+    The centralized coordinator invokes this raw operation for heartbeat,
+    ``system(action='refresh')``, and worker-hang recovery. Two filesystem
+    signals drive the watcher subprocess:
 
       1. ``.refresh.taken`` must exist before the watcher's ack deadline.
       2. ``.agent.lock`` must clear before the watcher's lock deadline.
 
     The heartbeat path may rename ``.refresh`` → ``.refresh.taken`` before
-    invoking us. Every caller receives an explicit outcome; only a committed
-    result means the watcher spawned and shutdown signaling completed. We
-    normalize the handshake here and set ``_shutdown`` / ``_cancel_event``
-    ourselves so the watcher's second phase can complete.
+    invoking us. Every caller receives an explicit outcome. A normal committed
+    result means watcher spawn and shutdown signaling completed; a
+    committed-degraded result means spawn completed but shutdown signaling
+    failed. We normalize the handshake here and set ``_shutdown`` /
+    ``_cancel_event`` ourselves so the watcher's second phase can complete.
     """
     # When the worker interface is poisoned, the in-memory ChatInterface may
     # still be mutated by a stuck worker thread — saving it would serialize
@@ -868,9 +931,8 @@ def _perform_refresh(
         )
     agent._log("refresh_deferred_relaunch",
                cmd=cmd[0], handshake=handshake_source)
-    # Lock-clear signaling — direct callers (intrinsic system tool call,
-    # AED preset fallback) reach this function without going through the
-    # heartbeat's `_shutdown.set()` step at lifecycle.py:212. Without
+    # Lock-clear signaling — System and worker recovery reach this operation
+    # without going through a heartbeat-owned `_shutdown.set()` step. Without
     # `_shutdown` set the run loop never exits and `.agent.lock` never
     # releases, so the watcher times out at phase='lock'. Setting these
     # events here makes the watcher's second phase complete uniformly
@@ -892,8 +954,11 @@ def _perform_refresh(
             error=f"{type(exc).__name__}: {exc}",
         )
         return RefreshHandoffOutcome(
-            RefreshHandoffStatus.SHUTDOWN_SIGNAL_FAILED,
-            f"watcher started but agent shutdown signaling failed: {exc}",
+            RefreshHandoffStatus.COMMITTED_DEGRADED,
+            (
+                "detached watcher started, but agent shutdown signaling "
+                f"failed: {exc}"
+            ),
         )
     return RefreshHandoffOutcome(
         RefreshHandoffStatus.COMMITTED,

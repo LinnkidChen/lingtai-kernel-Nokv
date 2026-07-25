@@ -325,6 +325,13 @@ def request_worker_hang_refresh(
             raise RuntimeError(
                 f"refresh handoff {outcome.status.value}: {outcome.message}"
             )
+        if outcome.degraded:
+            agent._log(
+                "worker_hang_refresh_request_degraded",
+                source=source,
+                artifact=artifact_relpath,
+                message=outcome.message[:300],
+            )
     except Exception as refresh_err:
         agent._llm_worker_refresh_requested = False
         try:

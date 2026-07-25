@@ -37,6 +37,24 @@ Generic agent kernel. Single class `BaseAgent` with methods distributed across 6
 
 > **History note:** there used to be a 7th module, `soul_flow.py`. It was deleted in `1acd183` — soul-domain logic moved to `intrinsics/soul/flow.py`, and the wire-splice logic that lived in it became `tc_inbox.TCInbox.drain_into()`. Mention preserved here only because old patches/discussions reference it.
 
+## Refresh handoff contract
+
+`base_agent/refresh_handoff.py` is the stable public home of
+`RefreshHandoffOutcome` and `RefreshHandoffStatus`; `base_agent/__init__.py`
+re-exports both and annotates `BaseAgent._perform_refresh` with the public type.
+The single lifecycle coordinator owns begin, optional preparation, handoff,
+terminal commit, and end for all three callers: System refresh, heartbeat
+`.refresh`, and `worker_recovery.request_worker_hang_refresh`.
+
+Failures before watcher spawn restore `active`. Watcher spawn is irreversible:
+if later shutdown signaling fails, the typed outcome is `committed-degraded`,
+the coordinator still commits `relaunching` with the lifecycle barrier set,
+and later watcher or MCP activation attempts remain blocked. Each caller
+consumes this typed terminal disposition: System returns an actionable error,
+heartbeat logs committed/failed/degraded distinctly, and worker recovery keeps
+the request latched for either committed outcome but resets it for failed or
+untyped outcomes so a later request can retry.
+
 ## Components
 
 - `base_agent/__init__.py` — `BaseAgent` coordinator. Its constructor requires injected `WorkdirLeasePort`, `NotificationStorePort`, `AgentPresenceStorePort`, `LifecycleClockPort`, `SnapshotPort`, and `SourceRevisionPort`; `RefreshWatcherPort` is the one exception — an optional, defaulted-`None` `refresh_watcher` kwarg, so the many pre-existing raw `BaseAgent(...)` construction sites unrelated to refresh are unaffected, while composition roots always inject the production adapter and `_perform_refresh` fails loudly on `None` before any handshake mutation once a real launch command exists (see `src/lingtai/kernel/refresh_watcher/CONTRACT.md`). `BaseAgent` stores only those capabilities and performs no concrete adapter construction (`src/lingtai/kernel/base_agent/__init__.py:379-462`). The required `lifecycle_clock` is bound to `self._lifecycle_clock` before the first time sample; wall-domain reads (`wall_seconds()`) seed/refresh `_state_changed_at`/`_last_progress_at`, the ACTIVE `_active_turn_started_at`, `_deferred_notifications_oldest_at`, and the event-journal `ts`, while monotonic reads (`monotonic_seconds()`) seed `_idle_since_monotonic` — no Core import/construction of the concrete adapter, no default/no-op form (see `src/lingtai/kernel/lifecycle_clock/CONTRACT.md`). `_sync_notifications` reads snapshots/fingerprints through the notification Port and preserves the existing state/wake/live-holder order (`src/lingtai/kernel/base_agent/__init__.py:1302-1543`).

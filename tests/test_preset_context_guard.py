@@ -8,7 +8,7 @@ from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 from pathlib import Path
 
 import pytest
-from lingtai.kernel.base_agent.lifecycle import (
+from lingtai.kernel.base_agent import (
     RefreshHandoffOutcome,
     RefreshHandoffStatus,
 )
@@ -19,7 +19,18 @@ from tests._notification_store_helpers import notification_store_for
 from tests._agent_presence_helpers import make_test_presence_store
 
 
-def _committed_refresh(calls: list | None = None) -> RefreshHandoffOutcome:
+def _committed_refresh(
+    calls: list | None = None,
+    *,
+    prepare=None,
+) -> RefreshHandoffOutcome:
+    if prepare is not None:
+        preparation_error = prepare()
+        if preparation_error is not None:
+            return RefreshHandoffOutcome(
+                RefreshHandoffStatus.PREPARATION_FAILED,
+                preparation_error,
+            )
     if calls is not None:
         calls.append(True)
     return RefreshHandoffOutcome(
@@ -149,7 +160,7 @@ def test_swap_refused_when_current_context_exceeds_target_limit(tmp_path, monkey
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: _committed_refresh(perform_calls))
+                        lambda **kwargs: _committed_refresh(perform_calls, **kwargs))
 
     log_events = []
     real_log = agent._log
@@ -186,7 +197,7 @@ def test_swap_allowed_when_current_context_fits(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_activate_preset",
                         lambda n: activate_calls.append(n))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: _committed_refresh(perform_calls))
+                        lambda **kwargs: _committed_refresh(perform_calls, **kwargs))
 
     small_path = str(plib / "small.json")
     result = agent._intrinsics["system"]({"action": "refresh", "preset": small_path})
@@ -369,7 +380,7 @@ def test_revert_refused_when_current_context_exceeds_default_limit(tmp_path, mon
     monkeypatch.setattr(agent, "_activate_default_preset",
                         lambda: activate_default_calls.append(True))
     monkeypatch.setattr(agent, "_perform_refresh",
-                        lambda: _committed_refresh(perform_calls))
+                        lambda **kwargs: _committed_refresh(perform_calls, **kwargs))
 
     log_events = []
     real_log = agent._log

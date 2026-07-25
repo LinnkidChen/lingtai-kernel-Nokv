@@ -1516,12 +1516,13 @@ class Agent(BaseAgent):
             )
         for name in global_names:
             owner = self._mcp_clients_by_tool[name]
-            handler_owner = getattr(
-                tagged_handlers[name], "_lingtai_mcp_client", None
-            )
+            handler = tagged_handlers[name]
+            handler_owner = getattr(handler, "_lingtai_mcp_client", None)
+            handler_tool_name = getattr(handler, "_lingtai_mcp_tool_name", None)
             if (
                 id(owner) not in live_client_ids
                 or handler_owner is not owner
+                or handler_tool_name != name
                 or sum(schema.name == name for schema in self._tool_schemas) != 1
             ):
                 raise RuntimeError(

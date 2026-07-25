@@ -456,15 +456,18 @@ requires both `active` and `default` to be members of `allowed`.
    a named swap activate and persist its selected path, followed by runtime
    reconstruction (LLM/config/capabilities/MCP/prompts, preserving conversation
    history where a live session exists).
-   Refresh owns this sequence through the relaunch request using the same
-   lifecycle lock as stop. The first caller to acquire that lock wins:
-   stop-first refuses preset mutation and relaunch, while refresh-first
-   completes its mutation and handoff attempt before stop proceeds. Refresh
-   reports success only when a detached watcher starts and shutdown signaling
-   succeeds. Missing launch commands, ACK creation failure, watcher-start
-   failure, or shutdown-signal failure return an error and leave the old
-   process active; deep reconstruction never clears a stop-owned barrier or
-   changes `stopping` back to `active`.
+   One lifecycle coordinator owns this sequence through the relaunch request
+   for System, heartbeat, and worker recovery, using the same lifecycle lock as
+   stop. The first caller to acquire that lock wins: stop-first refuses preset
+   mutation and relaunch, while refresh-first completes its mutation and
+   handoff attempt before stop proceeds. Refresh reports success only when a
+   detached watcher starts and shutdown signaling succeeds. Missing launch
+   commands, ACK creation failure, and watcher-start failure return an error
+   and restore the old process to `active`. Once the watcher starts, a later
+   shutdown-signal failure is instead `committed-degraded`: it returns an
+   actionable error but preserves terminal `relaunching` plus the barrier, so a
+   second watcher or activation cannot start. Deep reconstruction never clears
+   a stop-owned or committed-handoff barrier.
 4. A config, prompt, MCP, or capability edit needs `refresh` to take effect;
    `system(action="summarize")` alone does not reconstruct the runtime and
    must not be used as a refresh substitute.
