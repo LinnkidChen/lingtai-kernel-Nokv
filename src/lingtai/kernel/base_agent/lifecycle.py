@@ -713,7 +713,7 @@ def _coordinate_refresh_handoff(
     agent,
     operation: Callable[[], RefreshHandoffOutcome],
 ) -> RefreshHandoffOutcome:
-    """Own the complete refresh lifecycle for every caller."""
+    """Own lifecycle, including terminal-commit and finalizer degradation."""
     begin = getattr(agent, "_begin_mcp_refresh_ownership", None)
     end = getattr(agent, "_end_mcp_refresh_ownership", None)
     commit = getattr(agent, "_commit_mcp_refresh_handoff", None)
@@ -838,10 +838,11 @@ def _perform_refresh_uncoordinated(
     The heartbeat path may rename ``.refresh`` → ``.refresh.taken`` before
     invoking us. Every caller receives an explicit outcome. A normal committed
     result means watcher spawn and all post-spawn steps completed; a
-    committed-degraded result means spawn completed but some later telemetry,
-    shutdown-signaling, or terminal-commit step failed. We normalize the
-    handshake here and set ``_shutdown`` / ``_cancel_event`` ourselves so the
-    watcher's second phase can complete.
+    committed-degraded result from this raw operation means spawn completed but
+    its later telemetry or shutdown-signaling step failed. Terminal-commit and
+    finalizer degradation are coordinator-owned. We normalize the handshake
+    here and set ``_shutdown`` / ``_cancel_event`` ourselves so the watcher's
+    second phase can complete.
     """
     # When the worker interface is poisoned, the in-memory ChatInterface may
     # still be mutated by a stuck worker thread — saving it would serialize

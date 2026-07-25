@@ -76,6 +76,26 @@ def _committed_refresh(
     )
 
 
+def _assert_lifecycle_lock_available_from_another_thread(agent) -> None:
+    """Prove refresh finalization released the RLock beyond this thread."""
+    acquired = []
+    finished = threading.Event()
+
+    def probe():
+        held = agent._mcp_activation_lock.acquire(timeout=0.5)
+        acquired.append(held)
+        if held:
+            agent._mcp_activation_lock.release()
+        finished.set()
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    assert finished.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert acquired == [True]
+
+
 # ---------------------------------------------------------------------------
 # Validator
 # ---------------------------------------------------------------------------
@@ -1172,8 +1192,10 @@ def test_system_refresh_terminal_commit_failure_stays_terminal_and_not_respawned
     assert "terminal lifecycle transition is pending" in second["message"]
     assert len(agent._refresh_watcher.calls) == 1
     assert agent._mcp_refresh_handoff_committed is True
+    assert agent._mcp_refresh_owner_thread is None
     assert agent._mcp_lifecycle_state == "relaunching"
     assert agent._mcp_lifecycle_barrier.is_set()
+    _assert_lifecycle_lock_available_from_another_thread(agent)
 
 
 def test_system_refresh_end_after_release_failure_stays_terminal_and_not_respawned(
@@ -1199,8 +1221,10 @@ def test_system_refresh_end_after_release_failure_stays_terminal_and_not_respawn
     assert "terminal lifecycle transition is pending" in second["message"]
     assert len(agent._refresh_watcher.calls) == 1
     assert agent._mcp_refresh_handoff_committed is True
+    assert agent._mcp_refresh_owner_thread is None
     assert agent._mcp_lifecycle_state == "relaunching"
     assert agent._mcp_lifecycle_barrier.is_set()
+    _assert_lifecycle_lock_available_from_another_thread(agent)
 
 
 def test_system_refresh_uncommitted_end_failure_returns_typed_error(
@@ -1223,8 +1247,10 @@ def test_system_refresh_uncommitted_end_failure_returns_typed_error(
     assert "refresh lifecycle finalization failed" in result["message"]
     assert not agent._refresh_watcher.spawned
     assert agent._mcp_refresh_handoff_committed is False
+    assert agent._mcp_refresh_owner_thread is None
     assert agent._mcp_lifecycle_state == "active"
     assert not agent._mcp_lifecycle_barrier.is_set()
+    _assert_lifecycle_lock_available_from_another_thread(agent)
 
 
 @pytest.mark.parametrize("caller", ["heartbeat_direct", "worker_recovery"])
