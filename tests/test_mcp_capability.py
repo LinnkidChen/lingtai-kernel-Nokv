@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from lingtai.agent import Agent
+from lingtai.kernel.llm import FunctionSchema
 from lingtai.services.mcp_registry import (
     REGISTRY_FILENAME,
     decompress_addons,
@@ -23,6 +24,12 @@ from lingtai.services.mcp_registry import (
     validate_record,
 )
 from tests._service_helpers import make_gemini_mock_service as make_mock_service
+from tests._mcp_stdio_fixture import (
+    StdioProcessObserver,
+    stop_process,
+    wait_for_process_exit,
+    wait_for_thread_exit,
+)
 
 
 
@@ -850,6 +857,376 @@ def test_retry_failed_mcps_no_specs_is_noop(tmp_path):
     report = agent._retry_failed_mcps()
     assert report == {"retried": [], "recovered": [],
                       "still_failed": [], "healthy": []}
+
+
+class _ActivationClient:
+    def __init__(self, tools, *, list_error=None, on_start=None):
+        self.tools = tools
+        self.list_error = list_error
+        self.on_start = on_start
+        self.started = False
+        self.closed = False
+
+    def start(self):
+        if self.on_start:
+            self.on_start()
+        self.started = True
+
+    def list_tools(self, timeout=10):
+        if self.list_error:
+            raise self.list_error
+        return copy.deepcopy(self.tools)
+
+    def is_connected(self):
+        return self.started and not self.closed
+
+    def close(self):
+        self.closed = True
+
+    def call_tool(self, name, args):
+        return {"status": "success", "name": name, "args": args}
+
+
+def _tool(name):
+    return {
+        "name": name,
+        "description": f"{name} description",
+        "schema": {"type": "object", "properties": {}},
+    }
+
+
+def test_mcp_activation_listing_failure_cleans_unpublished_candidate(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([], list_error=RuntimeError("list failed"))
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient",
+        lambda **kwargs: candidate,
+    )
+    handlers = agent._tool_handlers
+    schemas = agent._tool_schemas
+
+    with pytest.raises(RuntimeError, match="list failed"):
+        agent.connect_mcp("/bin/false")
+
+    assert candidate.closed
+    assert agent._mcp_clients == []
+    assert agent._mcp_clients_by_tool == {}
+    assert agent._mcp_tool_names == set()
+    assert agent._tool_handlers is handlers
+    assert agent._tool_schemas is schemas
+
+
+def test_mcp_activation_collision_rejects_whole_candidate_before_mutation(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([_tool("system"), _tool("free_name")])
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient",
+        lambda **kwargs: candidate,
+    )
+    handlers = agent._tool_handlers
+    schemas = agent._tool_schemas
+
+    with pytest.raises(RuntimeError, match="built-in/reserved"):
+        agent.connect_mcp("/bin/false")
+
+    assert candidate.closed
+    assert agent._tool_handlers is handlers
+    assert agent._tool_schemas is schemas
+    assert "free_name" not in agent._tool_handlers
+
+
+def test_mcp_activation_duplicate_names_fail_closed(tmp_path, monkeypatch):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([_tool("dup"), _tool("dup")])
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient",
+        lambda **kwargs: candidate,
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        agent.connect_mcp("/bin/false")
+
+    assert candidate.closed
+    assert "dup" not in agent._tool_handlers
+
+
+def test_mcp_activation_publication_failure_exact_restores_initial_state(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([_tool("candidate_tool")])
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient",
+        lambda **kwargs: candidate,
+    )
+    handlers = agent._tool_handlers
+    schemas = agent._tool_schemas
+    agent._mcp_init_specs = {
+        "candidate": {"cfg": {}, "source": "init.json:mcp", "client": None}
+    }
+    monkeypatch.setattr(
+        agent,
+        "_maybe_setup_task_card_controller",
+        lambda: (_ for _ in ()).throw(RuntimeError("publish hook failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="publish hook failed"):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name="candidate",
+        )
+
+    assert candidate.closed
+    assert agent._tool_handlers is handlers
+    assert agent._tool_schemas is schemas
+    assert agent._mcp_clients == []
+    assert agent._mcp_clients_by_tool == {}
+    assert agent._mcp_tool_names == set()
+    assert agent._mcp_init_specs["candidate"]["client"] is None
+
+
+def test_mcp_activation_healthy_foreign_collision_preserves_identity(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+    owner = _ActivationClient([_tool("claimed")])
+    owner.started = True
+    owner_handler = agent._make_mcp_handler(owner, "claimed")
+    owner_schema = FunctionSchema(
+        name="claimed",
+        description="claimed",
+        parameters={"type": "object", "properties": {}},
+    )
+    agent._mcp_clients.append(owner)
+    agent._mcp_clients_by_tool["claimed"] = owner
+    agent._mcp_tool_names.add("claimed")
+    agent._tool_handlers["claimed"] = owner_handler
+    agent._tool_schemas.append(owner_schema)
+    candidate = _ActivationClient([_tool("claimed")])
+
+    with pytest.raises(RuntimeError, match="healthy foreign MCP"):
+        agent._activate_mcp_candidate(candidate)
+
+    assert candidate.closed
+    assert agent._tool_handlers["claimed"] is owner_handler
+    assert agent._mcp_clients_by_tool["claimed"] is owner
+    assert [s for s in agent._tool_schemas if s.name == "claimed"] == [owner_schema]
+    assert agent._mcp_clients == [owner]
+
+
+def test_mcp_activation_inconsistent_collision_preserves_identity(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+    existing = lambda args: args
+    agent._tool_handlers["orphan"] = existing
+    schemas = agent._tool_schemas
+    candidate = _ActivationClient([_tool("orphan")])
+
+    with pytest.raises(RuntimeError, match="built-in handler"):
+        agent._activate_mcp_candidate(candidate)
+
+    assert candidate.closed
+    assert agent._tool_handlers["orphan"] is existing
+    assert agent._tool_schemas is schemas
+    assert agent._mcp_clients == []
+
+
+def test_mcp_predecessor_must_be_exact_init_spec_identity(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+    recorded = _ActivationClient([])
+    candidate = _ActivationClient([_tool("new")])
+    other = _ActivationClient([])
+    agent._mcp_init_specs = {
+        "example": {"cfg": {}, "source": "init.json:mcp", "client": recorded}
+    }
+
+    with pytest.raises(RuntimeError, match="not exact"):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name="example",
+            predecessor=other,
+        )
+
+    assert not candidate.started
+    assert candidate.closed
+    assert agent._mcp_init_specs["example"]["client"] is recorded
+
+
+def test_mcp_predecessor_close_failure_never_starts_replacement(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+
+    class _Unclosable(_ActivationClient):
+        def close(self):
+            raise RuntimeError("close failed")
+
+    predecessor = _Unclosable([])
+    predecessor.started = False
+    agent._mcp_clients.append(predecessor)
+    agent._mcp_init_specs = {
+        "example": {"cfg": {}, "source": "init.json:mcp", "client": predecessor}
+    }
+    candidate = _ActivationClient([_tool("new")])
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name="example",
+            predecessor=predecessor,
+        )
+
+    assert not candidate.started
+    assert candidate.closed
+    assert agent._mcp_init_specs["example"]["client"] is None
+    assert predecessor not in agent._mcp_clients
+
+
+def test_mcp_predecessor_retires_before_replacement_and_reconciles_names(
+    tmp_path,
+):
+    agent, _ = _mk_agent(tmp_path)
+    predecessor = _ActivationClient([])
+    predecessor.started = True
+    predecessor.closed = False
+    for name in ("shared", "old_only"):
+        agent._tool_handlers[name] = agent._make_mcp_handler(predecessor, name)
+        agent._tool_schemas.append(
+            FunctionSchema(
+                name=name,
+                description=name,
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+        agent._mcp_clients_by_tool[name] = predecessor
+    agent._mcp_clients.append(predecessor)
+    agent._mcp_tool_names.update({"shared", "old_only"})
+    agent._mcp_init_specs = {
+        "example": {"cfg": {}, "source": "init.json:mcp", "client": predecessor}
+    }
+    # Model a transport whose loop died before retirement.
+    predecessor.started = False
+
+    candidate = _ActivationClient(
+        [_tool("shared"), _tool("new_only")],
+        on_start=lambda: (
+            None
+            if predecessor.closed
+            else (_ for _ in ()).throw(
+                AssertionError("replacement overlapped predecessor")
+            )
+        ),
+    )
+
+    names = agent._activate_mcp_candidate(
+        candidate,
+        allow_sealed=True,
+        init_spec_name="example",
+        predecessor=predecessor,
+    )
+
+    assert names == ["shared", "new_only"]
+    assert predecessor.closed
+    assert agent._mcp_init_specs["example"]["client"] is candidate
+    assert set(agent._mcp_clients_by_tool) >= {"shared", "new_only"}
+    assert "old_only" not in agent._tool_handlers
+    assert "old_only" not in agent._mcp_tool_names
+
+
+def test_mcp_teardown_attempts_every_client_and_later_converges(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+
+    class _FlakyClose(_ActivationClient):
+        def __init__(self, name, failures):
+            super().__init__([_tool(name)])
+            self.name = name
+            self.failures = failures
+            self.started = True
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls <= self.failures:
+                raise RuntimeError(f"{self.name} close failed")
+            self.closed = True
+
+    flaky = _FlakyClose("flaky", failures=1)
+    healthy = _FlakyClose("healthy", failures=0)
+    for client in (flaky, healthy):
+        name = client.name
+        agent._mcp_clients.append(client)
+        agent._mcp_clients_by_tool[name] = client
+        agent._mcp_tool_names.add(name)
+        agent._tool_handlers[name] = agent._make_mcp_handler(client, name)
+        agent._tool_schemas.append(
+            FunctionSchema(
+                name=name,
+                description=name,
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+    agent._mcp_init_specs = {
+        client.name: {"cfg": {}, "source": "init.json:mcp", "client": client}
+        for client in (flaky, healthy)
+    }
+
+    first = agent._retire_all_mcp_clients(context="test")
+
+    assert first["attempted"] == 2
+    assert len(first["unresolved"]) == 1
+    assert healthy.closed
+    assert healthy.close_calls == 1
+    assert flaky.close_calls == 1
+    assert agent._mcp_clients == [flaky]
+    assert agent._mcp_clients_by_tool == {}
+    assert "flaky" not in agent._tool_handlers
+    assert "healthy" not in agent._tool_handlers
+    assert agent._mcp_init_specs["flaky"]["client"] is None
+    assert agent._mcp_init_specs["healthy"]["client"] is None
+
+    second = agent._retire_all_mcp_clients(context="test_retry")
+
+    assert second["unresolved"] == []
+    assert flaky.closed
+    assert flaky.close_calls == 2
+    assert agent._mcp_clients == []
+
+
+def test_mcp_real_stdio_listing_failure_retires_child_and_thread(
+    tmp_path, monkeypatch
+):
+    from lingtai.services import mcp as mcp_module
+
+    observer = StdioProcessObserver()
+    observer.install(monkeypatch)
+    instances = []
+    real_client = mcp_module.MCPClient
+
+    def capture_client(**kwargs):
+        client = real_client(**kwargs)
+        instances.append(client)
+        return client
+
+    monkeypatch.setattr(mcp_module, "MCPClient", capture_client)
+    agent, _ = _mk_agent(tmp_path)
+    try:
+        with pytest.raises(Exception):
+            agent.connect_mcp(
+                sys.executable,
+                ["-m", "tests._mcp_activation_stdio_server"],
+            )
+        child = observer.wait_for_records(1)[0]
+        assert instances
+        assert wait_for_thread_exit(instances[0]._thread)
+        assert wait_for_process_exit(child)
+        assert agent._mcp_clients == []
+        assert agent._mcp_clients_by_tool == {}
+    finally:
+        for child in observer.records():
+            if not wait_for_process_exit(child, timeout=0):
+                stop_process(child)
 
 
 def test_curated_catalog_includes_whatsapp(tmp_path: Path):

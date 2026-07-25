@@ -78,6 +78,14 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 - `MCPClient` uses `stdio_client` transport (subprocess); `HTTPMCPClient` uses `streamablehttp_client` (remote HTTP/SSE). Both expose identical `call_tool()` / `list_tools()` / `close()` API.
 - Lazy start: both clients auto-connect on first `call_tool()`.
 - **Structured MCP results:** `_decode_tool_result` (`mcp.py:44-80`) is shared by stdio and HTTP. It prefers dictionary `structuredContent`, then JSON-object text, and preserves structured error fields at top level while forcing protocol-authoritative `status="error"`; plain-text errors retain the legacy `status`/`message` envelope. Tests: `tests/test_mcp_structured_result.py`.
+- **Structured-result policy:** `isError=false` (or an absent transport bit)
+  does not add a success status or rewrite an explicit object-level status.
+  For `isError=true`, a missing, empty, or non-string object `message` uses
+  the first text block and then `Unknown MCP error`; a non-empty string,
+  including whitespace-only text, is preserved literally. The same matrix is
+  locked for structured and JSON-object sources on both clients, and a
+  hermetic real-stdio round trip verifies the public five-field typed-error
+  result plus child/thread retirement.
 - **Stale-resource recovery (issue #104):** `MCPClient` detects a dead stdio transport in `call_tool` and recovers. `_format_exception` renders `ClassName: message` (class-only when `str(e)` is empty) so an empty `ClosedResourceError` never surfaces as a blank `{"status":"error","message":""}`. `_is_stale_resource_error` flags closed/broken transports by class name + message substrings. On a stale error `call_tool` calls `restart()` (which `close()`s, clears `_ready`/`_error`, resets `_closed`/`_session`/`_loop`/`_thread`/`*_cm` so `start()` cannot lie) and retries **once**; a failed retry returns a helpful error naming the class and the retry failure. Non-stale errors surface the class name without churning the subprocess. `HTTPMCPClient` reuses `MCPClient._format_exception` for its connect error only — it has no stale-resource restart (stdio is the reported transport). Tests: `tests/test_mcp_closed_resource_restart.py`.
 - The transport lifecycle, `list_tools()`, `_run_loop()`, and `_async_cleanup()` patterns remain duplicated between the two clients; result normalization is deliberately shared.
 - `mail.py` is a compatibility-only alias surface. The normative boundary is `lingtai.kernel.mail_transport.MailTransportPort`; the production implementation is `lingtai.adapters.posix.mail.PosixFilesystemMailAdapter`. The legacy public names remain aliases, not a second implementation or a Core shim.

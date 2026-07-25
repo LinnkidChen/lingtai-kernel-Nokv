@@ -9,6 +9,8 @@ related_files:
   - src/lingtai/tools/system/glossary-en.md
   - src/lingtai/tools/system/glossary-zh.md
   - src/lingtai/tools/system/glossary-wen.md
+  - src/lingtai/intrinsic_skills/system-manual/SKILL.md
+  - tests/test_system.py
 maintenance: |
   Keep related_files as repo-relative paths to real files. Include neighboring
   ANATOMY.md files so the anatomy graph stays connected rather than isolated;
@@ -34,7 +36,7 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 - `preset.py` — Preset management and refresh.
   - `_preset_ref_in()` (`preset.py:9-36`) — normalized membership test for preset path strings (~/foo vs absolute).
   - `_check_context_fits()` (`preset.py:39-76`) — verify agent's current context fits within target preset's context_limit.
-  - `_refresh()` (`preset.py:79-199`) — stop, reload config + MCP servers, restart. Handles preset swap (named or revert) with authorization gate and context-limit guard. **Empty-string normalization:** `args.get('preset')` returning `''` or whitespace-only is treated as absent (`preset_name = None`) before any conflict/swap logic; this protects against tool-call providers that serialize optional string fields as `""` instead of omitting them — without normalization, an empty string would fall into the allowed-list gate and surface as `"preset '' is not in this agent's allowed list"`. The `preset='' + revert_preset=True` combination is consequently treated as a plain revert (no conflict). **MCP retry hook (issue #34):** before calling `agent._perform_refresh()`, invokes `agent._retry_failed_mcps()` if the Agent subclass defines it. Failures are logged and swallowed so a flaky MCP cannot block refresh itself. Lets the documented "fix config → refresh" recovery path work in-process.
+  - `_refresh()` (`preset.py:79-215`) — stop, reload config + MCP servers, restart. Handles preset swap (named or revert) with authorization gate and context-limit guard. **Empty-string normalization:** `args.get('preset')` returning `''` or whitespace-only is treated as absent (`preset_name = None`) before any conflict/swap logic. **MCP retry precondition (issue #34):** before calling `agent._perform_refresh()`, invokes `agent._retry_failed_mcps()` if present. An exception, non-dict report, or non-empty `still_failed` list returns an actionable error and does not request deferred relaunch; healthy/no-spec reports preserve the successful refresh path.
   - `_presets()` (`preset.py:202-282`) — list available presets with LLM connectivity probing.
 
 - `karma.py` — Karma-gated lifecycle actions.

@@ -182,19 +182,41 @@ def _refresh(agent, args: dict) -> dict:
 
     agent._log("refresh_requested", reason=reason)
 
-    # Re-spawn any init.json MCPs whose subprocess exited at boot (or has
-    # since died). The Agent subclass owns the retry — BaseAgent has no
-    # MCP machinery — so the call is gated on hasattr(). Failures are
-    # logged and swallowed so a flaky MCP cannot block refresh itself.
-    # Closes Lingtai-AI/lingtai#34.
+    # Re-spawn any dead init.json MCP before requesting a deferred relaunch.
+    # Cleanup/retirement is a hard precondition: proceeding after an exception
+    # or unresolved replacement can overlap the old and new runtime.
     retry = getattr(agent, "_retry_failed_mcps", None)
     if callable(retry):
         try:
             report = retry()
+            if not isinstance(report, dict):
+                raise RuntimeError("MCP retry returned no verifiable report")
             if report.get("retried"):
                 agent._log("mcp_retry_summary", **report)
+            unresolved = list(report.get("still_failed") or [])
+            if unresolved:
+                agent._log(
+                    "mcp_retry_error",
+                    error="unresolved MCP cleanup or activation",
+                    still_failed=unresolved,
+                )
+                return {
+                    "status": "error",
+                    "message": (
+                        "refresh blocked: MCP cleanup or activation remains "
+                        f"unresolved for {', '.join(map(str, unresolved))}; "
+                        "fix the MCP and retry refresh"
+                    ),
+                }
         except Exception as e:
             agent._log("mcp_retry_error", error=str(e))
+            return {
+                "status": "error",
+                "message": (
+                    "refresh blocked: MCP cleanup or activation could not be "
+                    f"verified: {e}"
+                ),
+            }
 
     agent._perform_refresh()
     return {

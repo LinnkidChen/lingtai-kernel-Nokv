@@ -5,6 +5,9 @@ contract_version: 1
 related_files:
   - src/lingtai/tools/system/__init__.py
   - src/lingtai/tools/system/ANATOMY.md
+  - src/lingtai/tools/system/preset.py
+  - src/lingtai/intrinsic_skills/system-manual/SKILL.md
+  - tests/test_system.py
 maintenance: |
   Keep related_files as repo-relative paths to real files. If behavior and this
   contract disagree, the code is the source of truth — fix the contract in the
@@ -52,7 +55,7 @@ Dispatch is the `handle()` table in `src/lingtai/tools/system/__init__.py`.
 
 | Action | Required inputs | Optional inputs | Success output | Error shapes |
 |---|---|---|---|---|
-| `refresh` | — | `reason`, `preset`, `revert_preset` | `{status: "ok", message}` | `{status: "error", message}` on preset/revert conflict, unauthorized preset, oversize context, or activation failure |
+| `refresh` | — | `reason`, `preset`, `revert_preset` | `{status: "ok", message}` | `{status: "error", message}` on preset/revert conflict, unauthorized preset, oversize context, activation failure, or unverifiable/unresolved MCP retry cleanup |
 | `sleep` | — | `reason`, `force` | `{status: "ok", message}` (self-sleep; refuses with an ok+message when notifications pending and not `force`) | — |
 | `lull` | `address` | `reason` | `{status: "asleep", address}` | `{error: True, message}` (no karma, no/invalid address, self-target, target not running) |
 | `suspend` | `address` | `reason` | `{status: "suspended", address}` | `{error: True, message}` (as above) |
@@ -93,6 +96,12 @@ content with a `lingtai_agent_summarized_result` marker), persists via
 `_save_chat_history`, and the original payload stays traceable in
 `<workdir>/logs/events.jsonl` by `tool_call_id`.
 
+Before a refresh requests deferred relaunch, `_retry_failed_mcps()` must return
+a mapping whose `still_failed` list is empty. An exception, malformed report,
+or unresolved entry fails closed with an actionable error; `_perform_refresh()`
+is not called and no relaunch signal is requested. No MCP specs and an
+all-healthy report preserve the existing successful path.
+
 ## Cross-platform invariants
 
 - Address resolution uses `resolve_address` and all target file access is via
@@ -112,6 +121,7 @@ content with a `lingtai_agent_summarized_result` marker), persists via
 | `sleep` transitions the agent to ASLEEP (self, no karma) | `src/lingtai/tools/system/karma.py:_sleep` | `tests/test_system.py::test_system_self_sleep` |
 | Unknown/legacy actions return the unknown-action error | `src/lingtai/tools/system/__init__.py:handle` | `tests/test_system.py::test_system_unknown_action`, `tests/test_system.py::test_system_show_action_rejected` |
 | `refresh` with an unauthorized preset is refused | `src/lingtai/tools/system/preset.py:_refresh` | `tests/test_system.py::test_refresh_with_unauthorized_preset_returns_error` |
+| Unresolved MCP retry/cleanup blocks deferred relaunch | `src/lingtai/tools/system/preset.py:_refresh` | `tests/test_system.py::test_refresh_mcp_retry_exception_blocks_perform_refresh`, `tests/test_system.py::test_refresh_mcp_unresolved_report_blocks_perform_refresh` |
 | `refresh` cannot combine `preset` and `revert_preset` | `src/lingtai/tools/system/preset.py:_refresh` | `tests/test_system.py::test_refresh_revert_preset_with_preset_arg_errors` |
 | `presets` lists the allowed library and strips credentials | `src/lingtai/tools/system/preset.py:_presets` | `tests/test_system.py::test_presets_action_lists_full_library`, `tests/test_system.py::test_presets_action_strips_credentials` |
 | `cpr` propagates launch failure instead of reporting success | `src/lingtai/tools/system/karma.py:_cpr` | `tests/test_system.py::test_cpr_propagates_launch_failure_instead_of_resuscitated` |

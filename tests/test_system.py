@@ -508,6 +508,76 @@ def test_refresh_whitespace_preset_is_no_swap(tmp_path, monkeypatch):
     result = agent._intrinsics["system"]({"action": "refresh", "preset": "   \t\n"})
     assert result["status"] == "ok"
     assert activate_calls == []
+
+
+def test_refresh_mcp_retry_exception_blocks_perform_refresh(tmp_path, monkeypatch):
+    agent = _make_test_agent_for_presets(tmp_path)
+    perform_calls = []
+    monkeypatch.setattr(
+        agent,
+        "_retry_failed_mcps",
+        lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent, "_perform_refresh", lambda: perform_calls.append(True)
+    )
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "error"
+    assert "cleanup failed" in result["message"]
+    assert perform_calls == []
+
+
+def test_refresh_mcp_unresolved_report_blocks_perform_refresh(
+    tmp_path, monkeypatch
+):
+    agent = _make_test_agent_for_presets(tmp_path)
+    perform_calls = []
+    monkeypatch.setattr(
+        agent,
+        "_retry_failed_mcps",
+        lambda: {
+            "retried": ["broken"],
+            "recovered": [],
+            "still_failed": ["broken"],
+            "healthy": [],
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent, "_perform_refresh", lambda: perform_calls.append(True)
+    )
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "error"
+    assert "broken" in result["message"]
+    assert perform_calls == []
+
+
+def test_refresh_mcp_healthy_report_preserves_success_path(tmp_path, monkeypatch):
+    agent = _make_test_agent_for_presets(tmp_path)
+    perform_calls = []
+    monkeypatch.setattr(
+        agent,
+        "_retry_failed_mcps",
+        lambda: {
+            "retried": [],
+            "recovered": [],
+            "still_failed": [],
+            "healthy": ["healthy"],
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent, "_perform_refresh", lambda: perform_calls.append(True)
+    )
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "ok"
     assert perform_calls == [True]
 
 
