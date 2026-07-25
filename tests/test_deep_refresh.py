@@ -6,10 +6,34 @@ import ast
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _stage_curated_telegram(workdir: Path) -> Path:
+    init = _make_init()
+    init["mcp"] = {
+        "telegram": {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": ["-m", "lingtai.mcp_servers.telegram"],
+        }
+    }
+    (workdir / "init.json").write_text(json.dumps(init))
+    registry = {
+        "name": "telegram",
+        "summary": "Telegram bot client",
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": ["-m", "lingtai.mcp_servers.telegram"],
+        "source": "lingtai-curated",
+    }
+    registry_path = workdir / "mcp_registry.jsonl"
+    registry_path.write_text(json.dumps(registry) + "\n")
+    return registry_path
 
 
 def test_resolve_env_fields_resolves_env_var(monkeypatch):
@@ -953,12 +977,7 @@ def test_deep_refresh_re_registers_telegram_task_card_without_leaking_watcher(
             return {"status": "ok", "message_id": "acct:42:100"}
 
     monkeypatch.setattr(mcp_module, "MCPClient", _FakeTelegramMCPClient)
-    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
-    mcp_dir = tmp_path / "mcp"
-    mcp_dir.mkdir()
-    (mcp_dir / "servers.json").write_text(json.dumps({
-        "telegram": {"command": "fake-telegram"},
-    }))
+    _stage_curated_telegram(tmp_path)
 
     service = MagicMock()
     service.provider = "openai"
@@ -1051,7 +1070,7 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
             self.closed = True
 
         def list_tools(self):
-            if self.command == "fake-telegram":
+            if self.command == sys.executable:
                 return [{
                     "name": "telegram",
                     "schema": {
@@ -1074,16 +1093,16 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
 
         def call_tool(self, name, args, timeout=None):
             self.calls.append((name, dict(args)))
-            assert self.command == "fake-telegram"
+            assert self.command == sys.executable
             assert name == "_lingtai_telegram_task_card"
             return {"status": "ok", "message_id": "acct:42:100"}
 
     monkeypatch.setattr(mcp_module, "MCPClient", _FakeMCPClient)
-    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
+    _stage_curated_telegram(tmp_path)
     mcp_dir = tmp_path / "mcp"
     mcp_dir.mkdir()
     servers_path = mcp_dir / "servers.json"
-    servers_path.write_text(json.dumps({"telegram": {"command": "fake-telegram"}}))
+    servers_path.write_text("{}")
 
     service = MagicMock()
     service.provider = "openai"
@@ -1116,6 +1135,7 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
         servers_path.write_text(
             json.dumps({"unrelated": {"command": "fake-unrelated"}})
         )
+        (tmp_path / "init.json").write_text(json.dumps(_make_init()))
         agent._setup_from_init()
 
         assert old_telegram.closed is True
@@ -1177,7 +1197,7 @@ def test_telegram_registration_requires_explicit_identity_and_rejects_foreign_ta
                     },
                     "description": "foreign task card",
                 }]
-            assert self.command == "fake-telegram"
+            assert self.command == sys.executable
             return [{
                 "name": "telegram",
                 "schema": {
@@ -1192,12 +1212,7 @@ def test_telegram_registration_requires_explicit_identity_and_rejects_foreign_ta
             raise AssertionError("registration test must not dispatch an MCP tool")
 
     monkeypatch.setattr(mcp_module, "MCPClient", _FakeMCPClient)
-    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
-    mcp_dir = tmp_path / "mcp"
-    mcp_dir.mkdir()
-    (mcp_dir / "servers.json").write_text(
-        json.dumps({"telegram": {"command": "fake-telegram"}})
-    )
+    _stage_curated_telegram(tmp_path)
     service = MagicMock()
     service.provider = "openai"
     service.model = "gpt-4o"

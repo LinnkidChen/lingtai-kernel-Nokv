@@ -113,6 +113,7 @@ class MCPClient:
         self._read_stream: Any = None
         self._write_stream: Any = None
         self._loop: Any = None
+        self._connect_task: Any = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: str | None = None
@@ -218,7 +219,14 @@ class MCPClient:
         with self._lock:
             self._closed = True
             if self._loop and self._loop.is_running():
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                def _cancel_and_stop() -> None:
+                    connect_task = self._connect_task
+                    if connect_task is not None and not connect_task.done():
+                        connect_task.cancel()
+                        return
+                    self._loop.stop()
+
+                self._loop.call_soon_threadsafe(_cancel_and_stop)
             if self._thread and self._thread is not threading.current_thread():
                 self._thread.join(timeout=self._close_timeout)
                 if self._thread.is_alive():
@@ -244,6 +252,7 @@ class MCPClient:
         self._read_stream = None
         self._write_stream = None
         self._loop = None
+        self._connect_task = None
         self._thread = None
         self._stdio_cm = None
         self._session_cm = None
@@ -465,7 +474,8 @@ class MCPClient:
         self._loop = loop
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._async_connect())
+            self._connect_task = loop.create_task(self._async_connect())
+            loop.run_until_complete(self._connect_task)
             loop.run_forever()
         except asyncio.CancelledError as e:
             self._error = self._format_exception(e)
@@ -541,6 +551,7 @@ class HTTPMCPClient:
 
         self._session: Any = None
         self._loop: Any = None
+        self._connect_task: Any = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: str | None = None
@@ -585,7 +596,14 @@ class HTTPMCPClient:
         with self._lock:
             self._closed = True
             if self._loop and self._loop.is_running():
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                def _cancel_and_stop() -> None:
+                    connect_task = self._connect_task
+                    if connect_task is not None and not connect_task.done():
+                        connect_task.cancel()
+                        return
+                    self._loop.stop()
+
+                self._loop.call_soon_threadsafe(_cancel_and_stop)
             if self._thread and self._thread is not threading.current_thread():
                 self._thread.join(timeout=self._close_timeout)
                 if self._thread.is_alive():
@@ -667,7 +685,8 @@ class HTTPMCPClient:
         self._loop = loop
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._async_connect())
+            self._connect_task = loop.create_task(self._async_connect())
+            loop.run_until_complete(self._connect_task)
             loop.run_forever()
         except asyncio.CancelledError as e:
             self._error = MCPClient._format_exception(e)

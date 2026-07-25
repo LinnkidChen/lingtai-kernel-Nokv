@@ -10,6 +10,8 @@ from __future__ import annotations
 import copy
 import json
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -765,19 +767,17 @@ def test_retry_failed_mcps_records_dead_then_recovers(tmp_path, monkeypatch):
     }
     (workdir / "init.json").write_text(json.dumps(init))
 
-    # Patch connect_mcp on the Agent class: first call → returns dead client
-    # (subprocess "exited" immediately); second call → returns live client.
+    # Inject transport clients while retaining the production activation
+    # transaction: first launch is dead, the retry is live.
     call_count = {"n": 0}
 
-    def fake_connect_mcp(self, command, args=None, env=None):
+    def fake_client_factory(**kwargs):
         call_count["n"] += 1
-        client = _FakeMCPClient(is_connected_value=(call_count["n"] >= 2))
-        if not hasattr(self, "_mcp_clients"):
-            self._mcp_clients = []
-        self._mcp_clients.append(client)
-        return []  # no tools to register
+        return _FakeMCPClient(is_connected_value=(call_count["n"] >= 2))
 
-    monkeypatch.setattr(Agent, "connect_mcp", fake_connect_mcp)
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient", fake_client_factory
+    )
 
     agent = Agent(
         service=make_mock_service(),
@@ -822,14 +822,10 @@ def test_retry_failed_mcps_skips_healthy(tmp_path, monkeypatch):
         "mcp": {"telegram": {"type": "stdio", "command": "/bin/true"}},
     }))
 
-    def fake_connect_mcp(self, command, args=None, env=None):
-        client = _FakeMCPClient(is_connected_value=True)
-        if not hasattr(self, "_mcp_clients"):
-            self._mcp_clients = []
-        self._mcp_clients.append(client)
-        return []
-
-    monkeypatch.setattr(Agent, "connect_mcp", fake_connect_mcp)
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient",
+        lambda **kwargs: _FakeMCPClient(is_connected_value=True),
+    )
 
     agent = Agent(
         service=make_mock_service(),
@@ -859,6 +855,55 @@ def test_retry_failed_mcps_no_specs_is_noop(tmp_path):
     report = agent._retry_failed_mcps()
     assert report == {"retried": [], "recovered": [],
                       "still_failed": [], "healthy": []}
+
+
+def test_retry_failed_mcps_no_specs_reports_unresolved_pending_retirement(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+
+    class _Unclosable(_FakeMCPClient):
+        def close(self):
+            raise RuntimeError("close blocked")
+
+    pending = _Unclosable(is_connected_value=False)
+    agent._mcp_pending_retirements["candidate:pending"] = pending
+
+    report = agent._retry_failed_mcps()
+
+    assert report["still_failed"] == ["candidate:pending"]
+    assert agent._mcp_pending_retirements["candidate:pending"] is pending
+
+
+def test_retry_failed_mcps_stopping_is_fail_closed_without_init_specs(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+    agent._mcp_lifecycle_state = "stopping"
+    agent._mcp_lifecycle_barrier.set()
+
+    report = agent._retry_failed_mcps()
+
+    assert report["retried"] == []
+    assert report["still_failed"] == ["lifecycle:stopping"]
+
+
+def test_public_refresh_racing_stop_is_fail_closed(tmp_path, monkeypatch):
+    agent, _ = _mk_agent(tmp_path)
+    performed = []
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: performed.append(True))
+    agent._mcp_activation_lock.acquire()
+    stopping = threading.Thread(target=agent.stop)
+    stopping.start()
+    deadline = time.monotonic() + 1.0
+    while not agent._mcp_lifecycle_barrier.is_set() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    try:
+        result = agent._intrinsics["system"]({"action": "refresh"})
+    finally:
+        agent._mcp_activation_lock.release()
+    stopping.join(timeout=2.0)
+
+    assert not stopping.is_alive()
+    assert result["status"] == "error"
+    assert "lifecycle:stopping" in result["message"]
+    assert performed == []
 
 
 class _ActivationClient:
@@ -954,6 +999,176 @@ def test_mcp_activation_duplicate_names_fail_closed(tmp_path, monkeypatch):
 
     assert candidate.closed
     assert "dup" not in agent._tool_handlers
+
+
+@pytest.mark.parametrize(
+    ("catalog", "error"),
+    [
+        ({}, "array"),
+        ([None], "object"),
+        ([{"name": None}], "invalid name"),
+        ([{"name": "  "}], "invalid name"),
+        ([{"name": "x", "description": 7}], "description"),
+        ([{"name": "x", "schema": []}], "schema must be an object"),
+        (
+            [{"name": "x", "schema": {"properties": []}}],
+            "properties must be an object",
+        ),
+        (
+            [{"name": "x", "schema": {"required": "x"}}],
+            "required must be an array",
+        ),
+        (
+            [{"name": "x", "schema": {"required": [1]}}],
+            "required must be an array",
+        ),
+        (
+            [{"name": "x", "schema": {"properties": {"x": {1}}}}],
+            "not JSON serializable",
+        ),
+    ],
+)
+def test_mcp_candidate_catalog_malformed_matrix_is_atomic(
+    tmp_path, catalog, error
+):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient(catalog)
+    handlers = agent._tool_handlers
+    schemas = agent._tool_schemas
+    owners = agent._mcp_clients_by_tool
+    clients = agent._mcp_clients
+    names = agent._mcp_tool_names
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        agent._activate_mcp_candidate(candidate)
+
+    assert candidate.closed
+    assert agent._tool_handlers is handlers
+    assert agent._tool_schemas is schemas
+    assert agent._mcp_clients_by_tool is owners
+    assert agent._mcp_clients is clients
+    assert agent._mcp_tool_names is names
+
+
+@pytest.mark.parametrize("case", ["missing", "wrong", "unnamed_predecessor"])
+def test_mcp_init_spec_identity_is_validated_before_candidate_start(tmp_path, case):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([_tool("candidate")])
+    predecessor = None
+    init_spec_name = "example"
+    if case == "wrong":
+        agent._mcp_init_specs = {
+            "example": {"client": _ActivationClient([]), "cfg": {}}
+        }
+    elif case == "unnamed_predecessor":
+        init_spec_name = None
+        predecessor = _ActivationClient([])
+    handlers = agent._tool_handlers
+    schemas = agent._tool_schemas
+    owners = agent._mcp_clients_by_tool
+    clients = agent._mcp_clients
+    names = agent._mcp_tool_names
+
+    with pytest.raises(RuntimeError):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name=init_spec_name,
+            predecessor=predecessor,
+        )
+
+    assert not candidate.started
+    assert candidate.closed
+    assert agent._tool_handlers is handlers
+    assert agent._tool_schemas is schemas
+    assert agent._mcp_clients_by_tool is owners
+    assert agent._mcp_clients is clients
+    assert agent._mcp_tool_names is names
+
+
+class _RecordingChat:
+    def __init__(self, fail_calls=()):
+        self.calls = []
+        self.fail_calls = set(fail_calls)
+
+    def update_tools(self, schemas):
+        self.calls.append(tuple(schema.name for schema in schemas))
+        if len(self.calls) in self.fail_calls:
+            raise RuntimeError(f"chat update {len(self.calls)} failed")
+
+
+def test_initial_activation_failure_compensates_live_chat(tmp_path, monkeypatch):
+    agent, _ = _mk_agent(tmp_path)
+    chat = _RecordingChat()
+    agent._chat = chat
+    candidate = _ActivationClient([_tool("candidate")])
+    agent._mcp_init_specs = {"candidate": {"cfg": {}, "client": None}}
+    monkeypatch.setattr(
+        agent,
+        "_maybe_setup_task_card_controller",
+        lambda: (_ for _ in ()).throw(RuntimeError("task-card setup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="task-card setup failed"):
+        agent._activate_mcp_candidate(
+            candidate, allow_sealed=True, init_spec_name="candidate"
+        )
+
+    assert chat.calls[-1].count("candidate") == 0
+    assert "candidate" not in agent._tool_handlers
+    assert candidate.closed
+
+
+def test_replacement_failure_compensates_chat_after_predecessor_retirement(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    predecessor = _ActivationClient([])
+    _install_dead_projection(agent, "example", predecessor)
+    chat = _RecordingChat()
+    agent._chat = chat
+    candidate = _ActivationClient([_tool("candidate")])
+    monkeypatch.setattr(
+        agent,
+        "_maybe_setup_task_card_controller",
+        lambda: (_ for _ in ()).throw(RuntimeError("task-card setup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="task-card setup failed"):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name="example",
+            predecessor=predecessor,
+        )
+
+    assert predecessor.closed
+    assert chat.calls[-1].count("old") == 0
+    assert chat.calls[-1].count("candidate") == 0
+    assert "old" not in agent._tool_handlers
+    assert "candidate" not in agent._tool_handlers
+
+
+def test_chat_compensation_failure_is_composite_evidence(tmp_path, monkeypatch):
+    agent, _ = _mk_agent(tmp_path)
+    agent._chat = _RecordingChat(fail_calls={2})
+    candidate = _ActivationClient([_tool("candidate")])
+    agent._mcp_init_specs = {"candidate": {"cfg": {}, "client": None}}
+    monkeypatch.setattr(
+        agent,
+        "_maybe_setup_task_card_controller",
+        lambda: (_ for _ in ()).throw(RuntimeError("task-card setup failed")),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="task-card setup failed.*live-chat compensation unresolved",
+    ):
+        agent._activate_mcp_candidate(
+            candidate, allow_sealed=True, init_spec_name="candidate"
+        )
+
+    assert candidate.closed
 
 
 def test_mcp_activation_publication_failure_exact_restores_initial_state(
@@ -1266,6 +1481,158 @@ def test_mcp_real_stdio_listing_failure_retires_child_and_thread(
                 stop_process(child)
 
 
+@pytest.mark.parametrize(
+    "failing_module",
+    [
+        "tests._mcp_startup_timeout_stdio_server",
+        "tests._mcp_activation_stdio_server",
+    ],
+)
+def test_agent_retry_real_stdio_failure_then_single_live_replacement(
+    tmp_path, monkeypatch, failing_module
+):
+    from lingtai.services.mcp import MCPClient
+
+    observer = StdioProcessObserver()
+    observer.install(monkeypatch)
+    agent, _ = _mk_agent(tmp_path)
+    instances = []
+
+    def factory(**kwargs):
+        startup_timeout = (
+            2.0
+            if "tests._mcp_structured_stdio_server" in kwargs.get("args", [])
+            else 0.15
+        )
+        client = MCPClient(
+            **kwargs,
+            startup_timeout=startup_timeout,
+            close_timeout=4.0,
+        )
+        instances.append(client)
+        return client
+
+    agent._mcp_stdio_client_factory = factory
+    agent._mcp_init_specs = {
+        "example": {
+            "cfg": {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-m", failing_module],
+            },
+            "source": "init.json:mcp",
+            "client": None,
+        }
+    }
+    try:
+        first = agent._retry_failed_mcps()
+        first_child = observer.wait_for_records(1)[0]
+        assert first["still_failed"] == ["example"]
+        assert wait_for_thread_exit(instances[0]._thread, timeout=2.0)
+        assert wait_for_process_exit(first_child, timeout=2.0)
+
+        agent._mcp_init_specs["example"]["cfg"]["args"] = [
+            "-m",
+            "tests._mcp_structured_stdio_server",
+        ]
+        second = agent._retry_failed_mcps()
+        children = observer.wait_for_records(2)
+
+        assert second["recovered"] == ["example"]
+        replacement = agent._mcp_init_specs["example"]["client"]
+        assert replacement is instances[1]
+        assert replacement.is_connected()
+        assert agent._mcp_clients == [replacement]
+        assert len([client for client in instances if client.is_connected()]) == 1
+        assert wait_for_process_exit(children[0], timeout=0)
+    finally:
+        agent._retire_all_mcp_clients(context="test_cleanup")
+        for child in observer.records():
+            if not wait_for_process_exit(child, timeout=0):
+                stop_process(child)
+
+
+def _free_local_port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _wait_for_local_port(port, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.02)
+    raise AssertionError(f"local HTTP MCP did not listen on {port}")
+
+
+def test_agent_retry_local_http_failure_then_single_live_replacement(tmp_path):
+    from lingtai.services.mcp import HTTPMCPClient
+
+    agent, _ = _mk_agent(tmp_path)
+    instances = []
+
+    def factory(**kwargs):
+        client = HTTPMCPClient(
+            **kwargs,
+            startup_timeout=0.5,
+            close_timeout=1.0,
+        )
+        instances.append(client)
+        return client
+
+    agent._mcp_http_client_factory = factory
+    unavailable_port = _free_local_port()
+    agent._mcp_init_specs = {
+        "example": {
+            "cfg": {
+                "type": "http",
+                "url": f"http://127.0.0.1:{unavailable_port}/mcp",
+            },
+            "source": "init.json:mcp",
+            "client": None,
+        }
+    }
+    process = None
+    try:
+        first = agent._retry_failed_mcps()
+        assert first["still_failed"] == ["example"]
+        assert wait_for_thread_exit(instances[0]._thread, timeout=2.0)
+
+        live_port = _free_local_port()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests._mcp_http_server",
+                "--port",
+                str(live_port),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_for_local_port(live_port)
+        agent._mcp_init_specs["example"]["cfg"]["url"] = (
+            f"http://127.0.0.1:{live_port}/mcp"
+        )
+        second = agent._retry_failed_mcps()
+
+        assert second["recovered"] == ["example"]
+        replacement = agent._mcp_init_specs["example"]["client"]
+        assert replacement is instances[1]
+        assert replacement.is_connected()
+        assert agent._mcp_clients == [replacement]
+        assert len([client for client in instances if client.is_connected()]) == 1
+    finally:
+        agent._retire_all_mcp_clients(context="test_cleanup")
+        if process is not None and process.poll() is None:
+            process.terminate()
+            process.wait(timeout=3.0)
+
+
 def _install_dead_projection(agent, spec_name, client, names=("old",)):
     client.started = False
     client.closed = False
@@ -1401,7 +1768,15 @@ def test_retry_failed_mcps_candidate_cleanup_failure_is_keyed_and_drained(
 
 @pytest.mark.parametrize(
     "damage",
-    ["handler", "owner", "schema", "name_set", "client_list", "init_spec"],
+    [
+        "handler",
+        "handler_tool_name",
+        "owner",
+        "schema",
+        "name_set",
+        "client_list",
+        "init_spec",
+    ],
 )
 def test_predecessor_projection_matrix_rejects_object_identically(tmp_path, damage):
     agent, _ = _mk_agent(tmp_path)
@@ -1413,9 +1788,13 @@ def test_predecessor_projection_matrix_rejects_object_identically(tmp_path, dama
     owners = agent._mcp_clients_by_tool
     names = agent._mcp_tool_names
     spec = agent._mcp_init_specs["example"]
+    handlers_container = agent._tool_handlers
+    schemas_container = agent._tool_schemas
 
     if damage == "handler":
         agent._tool_handlers["old"] = lambda args: args
+    elif damage == "handler_tool_name":
+        agent._tool_handlers["old"]._lingtai_mcp_tool_name = "wrong"
     elif damage == "owner":
         agent._mcp_clients_by_tool.pop("old")
     elif damage == "schema":
@@ -1453,6 +1832,8 @@ def test_predecessor_projection_matrix_rejects_object_identically(tmp_path, dama
         assert agent._tool_handlers["old"] is handler
     assert candidate.closed
     assert not predecessor.closed
+    assert handlers_container is agent._tool_handlers
+    assert schemas_container is agent._tool_schemas
     assert clients is agent._mcp_clients
     assert owners is agent._mcp_clients_by_tool
     assert names is agent._mcp_tool_names
@@ -1477,6 +1858,137 @@ def test_generic_foreign_candidate_cannot_claim_reserved_names(tmp_path, reserve
             reserved_activation_token=object(),
         )
     assert forged.closed
+
+
+def _write_telegram_registration(workdir, *, source="lingtai-curated"):
+    cfg = {
+        "type": "stdio",
+        "command": sys.executable,
+        "args": ["-m", "lingtai.mcp_servers.telegram"],
+    }
+    (workdir / "init.json").write_text(json.dumps({"mcp": {"telegram": cfg}}))
+    (workdir / "mcp_registry.jsonl").write_text(
+        json.dumps(
+            {
+                "name": "telegram",
+                "summary": "telegram",
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": ["-m", "lingtai.mcp_servers.telegram"],
+                "source": source,
+            }
+        )
+        + "\n"
+    )
+
+
+def test_curated_telegram_provenance_survives_retry(tmp_path, monkeypatch):
+    workdir = tmp_path / "agent"
+    workdir.mkdir()
+    _write_telegram_registration(workdir)
+    clients = [
+        _ActivationClient([_tool("telegram")]),
+        _ActivationClient([_tool("telegram")]),
+    ]
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient", lambda **kwargs: clients.pop(0)
+    )
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=workdir,
+        capabilities={"mcp": {}},
+    )
+    predecessor = agent._mcp_init_specs["telegram"]["client"]
+    predecessor.started = False
+
+    report = agent._retry_failed_mcps()
+
+    assert report["recovered"] == ["telegram"]
+    replacement = agent._mcp_init_specs["telegram"]["client"]
+    assert replacement is agent._mcp_clients_by_tool["telegram"]
+    assert predecessor.closed
+
+
+@pytest.mark.parametrize("registration", ["user", "legacy"])
+def test_unverified_telegram_registration_has_no_reserved_authority(
+    tmp_path, monkeypatch, registration
+):
+    workdir = tmp_path / "agent"
+    workdir.mkdir()
+    if registration == "user":
+        _write_telegram_registration(workdir, source="user")
+    else:
+        (workdir / "init.json").write_text("{}")
+        mcp_dir = workdir / "mcp"
+        mcp_dir.mkdir()
+        (mcp_dir / "servers.json").write_text(
+            json.dumps(
+                {
+                    "telegram": {
+                        "command": sys.executable,
+                        "args": ["-m", "lingtai.mcp_servers.telegram"],
+                    }
+                }
+            )
+        )
+    candidate = _ActivationClient([_tool("telegram")])
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient", lambda **kwargs: candidate
+    )
+
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=workdir,
+        capabilities={"mcp": {}},
+    )
+
+    assert candidate.closed
+    assert "telegram" not in agent._tool_handlers
+    if registration == "user":
+        assert agent._mcp_init_specs["telegram"]["reserved_provenance"] is False
+        assert agent._mcp_init_specs["telegram"]["client"] is None
+
+
+def test_legacy_connector_override_cannot_bypass_activation_outcome(
+    tmp_path, monkeypatch
+):
+    workdir = tmp_path / "agent"
+    workdir.mkdir()
+    (workdir / "init.json").write_text(
+        json.dumps({"mcp": {"example": {"command": "/bin/true"}}})
+    )
+    (workdir / "mcp_registry.jsonl").write_text(
+        json.dumps(
+            {
+                "name": "example",
+                "summary": "example",
+                "transport": "stdio",
+                "command": "/bin/true",
+                "args": [],
+                "source": "user",
+            }
+        )
+        + "\n"
+    )
+    called = []
+
+    def legacy_override(self, command, args=None, env=None):
+        called.append(command)
+        return ["forged"]
+
+    monkeypatch.setattr(Agent, "connect_mcp", legacy_override)
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=workdir,
+        capabilities={"mcp": {}},
+    )
+
+    assert called == []
+    assert agent._mcp_init_specs["example"]["client"] is None
+    assert "forged" not in agent._tool_handlers
 
 
 def test_stop_during_candidate_start_prevents_late_publication(tmp_path):

@@ -67,7 +67,7 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 
 ## State
 
-- **`MCPClient` / `HTTPMCPClient`**: each instance manages a background daemon thread, an asyncio event loop (`_loop`), a `ClientSession` (`_session`), and a 50-entry activity log (`mcp.py:103-118,420-431`). Thread-safe via `threading.Lock` and `threading.Event`.
+- **`MCPClient` / `HTTPMCPClient`**: each instance manages a background daemon thread, an asyncio event loop (`_loop`), a `ClientSession` (`_session`), and a 50-entry activity log (`mcp.py:103-118,420-431`). Thread-safe via `threading.RLock` and `threading.Event`.
 - **`LocalFileIOService`**: facade over a `_backend`; exposes `last_traversal` from the backend for tool metadata.
 - **`LocalFileIOBackend`**: default Python local filesystem backend; state is optional `_root` plus `last_traversal`.
 - **`RustFileIOBackend`**: holds an embedded `LocalFileIOBackend` (for read/write/edit), a `SidecarAdapter` (subprocess client), and a `last_traversal` rebuilt from each sidecar envelope.
