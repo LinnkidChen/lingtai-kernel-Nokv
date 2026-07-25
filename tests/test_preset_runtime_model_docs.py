@@ -93,6 +93,17 @@ def test_substrate_reference_contains_required_preset_anchors():
         assert anchor in text_lower, f"missing anchor: {anchor}"
 
 
+def test_substrate_reference_documents_fail_closed_mcp_refresh_precondition():
+    text = _read(SUBSTRATE_REFERENCE)
+    normalized = " ".join(text.split())
+    assert "version: 1.4.0" in text
+    assert "last_changed_at: 2026-07-25T00:00:00Z" in text
+    for field in ("retried", "recovered", "still_failed", "healthy"):
+        assert f"`{field}`" in text
+    assert "blocks refresh without changing `init.json`" in normalized
+    assert "repeated refresh is the supported convergence path" in normalized
+
+
 def test_substrate_reference_daemon_explicit_preset_must_be_allowed():
     text = _read(SUBSTRATE_REFERENCE)
     assert "manifest.preset.allowed" in text

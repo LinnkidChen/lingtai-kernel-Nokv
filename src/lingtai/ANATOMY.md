@@ -148,12 +148,18 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
   `{cfg, source, client}`. Initial stdio/HTTP candidates remain unpublished
   through startup, full tools/list preparation, schema validation, duplicate
   detection, and ownership preflight. `_retry_failed_mcps` accepts a
-  predecessor only by exact init-spec identity, depublishes it at the
-  irreversible boundary, verifies close/thread retirement, and only then
-  starts the replacement; successful publication reconciles the complete
-  old/new name set. Failed post-retirement activation leaves the spec
-  retryable with `client=None`, never a reference to the closed predecessor.
-  `system(action="refresh")` blocks `_perform_refresh` on exceptions or
-  `still_failed` entries.
+  predecessor only after validating its complete handler/owner/schema/name-set,
+  client-list, and init-spec projection. Retirement is keyed by init-spec:
+  depublishing does not discard association, and a failed close remains in
+  `_mcp_pending_retirements` plus the spec until close/thread retirement is
+  verified on a later retry. `MCPActivationOutcome` carries the exact committed
+  replacement identity, which must match the spec, client list, handlers,
+  schemas, owner map, and name set. Activation, retry, stop, and deep refresh
+  share one lifecycle `RLock`; a generation plus teardown barrier invalidates
+  waiters and prevents a candidate from publishing after stop/refresh begins.
+  Reserved `telegram`/`task_card` claims require the explicit Telegram loader
+  identity rather than a name-only collision bypass. `system(action="refresh")`
+  validates the entire four-list retry report and blocks preset mutation and
+  `_perform_refresh` on malformed reports, exceptions, or `still_failed`.
 - **Runtime venv markers:** `venv_resolve.py` accepts legacy managed venvs without `.lingtai-env.json` if `import lingtai` succeeds, then stamps the marker best-effort. Marker read/parse/probe failures are `error`, not `mismatch`, and never delete the managed runtime. A valid marker that proves a different OS/arch/Python environment is a confirmed mismatch: explicit `init.venv_path` candidates are rejected but left on disk, while only the managed global runtime venv (`~/.lingtai-tui/runtime/venv/`) may be removed before auto-create. The TUI calls this same logic through `python -m lingtai.venv_resolve env-marker {check,stamp} --venv <path>`.
 - **Lazy top-level facade:** `src/lingtai/__init__.py` uses PEP-562 ``__getattr__`` to resolve every public name lazily from its canonical source module (``__init__.py:18-110``). A bare ``import lingtai`` performs only stdlib/importlib.metadata work; it must not load `lingtai.agent`, `lingtai.kernel`, `tools`, `lingtai.llm`, services, MCP servers, or concrete providers. ``__dir__`` returns standard module globals unioned with ``__all__`` (``__init__.py:112-113``). Verified by `tests/test_lingtai_facade.py` and `tests/test_kernel_isolation.py`.

@@ -581,6 +581,126 @@ def test_refresh_mcp_healthy_report_preserves_success_path(tmp_path, monkeypatch
     assert perform_calls == [True]
 
 
+@pytest.mark.parametrize(
+    "report",
+    [
+        None,
+        {},
+        {"retried": [], "recovered": [], "still_failed": []},
+        {
+            "retried": (),
+            "recovered": [],
+            "still_failed": [],
+            "healthy": [],
+        },
+        {
+            "retried": [],
+            "recovered": [],
+            "still_failed": [1],
+            "healthy": [],
+        },
+        {
+            "retried": [],
+            "recovered": [],
+            "still_failed": [],
+            "healthy": [],
+            "extra": [],
+        },
+    ],
+)
+def test_refresh_malformed_retry_report_fails_closed(
+    tmp_path, monkeypatch, report
+):
+    agent = _make_test_agent_for_presets(tmp_path)
+    perform_calls = []
+    monkeypatch.setattr(
+        agent, "_retry_failed_mcps", lambda: report, raising=False
+    )
+    monkeypatch.setattr(
+        agent, "_perform_refresh", lambda: perform_calls.append(True)
+    )
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "error"
+    assert "report" in result["message"]
+    assert perform_calls == []
+
+
+def test_refresh_no_spec_retry_report_succeeds(tmp_path, monkeypatch):
+    agent = _make_test_agent_for_presets(tmp_path)
+    perform_calls = []
+    monkeypatch.setattr(
+        agent,
+        "_retry_failed_mcps",
+        lambda: {
+            "retried": [],
+            "recovered": [],
+            "still_failed": [],
+            "healthy": [],
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent, "_perform_refresh", lambda: perform_calls.append(True)
+    )
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "ok"
+    assert perform_calls == [True]
+
+
+def test_refresh_mcp_precondition_preserves_preset_init_json(
+    tmp_path, monkeypatch
+):
+    import json
+
+    presets = tmp_path / "presets"
+    presets.mkdir()
+    for name in ("alpha", "beta"):
+        (presets / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "description": {"summary": name},
+                    "manifest": {
+                        "llm": {"provider": "gemini", "model": name},
+                        "capabilities": {},
+                    },
+                }
+            )
+        )
+    agent = _make_test_agent_for_presets(
+        tmp_path, presets_path=presets, active_preset="alpha"
+    )
+    init_path = agent._working_dir / "init.json"
+    before = init_path.read_bytes()
+    activate_calls = []
+    monkeypatch.setattr(
+        agent,
+        "_retry_failed_mcps",
+        lambda: {
+            "retried": ["broken"],
+            "recovered": [],
+            "still_failed": ["broken"],
+            "healthy": [],
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent, "_activate_preset", lambda name: activate_calls.append(name)
+    )
+
+    result = agent._intrinsics["system"](
+        {"action": "refresh", "preset": str(presets / "beta.json")}
+    )
+
+    assert result["status"] == "error"
+    assert init_path.read_bytes() == before
+    assert activate_calls == []
+
+
 def test_presets_action_lists_full_library(tmp_path):
     """system(action='presets') returns all explicitly allowed presets."""
     import json

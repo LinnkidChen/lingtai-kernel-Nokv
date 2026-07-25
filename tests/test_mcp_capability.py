@@ -11,6 +11,8 @@ import copy
 import json
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1080,8 +1082,9 @@ def test_mcp_predecessor_close_failure_never_starts_replacement(tmp_path):
 
     assert not candidate.started
     assert candidate.closed
-    assert agent._mcp_init_specs["example"]["client"] is None
+    assert agent._mcp_init_specs["example"]["client"] is predecessor
     assert predecessor not in agent._mcp_clients
+    assert agent._mcp_pending_retirements["example"] is predecessor
 
 
 def test_mcp_predecessor_retires_before_replacement_and_reconciles_names(
@@ -1120,19 +1123,50 @@ def test_mcp_predecessor_retires_before_replacement_and_reconciles_names(
         ),
     )
 
-    names = agent._activate_mcp_candidate(
+    outcome = agent._activate_mcp_candidate(
         candidate,
         allow_sealed=True,
         init_spec_name="example",
         predecessor=predecessor,
     )
 
-    assert names == ["shared", "new_only"]
+    assert outcome.client is candidate
+    assert outcome.tool_names == ("shared", "new_only")
     assert predecessor.closed
     assert agent._mcp_init_specs["example"]["client"] is candidate
     assert set(agent._mcp_clients_by_tool) >= {"shared", "new_only"}
     assert "old_only" not in agent._tool_handlers
     assert "old_only" not in agent._mcp_tool_names
+
+
+def test_post_retirement_publication_fault_never_restores_closed_predecessor(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    predecessor = _ActivationClient([])
+    _install_dead_projection(agent, "example", predecessor)
+    candidate = _ActivationClient([_tool("new")])
+    monkeypatch.setattr(
+        agent,
+        "_maybe_setup_task_card_controller",
+        lambda: (_ for _ in ()).throw(RuntimeError("post-retirement fault")),
+    )
+
+    with pytest.raises(RuntimeError, match="post-retirement fault"):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name="example",
+            predecessor=predecessor,
+        )
+
+    assert predecessor.closed
+    assert candidate.closed
+    assert agent._mcp_init_specs["example"]["client"] is None
+    assert predecessor not in agent._mcp_clients
+    assert "old" not in agent._tool_handlers
+    assert "new" not in agent._tool_handlers
+    assert agent._mcp_pending_retirements == {}
 
 
 def test_mcp_teardown_attempts_every_client_and_later_converges(tmp_path):
@@ -1179,11 +1213,12 @@ def test_mcp_teardown_attempts_every_client_and_later_converges(tmp_path):
     assert healthy.closed
     assert healthy.close_calls == 1
     assert flaky.close_calls == 1
-    assert agent._mcp_clients == [flaky]
+    assert agent._mcp_clients == []
+    assert agent._mcp_pending_retirements == {"flaky": flaky}
     assert agent._mcp_clients_by_tool == {}
     assert "flaky" not in agent._tool_handlers
     assert "healthy" not in agent._tool_handlers
-    assert agent._mcp_init_specs["flaky"]["client"] is None
+    assert agent._mcp_init_specs["flaky"]["client"] is flaky
     assert agent._mcp_init_specs["healthy"]["client"] is None
 
     second = agent._retire_all_mcp_clients(context="test_retry")
@@ -1192,6 +1227,8 @@ def test_mcp_teardown_attempts_every_client_and_later_converges(tmp_path):
     assert flaky.closed
     assert flaky.close_calls == 2
     assert agent._mcp_clients == []
+    assert agent._mcp_pending_retirements == {}
+    assert agent._mcp_init_specs["flaky"]["client"] is None
 
 
 def test_mcp_real_stdio_listing_failure_retires_child_and_thread(
@@ -1227,6 +1264,323 @@ def test_mcp_real_stdio_listing_failure_retires_child_and_thread(
         for child in observer.records():
             if not wait_for_process_exit(child, timeout=0):
                 stop_process(child)
+
+
+def _install_dead_projection(agent, spec_name, client, names=("old",)):
+    client.started = False
+    client.closed = False
+    agent._mcp_clients.append(client)
+    for name in names:
+        agent._mcp_clients_by_tool[name] = client
+        agent._mcp_tool_names.add(name)
+        agent._tool_handlers[name] = agent._make_mcp_handler(client, name)
+        agent._tool_schemas.append(
+            FunctionSchema(
+                name=name,
+                description=name,
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+    agent._mcp_init_specs = {
+        spec_name: {
+            "cfg": {"type": "stdio", "command": "/bin/false"},
+            "source": "init.json:mcp",
+            "client": client,
+        }
+    }
+
+
+def test_retry_failed_mcps_transactional_replacement_identity_production_signature(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    predecessor = _ActivationClient([])
+    _install_dead_projection(agent, "example", predecessor)
+    replacement = _ActivationClient([_tool("new")])
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient", lambda **kwargs: replacement
+    )
+
+    report = agent._retry_failed_mcps()
+
+    assert report == {
+        "retried": ["example"],
+        "recovered": ["example"],
+        "still_failed": [],
+        "healthy": [],
+    }
+    assert agent._mcp_init_specs["example"]["client"] is replacement
+    assert agent._mcp_clients == [replacement]
+    assert agent._mcp_clients_by_tool["new"] is replacement
+    assert agent._tool_handlers["new"]._lingtai_mcp_client is replacement
+    assert "new" in agent._mcp_tool_names
+    assert sum(schema.name == "new" for schema in agent._tool_schemas) == 1
+
+
+def test_retry_failed_mcps_retirement_close_failure_converges_second_attempt(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+
+    class _FlakyPredecessor(_ActivationClient):
+        def __init__(self):
+            super().__init__([])
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("predecessor close blocked")
+            self.closed = True
+
+    predecessor = _FlakyPredecessor()
+    _install_dead_projection(agent, "example", predecessor)
+    unused = _ActivationClient([_tool("unused")])
+    replacement = _ActivationClient([_tool("new")])
+    replacements = [unused, replacement]
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient", lambda **kwargs: replacements.pop(0)
+    )
+
+    first = agent._retry_failed_mcps()
+    assert first["still_failed"] == ["example"]
+    assert agent._mcp_init_specs["example"]["client"] is predecessor
+    assert agent._mcp_pending_retirements["example"] is predecessor
+
+    second = agent._retry_failed_mcps()
+    assert second["recovered"] == ["example"]
+    assert second["still_failed"] == []
+    assert predecessor.close_calls == 2
+    assert agent._mcp_pending_retirements == {}
+    assert agent._mcp_init_specs["example"]["client"] is replacement
+
+
+def test_retry_failed_mcps_candidate_cleanup_failure_is_keyed_and_drained(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    agent._mcp_init_specs = {
+        "example": {
+            "cfg": {"type": "stdio", "command": "/bin/false"},
+            "source": "init.json:mcp",
+            "client": None,
+        }
+    }
+
+    class _CleanupFlaky(_ActivationClient):
+        def __init__(self):
+            super().__init__([], on_start=lambda: (_ for _ in ()).throw(
+                RuntimeError("start failed")
+            ))
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("candidate close blocked")
+            self.closed = True
+
+    failed = _CleanupFlaky()
+    recovered = _ActivationClient([_tool("new")])
+    candidates = [failed, recovered]
+    monkeypatch.setattr(
+        "lingtai.services.mcp.MCPClient", lambda **kwargs: candidates.pop(0)
+    )
+
+    first = agent._retry_failed_mcps()
+    assert first["still_failed"] == ["example"]
+    assert agent._mcp_pending_retirements["example"] is failed
+    assert agent._mcp_init_specs["example"]["client"] is failed
+
+    second = agent._retry_failed_mcps()
+    assert second["recovered"] == ["example"]
+    assert failed.close_calls == 2
+    assert agent._mcp_pending_retirements == {}
+    assert agent._mcp_init_specs["example"]["client"] is recovered
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["handler", "owner", "schema", "name_set", "client_list", "init_spec"],
+)
+def test_predecessor_projection_matrix_rejects_object_identically(tmp_path, damage):
+    agent, _ = _mk_agent(tmp_path)
+    predecessor = _ActivationClient([])
+    _install_dead_projection(agent, "example", predecessor)
+    handler = agent._tool_handlers["old"]
+    schema = next(schema for schema in agent._tool_schemas if schema.name == "old")
+    clients = agent._mcp_clients
+    owners = agent._mcp_clients_by_tool
+    names = agent._mcp_tool_names
+    spec = agent._mcp_init_specs["example"]
+
+    if damage == "handler":
+        agent._tool_handlers["old"] = lambda args: args
+    elif damage == "owner":
+        agent._mcp_clients_by_tool.pop("old")
+    elif damage == "schema":
+        agent._tool_schemas.append(copy.deepcopy(schema))
+    elif damage == "name_set":
+        agent._mcp_tool_names.remove("old")
+    elif damage == "client_list":
+        agent._mcp_clients.append(predecessor)
+    else:
+        spec["client"] = _ActivationClient([])
+
+    candidate = _ActivationClient([_tool("new")])
+    before_handlers = dict(agent._tool_handlers)
+    before_schemas = list(agent._tool_schemas)
+    before_owners = dict(agent._mcp_clients_by_tool)
+    before_clients = list(agent._mcp_clients)
+    before_names = set(agent._mcp_tool_names)
+    before_spec_client = spec["client"]
+
+    with pytest.raises(RuntimeError):
+        agent._activate_mcp_candidate(
+            candidate,
+            allow_sealed=True,
+            init_spec_name="example",
+            predecessor=predecessor,
+        )
+
+    assert agent._tool_handlers == before_handlers
+    assert agent._tool_schemas == before_schemas
+    assert agent._mcp_clients_by_tool == before_owners
+    assert agent._mcp_clients == before_clients
+    assert agent._mcp_tool_names == before_names
+    assert spec["client"] is before_spec_client
+    if damage not in {"handler", "owner", "init_spec"}:
+        assert agent._tool_handlers["old"] is handler
+    assert candidate.closed
+    assert not predecessor.closed
+    assert clients is agent._mcp_clients
+    assert owners is agent._mcp_clients_by_tool
+    assert names is agent._mcp_tool_names
+
+
+@pytest.mark.parametrize("reserved", ["telegram", "task_card"])
+def test_generic_foreign_candidate_cannot_claim_reserved_names(tmp_path, reserved):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([_tool(reserved)])
+
+    with pytest.raises(RuntimeError, match="built-in/reserved"):
+        agent._activate_mcp_candidate(candidate)
+
+    assert candidate.closed
+    assert reserved not in agent._tool_handlers
+    assert reserved not in agent._mcp_clients_by_tool
+
+    forged = _ActivationClient([_tool(reserved)])
+    with pytest.raises(RuntimeError, match="built-in/reserved"):
+        agent._activate_mcp_candidate(
+            forged,
+            reserved_activation_token=object(),
+        )
+    assert forged.closed
+
+
+def test_stop_during_candidate_start_prevents_late_publication(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    candidate = _ActivationClient(
+        [_tool("late")],
+        on_start=lambda: (started.set(), release.wait(timeout=2.0)),
+    )
+    activation_errors = []
+    stop_errors = []
+
+    def activate():
+        try:
+            agent._activate_mcp_candidate(candidate)
+        except Exception as exc:
+            activation_errors.append(exc)
+
+    activation = threading.Thread(target=activate)
+    activation.start()
+    assert started.wait(timeout=1.0)
+
+    def stop():
+        try:
+            agent.stop()
+        except Exception as exc:
+            stop_errors.append(exc)
+
+    stopping = threading.Thread(target=stop)
+    stopping.start()
+    deadline = time.monotonic() + 1.0
+    while not agent._mcp_lifecycle_barrier.is_set() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    release.set()
+    activation.join(timeout=2.0)
+    stopping.join(timeout=2.0)
+
+    assert not activation.is_alive()
+    assert not stopping.is_alive()
+    assert activation_errors
+    assert stop_errors == []
+    assert "late" not in agent._tool_handlers
+    assert candidate.closed
+
+
+def test_waiting_activation_is_invalidated_by_public_deep_refresh(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    candidate = _ActivationClient([_tool("late")])
+    errors = []
+    waiting = threading.Event()
+    release = threading.Event()
+    agent._mcp_activation_wait_hook = lambda: (
+        waiting.set(),
+        release.wait(timeout=2.0),
+    )
+
+    def activate():
+        try:
+            agent._activate_mcp_candidate(candidate)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=activate)
+    thread.start()
+    assert waiting.wait(timeout=1.0)
+    monkeypatch.setattr(agent, "_setup_from_init_locked", lambda: None)
+    agent._setup_from_init()
+    release.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert errors
+    assert "invalidated" in str(errors[0])
+    assert candidate.closed
+    assert "late" not in agent._tool_handlers
+
+
+def test_public_stop_partial_retirement_then_repeat_converges(tmp_path):
+    agent, _ = _mk_agent(tmp_path)
+
+    class _Flaky(_ActivationClient):
+        def __init__(self):
+            super().__init__([_tool("flaky")])
+            self.started = True
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("close failed")
+            self.closed = True
+
+    client = _Flaky()
+    _install_dead_projection(agent, "example", client, names=("flaky",))
+
+    agent.stop()
+    assert agent._mcp_pending_retirements["example"] is client
+    assert "flaky" not in agent._tool_handlers
+    agent.stop()
+    assert agent._mcp_pending_retirements == {}
+    assert client.close_calls == 2
 
 
 def test_curated_catalog_includes_whatsapp(tmp_path: Path):

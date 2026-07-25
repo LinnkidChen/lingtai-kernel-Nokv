@@ -74,6 +74,64 @@ def _check_context_fits(agent, preset_name: str) -> tuple:
     return True, None, None
 
 
+def _mcp_refresh_precondition(agent) -> dict | None:
+    """Return an error response unless the complete retry report is valid."""
+    retry = getattr(agent, "_retry_failed_mcps", None)
+    if not callable(retry):
+        return None
+    required = {"retried", "recovered", "still_failed", "healthy"}
+    try:
+        report = retry()
+        if not isinstance(report, dict):
+            raise RuntimeError("MCP retry report must be an object")
+        missing = sorted(required - set(report))
+        if missing:
+            raise RuntimeError(
+                "MCP retry report missing fields: " + ", ".join(missing)
+            )
+        unexpected = sorted(set(report) - required)
+        if unexpected:
+            raise RuntimeError(
+                "MCP retry report has unexpected fields: "
+                + ", ".join(unexpected)
+            )
+        for field in sorted(required):
+            value = report[field]
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise RuntimeError(
+                    f"MCP retry report field {field!r} must be a list of strings"
+                )
+        if report["retried"]:
+            agent._log("mcp_retry_summary", **report)
+        if report["still_failed"]:
+            unresolved = report["still_failed"]
+            agent._log(
+                "mcp_retry_error",
+                error="unresolved MCP cleanup or activation",
+                still_failed=unresolved,
+            )
+            return {
+                "status": "error",
+                "message": (
+                    "refresh blocked: MCP cleanup or activation remains "
+                    f"unresolved for {', '.join(unresolved)}; "
+                    "fix the MCP and retry refresh"
+                ),
+            }
+    except Exception as exc:
+        agent._log("mcp_retry_error", error=str(exc))
+        return {
+            "status": "error",
+            "message": (
+                "refresh blocked: MCP cleanup or activation could not be "
+                f"verified: {exc}"
+            ),
+        }
+    return None
+
+
 def _refresh(agent, args: dict) -> dict:
     from lingtai.kernel.i18n import t
     reason = args.get("reason", "")
@@ -159,11 +217,15 @@ def _refresh(agent, args: dict) -> dict:
 
         try:
             if revert_preset:
-                agent._activate_default_preset()
+                activate = agent._activate_default_preset
             else:
-                agent._activate_preset(preset_name)
-                # Persist the choice as default so future refreshes/molts
-                # don't silently revert to the previous default preset.
+                activate = lambda: agent._activate_preset(preset_name)
+            precondition_error = _mcp_refresh_precondition(agent)
+            if precondition_error is not None:
+                return precondition_error
+            activate()
+            if not revert_preset:
+                # Persist only after the MCP precondition and runtime swap.
                 _update_default_preset(agent, preset_name)
         except KeyError:
             agent._log("preset_swap_failed",
@@ -179,44 +241,12 @@ def _refresh(agent, args: dict) -> dict:
                     "message": f"failed to activate preset {preset_name!r}: {e}"}
         agent._log("preset_swap_started",
                    preset=preset_name, reason=reason, revert=revert_preset)
+    else:
+        precondition_error = _mcp_refresh_precondition(agent)
+        if precondition_error is not None:
+            return precondition_error
 
     agent._log("refresh_requested", reason=reason)
-
-    # Re-spawn any dead init.json MCP before requesting a deferred relaunch.
-    # Cleanup/retirement is a hard precondition: proceeding after an exception
-    # or unresolved replacement can overlap the old and new runtime.
-    retry = getattr(agent, "_retry_failed_mcps", None)
-    if callable(retry):
-        try:
-            report = retry()
-            if not isinstance(report, dict):
-                raise RuntimeError("MCP retry returned no verifiable report")
-            if report.get("retried"):
-                agent._log("mcp_retry_summary", **report)
-            unresolved = list(report.get("still_failed") or [])
-            if unresolved:
-                agent._log(
-                    "mcp_retry_error",
-                    error="unresolved MCP cleanup or activation",
-                    still_failed=unresolved,
-                )
-                return {
-                    "status": "error",
-                    "message": (
-                        "refresh blocked: MCP cleanup or activation remains "
-                        f"unresolved for {', '.join(map(str, unresolved))}; "
-                        "fix the MCP and retry refresh"
-                    ),
-                }
-        except Exception as e:
-            agent._log("mcp_retry_error", error=str(e))
-            return {
-                "status": "error",
-                "message": (
-                    "refresh blocked: MCP cleanup or activation could not be "
-                    f"verified: {e}"
-                ),
-            }
 
     agent._perform_refresh()
     return {

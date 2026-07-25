@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import threading
@@ -23,6 +24,23 @@ from lingtai.kernel._frontmatter import strip_frontmatter as _strip_frontmatter
 from lingtai.kernel.config import AgentConfig, THINKING_PROVIDERS
 from lingtai.llm.service import LLMService, build_provider_defaults_from_manifest_llm
 from lingtai.kernel.prompt import build_system_prompt
+
+
+@dataclass(frozen=True)
+class MCPActivationOutcome:
+    """Exact committed client identity returned by an activation transaction."""
+
+    client: Any
+    tool_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _MCPPredecessorProjection:
+    """Validated public/private projection captured before retirement."""
+
+    spec_name: str
+    client: Any
+    tool_names: frozenset[str]
 
 
 def _detached_spawn_kwargs() -> dict[str, Any]:
@@ -144,7 +162,13 @@ class Agent(BaseAgent):
         # MCP transport startup, validation, predecessor retirement, and
         # publication form one wrapper-owned transaction.  Candidates stay
         # outside every public registry until the transaction commits.
-        self._mcp_activation_lock = threading.Lock()
+        self._mcp_activation_lock = threading.RLock()
+        self._mcp_lifecycle_generation = 0
+        self._mcp_lifecycle_state = "active"
+        self._mcp_lifecycle_barrier = threading.Event()
+        self._mcp_refresh_owner_thread: int | None = None
+        self._mcp_pending_retirements: dict[str, Any] = {}
+        self._mcp_reserved_activation_tokens: set[object] = set()
         self._mcp_clients: list[Any] = []
         self._mcp_clients_by_tool: dict[str, Any] = {}
         self._mcp_tool_names: set[str] = set()
@@ -647,19 +671,18 @@ class Agent(BaseAgent):
 
         def _spawn(name: str, cfg: dict, source: str) -> object | None:
             """Return the MCPClient/HTTPMCPClient on success, None on failure."""
-            # Snapshot the client list pre-spawn so we can identify the new
-            # client connect_mcp* appended (avoids changing connect_mcp's
-            # public return contract — it returns tool names, not the client).
-            pre_clients = list(getattr(self, "_mcp_clients", []) or [])
             try:
+                import inspect
+
                 server_type = cfg.get("type", "stdio")
                 if server_type == "http":
                     if "url" not in cfg:
                         return None
-                    tools = self.connect_mcp_http(
-                        url=cfg["url"],
-                        headers=cfg.get("headers"),
-                    )
+                    connector = self.connect_mcp_http
+                    connector_args = {
+                        "url": cfg["url"],
+                        "headers": cfg.get("headers"),
+                    }
                 else:
                     if "command" not in cfg:
                         return None
@@ -671,19 +694,45 @@ class Agent(BaseAgent):
                         "LINGTAI_MCP_NAME": name,
                         **(cfg.get("env") or {}),
                     }
-                    tools = self.connect_mcp(
-                        command=cfg["command"],
-                        args=cfg.get("args"),
-                        env=merged_env,
-                    )
+                    connector = self.connect_mcp
+                    connector_args = {
+                        "command": cfg["command"],
+                        "args": cfg.get("args"),
+                        "env": merged_env,
+                    }
+                if (
+                    "_return_activation_outcome"
+                    in inspect.signature(connector).parameters
+                ):
+                    reserved_token = object() if name == "telegram" else None
+                    if reserved_token is not None:
+                        self._mcp_reserved_activation_tokens.add(reserved_token)
+                    try:
+                        outcome = connector(
+                            **connector_args,
+                            _return_activation_outcome=True,
+                            _reserved_activation_token=reserved_token,
+                        )
+                    finally:
+                        if reserved_token is not None:
+                            self._mcp_reserved_activation_tokens.discard(
+                                reserved_token
+                            )
+                    if not isinstance(outcome, MCPActivationOutcome):
+                        raise RuntimeError(
+                            "MCP loader received no activation outcome"
+                        )
+                    tools = list(outcome.tool_names)
+                    loaded_client = outcome.client
+                else:
+                    pre_clients = list(self._mcp_clients)
+                    tools = connector(**connector_args)
+                    new_clients = self._mcp_clients[len(pre_clients):]
+                    loaded_client = new_clients[-1] if new_clients else None
                 logger.info("[%s] MCP %s (%s): loaded %d tools (%s)",
                             self.agent_name, name, source, len(tools),
                             ", ".join(tools))
-                # Identify the client connect_mcp* just appended.
-                post_clients = list(getattr(self, "_mcp_clients", []) or [])
-                new_clients = post_clients[len(pre_clients):]
-                # connect_mcp / connect_mcp_http always append exactly one.
-                return new_clients[-1] if new_clients else None
+                return loaded_client
             except Exception as e:
                 logger.warning("[%s] MCP %s (%s): failed to load: %s",
                                self.agent_name, name, source, e)
@@ -746,6 +795,27 @@ class Agent(BaseAgent):
             }
 
     def _retry_failed_mcps(self) -> dict:
+        """Serialize retry, pending-retirement drain, and replacement."""
+        self._ensure_mcp_activation_state()
+        with self._mcp_activation_lock:
+            if self._mcp_lifecycle_state == "stopping":
+                return {
+                    "retried": [],
+                    "recovered": [],
+                    "still_failed": sorted(self._mcp_init_specs),
+                    "healthy": [],
+                }
+            unresolved = self._drain_pending_mcp_retirements_locked()
+            if unresolved:
+                return {
+                    "retried": [],
+                    "recovered": [],
+                    "still_failed": sorted(unresolved),
+                    "healthy": [],
+                }
+            return self._retry_failed_mcps_locked()
+
+    def _retry_failed_mcps_locked(self) -> dict:
         """Re-spawn any init.json MCP whose subprocess is dead or never started.
 
         Walks ``self._mcp_init_specs`` (populated by ``_load_mcp_from_workdir``)
@@ -802,7 +872,6 @@ class Agent(BaseAgent):
             # irreversible boundary, verify close/join, then start and publish
             # one replacement. Test/host overrides with the older public
             # signature retain the legacy close/remove behavior.
-            pre_clients = list(getattr(self, "_mcp_clients", []) or [])
             new_client: object | None = None
             try:
                 server_type = cfg.get("type", "stdio")
@@ -835,35 +904,50 @@ class Agent(BaseAgent):
                     "_init_spec_name" in inspect.signature(connector).parameters
                 )
                 if supports_transaction:
-                    connector(
-                        **connector_args,
-                        _allow_sealed=True,
-                        _init_spec_name=name,
-                        _predecessor=client,
-                    )
+                    reserved_token = object() if name == "telegram" else None
+                    if reserved_token is not None:
+                        self._mcp_reserved_activation_tokens.add(reserved_token)
+                    try:
+                        outcome = connector(
+                            **connector_args,
+                            _allow_sealed=True,
+                            _init_spec_name=name,
+                            _predecessor=client,
+                            _return_activation_outcome=True,
+                            _reserved_activation_token=reserved_token,
+                        )
+                    finally:
+                        if reserved_token is not None:
+                            self._mcp_reserved_activation_tokens.discard(
+                                reserved_token
+                            )
+                    if not isinstance(outcome, MCPActivationOutcome):
+                        raise RuntimeError(
+                            "production MCP connector returned no activation outcome"
+                        )
+                    self._assert_mcp_activation_outcome(name, outcome)
+                    new_client = outcome.client
                 else:
                     if client is not None:
-                        client.close()
+                        try:
+                            self._close_mcp_candidate(client)
+                        except Exception:
+                            self._record_pending_mcp_retirement(name, client)
+                            raise
                         try:
                             self._mcp_clients.remove(client)
                         except ValueError:
                             pass
                     connector(**connector_args)
-                post_clients = list(getattr(self, "_mcp_clients", []) or [])
-                new = post_clients[len(pre_clients):]
-                if new:
-                    new_client = new[-1]
-                elif (
-                    not supports_transaction
-                    and post_clients
-                    and post_clients[-1] is not client
-                ):
-                    new_client = post_clients[-1]
+                    post_clients = list(getattr(self, "_mcp_clients", []) or [])
+                    if post_clients and post_clients[-1] is not client:
+                        new_client = post_clients[-1]
             except Exception as e:
                 logger.warning("[%s] MCP %s (%s): retry failed: %s",
                                self.agent_name, name, source, e)
                 self._log("mcp_retry_failed", name=name, error=str(e))
-                spec["client"] = None
+                if name not in self._mcp_pending_retirements:
+                    spec["client"] = None
                 still_failed.append(name)
                 continue
 
@@ -1023,7 +1107,19 @@ class Agent(BaseAgent):
     def _ensure_mcp_activation_state(self) -> None:
         """Initialize private activation state for legacy `__new__` callers."""
         if not hasattr(self, "_mcp_activation_lock"):
-            self._mcp_activation_lock = threading.Lock()
+            self._mcp_activation_lock = threading.RLock()
+        if not hasattr(self, "_mcp_lifecycle_generation"):
+            self._mcp_lifecycle_generation = 0
+        if not hasattr(self, "_mcp_lifecycle_state"):
+            self._mcp_lifecycle_state = "active"
+        if not hasattr(self, "_mcp_lifecycle_barrier"):
+            self._mcp_lifecycle_barrier = threading.Event()
+        if not hasattr(self, "_mcp_refresh_owner_thread"):
+            self._mcp_refresh_owner_thread = None
+        if not hasattr(self, "_mcp_pending_retirements"):
+            self._mcp_pending_retirements = {}
+        if not hasattr(self, "_mcp_reserved_activation_tokens"):
+            self._mcp_reserved_activation_tokens = set()
         if not hasattr(self, "_mcp_clients"):
             self._mcp_clients = []
         if not hasattr(self, "_mcp_clients_by_tool"):
@@ -1117,24 +1213,32 @@ class Agent(BaseAgent):
             )
         return prepared
 
-    def _preflight_mcp_candidate(self, prepared: list[tuple[str, Any, Any]]) -> None:
+    def _preflight_mcp_candidate(
+        self,
+        prepared: list[tuple[str, Any, Any]],
+        *,
+        init_spec_name: str | None = None,
+        predecessor: Any | None = None,
+        reserved_activation_token: object | None = None,
+    ) -> None:
         """Reject built-in, foreign, or inconsistent ownership before commit."""
         collisions = []
         for name, _, _ in prepared:
-            # ``task_card`` is the existing Telegram-owned reclaim seam: a
-            # foreign MCP may advertise it, but Telegram immediately replaces
-            # the public handler/schema. Preserve that established exception
-            # while keeping every ordinary built-in/reserved name fail-closed.
-            if name == "task_card":
-                continue
+            # The Telegram composition root is the only explicit reclaim seam
+            # for these reserved public names. Generic/direct MCP candidates
+            # cannot acquire them merely by advertising the same string.
             if (
-                name == "telegram"
-                and getattr(self, "_task_card_controller", None) is not None
+                name in {"telegram", "task_card"}
+                and reserved_activation_token is not None
+                and reserved_activation_token
+                in self._mcp_reserved_activation_tokens
             ):
-                # Preserve the established direct Telegram reconnect path.
-                # Init-spec retries use the stricter exact-predecessor path.
                 continue
-            if name in self._intrinsics or name == "bash":
+            if name in self._intrinsics or name in {
+                "bash",
+                "telegram",
+                "task_card",
+            }:
                 collisions.append((name, "built-in/reserved"))
                 continue
             handler = self._tool_handlers.get(name)
@@ -1160,20 +1264,70 @@ class Agent(BaseAgent):
             detail = ", ".join(f"{name!r} ({kind})" for name, kind in collisions)
             raise RuntimeError(f"MCP candidate tool collision: {detail}")
 
-    def _depublish_mcp_client(
-        self, client: Any, *, init_spec_name: str | None = None
-    ) -> None:
-        """Irreversibly remove one predecessor from every public projection."""
-        names = {
+    def _validate_mcp_predecessor_projection(
+        self, spec_name: str, client: Any
+    ) -> _MCPPredecessorProjection:
+        """Validate every predecessor projection before irreversible mutation."""
+        spec = self._mcp_init_specs.get(spec_name)
+        if not isinstance(spec, dict) or spec.get("client") is not client:
+            raise RuntimeError("MCP predecessor is not exact for init spec")
+        if self._mcp_clients.count(client) != 1:
+            raise RuntimeError("MCP predecessor client-list membership is inconsistent")
+        if set(self._mcp_clients_by_tool) != set(self._mcp_tool_names):
+            raise RuntimeError("MCP predecessor owner/name-set projection is inconsistent")
+
+        owner_names = {
             name
             for name, owner in self._mcp_clients_by_tool.items()
             if owner is client
         }
-        names.update(
+        handler_names = {
             name
             for name, handler in self._tool_handlers.items()
             if getattr(handler, "_lingtai_mcp_client", None) is client
+        }
+        if owner_names != handler_names:
+            raise RuntimeError("MCP predecessor handler/owner projection is inconsistent")
+        for name in owner_names:
+            if name not in self._mcp_tool_names:
+                raise RuntimeError(
+                    f"MCP predecessor tool-name projection is missing {name!r}"
+                )
+            schemas = [schema for schema in self._tool_schemas if schema.name == name]
+            if len(schemas) != 1:
+                raise RuntimeError(
+                    f"MCP predecessor schema multiplicity is inconsistent for {name!r}"
+                )
+            handler = self._tool_handlers.get(name)
+            if getattr(handler, "_lingtai_mcp_tool_name", None) != name:
+                raise RuntimeError(
+                    f"MCP predecessor handler capture is inconsistent for {name!r}"
+                )
+        return _MCPPredecessorProjection(
+            spec_name=spec_name,
+            client=client,
+            tool_names=frozenset(owner_names),
         )
+
+    def _depublish_mcp_client(
+        self,
+        client: Any,
+        *,
+        init_spec_name: str | None = None,
+        projection: _MCPPredecessorProjection | None = None,
+    ) -> None:
+        """Irreversibly remove one predecessor from every public projection."""
+        names = set(projection.tool_names) if projection is not None else {
+            name
+            for name, owner in self._mcp_clients_by_tool.items()
+            if owner is client
+        }
+        if projection is None:
+            names.update(
+                name
+                for name, handler in self._tool_handlers.items()
+                if getattr(handler, "_lingtai_mcp_client", None) is client
+            )
         self._tool_handlers = {
             name: handler
             for name, handler in self._tool_handlers.items()
@@ -1191,11 +1345,6 @@ class Agent(BaseAgent):
         self._mcp_clients = [
             existing for existing in self._mcp_clients if existing is not client
         ]
-        for name, spec in getattr(self, "_mcp_init_specs", {}).items():
-            if init_spec_name is not None and name != init_spec_name:
-                continue
-            if isinstance(spec, dict) and spec.get("client") is client:
-                spec["client"] = None
         self._token_decomp_dirty = True
 
     @staticmethod
@@ -1217,6 +1366,53 @@ class Agent(BaseAgent):
             if connected:
                 raise RuntimeError("MCP client is still connected after close")
 
+    def _record_pending_mcp_retirement(self, key: str, client: Any) -> None:
+        existing = self._mcp_pending_retirements.get(key)
+        if existing is not None and existing is not client:
+            raise RuntimeError(
+                f"MCP retirement key {key!r} already owns another client"
+            )
+        self._mcp_pending_retirements[key] = client
+        spec = self._mcp_init_specs.get(key)
+        if isinstance(spec, dict):
+            spec["client"] = client
+
+    def _drain_pending_mcp_retirements_locked(self) -> dict[str, str]:
+        """Retry every keyed close without discarding ownership on failure."""
+        unresolved: dict[str, str] = {}
+        for key, client in list(self._mcp_pending_retirements.items()):
+            try:
+                self._close_mcp_candidate(client)
+            except Exception as exc:
+                unresolved[key] = f"{type(exc).__name__}: {exc}"
+                continue
+            self._mcp_pending_retirements.pop(key, None)
+            spec = self._mcp_init_specs.get(key)
+            if isinstance(spec, dict) and spec.get("client") is client:
+                spec["client"] = None
+        return unresolved
+
+    def _assert_mcp_activation_outcome(
+        self, spec_name: str, outcome: MCPActivationOutcome
+    ) -> None:
+        """Require every committed projection to share exact client identity."""
+        client = outcome.client
+        spec = self._mcp_init_specs.get(spec_name)
+        if not isinstance(spec, dict) or spec.get("client") is not client:
+            raise RuntimeError("MCP activation outcome does not own its init spec")
+        if self._mcp_clients.count(client) != 1:
+            raise RuntimeError("MCP activation outcome client-list mismatch")
+        for name in outcome.tool_names:
+            if self._mcp_clients_by_tool.get(name) is not client:
+                raise RuntimeError(f"MCP activation owner mismatch for {name!r}")
+            handler = self._tool_handlers.get(name)
+            if getattr(handler, "_lingtai_mcp_client", None) is not client:
+                raise RuntimeError(f"MCP activation handler mismatch for {name!r}")
+            if name not in self._mcp_tool_names:
+                raise RuntimeError(f"MCP activation name-set mismatch for {name!r}")
+            if sum(schema.name == name for schema in self._tool_schemas) != 1:
+                raise RuntimeError(f"MCP activation schema mismatch for {name!r}")
+
     def _activate_mcp_candidate(
         self,
         client: Any,
@@ -1224,33 +1420,79 @@ class Agent(BaseAgent):
         allow_sealed: bool = False,
         init_spec_name: str | None = None,
         predecessor: Any | None = None,
-    ) -> list[str]:
+        reserved_activation_token: object | None = None,
+    ) -> MCPActivationOutcome:
         """Retire an exact dead predecessor, then atomically publish a candidate."""
         self._ensure_mcp_activation_state()
+        requested_generation = self._mcp_lifecycle_generation
+        wait_hook = getattr(self, "_mcp_activation_wait_hook", None)
+        if callable(wait_hook):
+            wait_hook()
         with self._mcp_activation_lock:
             retired = False
+            candidate_key = init_spec_name or f"candidate:{id(client)}"
             try:
+                if requested_generation != self._mcp_lifecycle_generation:
+                    raise RuntimeError("MCP activation invalidated by lifecycle transition")
+                refresh_owner = (
+                    self._mcp_lifecycle_state == "refreshing"
+                    and self._mcp_refresh_owner_thread == threading.get_ident()
+                )
+                if self._mcp_lifecycle_state != "active" and not refresh_owner:
+                    raise RuntimeError(
+                        f"MCP activation blocked while lifecycle is "
+                        f"{self._mcp_lifecycle_state}"
+                    )
+                unresolved = self._drain_pending_mcp_retirements_locked()
+                if unresolved:
+                    detail = ", ".join(
+                        f"{name}: {error}" for name, error in unresolved.items()
+                    )
+                    raise RuntimeError(
+                        f"MCP pending retirement remains unresolved: {detail}"
+                    )
                 if self._sealed and not (allow_sealed and init_spec_name):
                     raise RuntimeError("Cannot modify tools after start()")
                 if predecessor is not None:
-                    spec = self._mcp_init_specs.get(init_spec_name or "")
-                    if not isinstance(spec, dict) or spec.get("client") is not predecessor:
-                        raise RuntimeError("MCP predecessor is not exact for init spec")
-                    if self._mcp_clients.count(predecessor) != 1:
-                        raise RuntimeError("MCP predecessor membership is inconsistent")
+                    if init_spec_name is None:
+                        raise RuntimeError("MCP predecessor requires an init spec")
+                    projection = self._validate_mcp_predecessor_projection(
+                        init_spec_name, predecessor
+                    )
                     if self._mcp_client_is_connected(predecessor):
                         raise RuntimeError("MCP predecessor is still healthy")
                     self._depublish_mcp_client(
-                        predecessor, init_spec_name=init_spec_name
+                        predecessor,
+                        init_spec_name=init_spec_name,
+                        projection=projection,
                     )
                     retired = True
+                    self._record_pending_mcp_retirement(
+                        init_spec_name, predecessor
+                    )
                     if self._chat is not None:
                         self._chat.update_tools(self._build_tool_schemas())
                     self._close_mcp_candidate(predecessor)
+                    self._mcp_pending_retirements.pop(init_spec_name, None)
+                    spec = self._mcp_init_specs[init_spec_name]
+                    if spec.get("client") is predecessor:
+                        spec["client"] = None
 
                 client.start()
                 prepared = self._prepare_mcp_candidate(client)
-                self._preflight_mcp_candidate(prepared)
+                self._preflight_mcp_candidate(
+                    prepared,
+                    init_spec_name=init_spec_name,
+                    predecessor=predecessor,
+                    reserved_activation_token=reserved_activation_token,
+                )
+                if (
+                    self._mcp_lifecycle_barrier.is_set()
+                    or requested_generation != self._mcp_lifecycle_generation
+                ):
+                    raise RuntimeError(
+                        "MCP activation interrupted by lifecycle teardown"
+                    )
                 names = [name for name, _, _ in prepared]
                 name_set = set(names)
 
@@ -1297,6 +1539,18 @@ class Agent(BaseAgent):
                         ):
                             self._mcp_clients_by_tool.pop("task_card", None)
                             self._mcp_tool_names.discard("task_card")
+                    outcome = MCPActivationOutcome(
+                        client=client,
+                        tool_names=tuple(
+                            name
+                            for name in names
+                            if self._mcp_clients_by_tool.get(name) is client
+                        ),
+                    )
+                    if init_spec_name is not None:
+                        self._assert_mcp_activation_outcome(
+                            init_spec_name, outcome
+                        )
                 except Exception:
                     self._tool_handlers = handlers_before
                     self._tool_schemas = schemas_before
@@ -1307,17 +1561,30 @@ class Agent(BaseAgent):
                     if init_spec_name is not None:
                         self._mcp_init_specs[init_spec_name]["client"] = None
                     raise
-                return names
+                return outcome
             except Exception as activation_error:
-                if retired and init_spec_name is not None:
-                    self._mcp_init_specs[init_spec_name]["client"] = None
                 try:
                     self._close_mcp_candidate(client)
                 except Exception as cleanup_error:
+                    if (
+                        candidate_key in self._mcp_pending_retirements
+                        and self._mcp_pending_retirements[candidate_key] is not client
+                    ):
+                        candidate_key = (
+                            f"{candidate_key}:candidate:{id(client)}"
+                        )
+                    self._record_pending_mcp_retirement(candidate_key, client)
                     raise RuntimeError(
                         f"MCP activation failed ({activation_error}); "
                         f"candidate cleanup unresolved ({cleanup_error})"
                     ) from activation_error
+                if init_spec_name is not None:
+                    spec = self._mcp_init_specs.get(init_spec_name)
+                    if (
+                        isinstance(spec, dict)
+                        and spec.get("client") is client
+                    ):
+                        spec["client"] = None
                 raise
 
     def connect_mcp(
@@ -1329,7 +1596,9 @@ class Agent(BaseAgent):
         _allow_sealed: bool = False,
         _init_spec_name: str | None = None,
         _predecessor: Any | None = None,
-    ) -> list[str]:
+        _return_activation_outcome: bool = False,
+        _reserved_activation_token: object | None = None,
+    ) -> list[str] | MCPActivationOutcome:
         """Connect to an MCP server and auto-register all its tools.
 
         Args:
@@ -1351,12 +1620,14 @@ class Agent(BaseAgent):
             env = {k: self._expand_agent_placeholders(v) for k, v in env.items()}
 
         client = MCPClient(command=command, args=args, env=env)
-        return self._activate_mcp_candidate(
+        outcome = self._activate_mcp_candidate(
             client,
             allow_sealed=_allow_sealed,
             init_spec_name=_init_spec_name,
             predecessor=_predecessor,
+            reserved_activation_token=_reserved_activation_token,
         )
+        return outcome if _return_activation_outcome else list(outcome.tool_names)
 
     def _maybe_setup_task_card_controller(self) -> None:
         """Register the Telegram-owned public ``task_card`` controller once a
@@ -1409,7 +1680,9 @@ class Agent(BaseAgent):
         _allow_sealed: bool = False,
         _init_spec_name: str | None = None,
         _predecessor: Any | None = None,
-    ) -> list[str]:
+        _return_activation_outcome: bool = False,
+        _reserved_activation_token: object | None = None,
+    ) -> list[str] | MCPActivationOutcome:
         """Connect to a remote HTTP MCP server and auto-register all its tools.
 
         Args:
@@ -1422,50 +1695,70 @@ class Agent(BaseAgent):
         from .services.mcp import HTTPMCPClient
 
         client = HTTPMCPClient(url=url, headers=headers)
-        return self._activate_mcp_candidate(
+        outcome = self._activate_mcp_candidate(
             client,
             allow_sealed=_allow_sealed,
             init_spec_name=_init_spec_name,
             predecessor=_predecessor,
+            reserved_activation_token=_reserved_activation_token,
         )
+        return outcome if _return_activation_outcome else list(outcome.tool_names)
 
     def _retire_all_mcp_clients(self, *, context: str) -> dict:
         """Depublish first, then attempt every close and retain unresolved work."""
-        clients = []
-        for client in self._mcp_clients:
-            if not any(existing is client for existing in clients):
-                clients.append(client)
+        self._ensure_mcp_activation_state()
+        with self._mcp_activation_lock:
+            keyed: dict[str, Any] = dict(self._mcp_pending_retirements)
+            for name, spec in self._mcp_init_specs.items():
+                if isinstance(spec, dict) and spec.get("client") is not None:
+                    keyed.setdefault(name, spec["client"])
+            for client in self._mcp_clients:
+                if not any(existing is client for existing in keyed.values()):
+                    keyed[f"client:{id(client)}"] = client
 
-        # Callable state is removed before the first potentially failing close.
-        for client in clients:
-            self._depublish_mcp_client(client)
+            # Callable state is removed before the first potentially failing
+            # close, while keyed ownership is retained until verified.
+            for key, client in keyed.items():
+                self._depublish_mcp_client(client)
+                self._record_pending_mcp_retirement(key, client)
 
-        unresolved = []
-        retired = []
-        for client in clients:
-            try:
-                self._close_mcp_candidate(client)
-            except Exception as exc:
-                unresolved.append(
-                    {
-                        "client": type(client).__name__,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                self._mcp_clients.append(client)
-            else:
-                retired.append(type(client).__name__)
-        report = {
-            "context": context,
-            "attempted": len(clients),
-            "retired": retired,
-            "unresolved": unresolved,
-        }
-        if unresolved:
-            self._log("mcp_cleanup_unresolved", **report)
-        return report
+            unresolved = []
+            retired = []
+            for key, client in list(keyed.items()):
+                try:
+                    self._close_mcp_candidate(client)
+                except Exception as exc:
+                    unresolved.append(
+                        {
+                            "key": key,
+                            "client": type(client).__name__,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                else:
+                    retired.append(type(client).__name__)
+                    self._mcp_pending_retirements.pop(key, None)
+                    spec = self._mcp_init_specs.get(key)
+                    if isinstance(spec, dict) and spec.get("client") is client:
+                        spec["client"] = None
+            report = {
+                "context": context,
+                "attempted": len(keyed),
+                "retired": retired,
+                "unresolved": unresolved,
+            }
+            if unresolved:
+                self._log("mcp_cleanup_unresolved", **report)
+            return report
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._ensure_mcp_activation_state()
+        # Signal before waiting on the lifecycle lock so an in-flight candidate
+        # cannot cross its publication boundary after stop was requested.
+        self._mcp_lifecycle_barrier.set()
+        with self._mcp_activation_lock:
+            self._mcp_lifecycle_generation += 1
+            self._mcp_lifecycle_state = "stopping"
         # Stop LICC poller before closing MCP clients so any in-flight events
         # finish dispatching before subprocess teardown.
         poller = getattr(self, "_mcp_inbox_poller", None)
@@ -1632,6 +1925,25 @@ class Agent(BaseAgent):
         self._activate_preset(default_name)
 
     def _setup_from_init(self) -> None:
+        """Serialize the complete deep-refresh reconstruction lifecycle."""
+        self._ensure_mcp_activation_state()
+        self._mcp_lifecycle_barrier.set()
+        with self._mcp_activation_lock:
+            self._mcp_lifecycle_generation += 1
+            self._mcp_lifecycle_state = "refreshing"
+            self._mcp_refresh_owner_thread = threading.get_ident()
+            # The generation invalidates waiters. The owning refresh may now
+            # activate replacement clients while holding the same RLock.
+            self._mcp_lifecycle_barrier.clear()
+            try:
+                self._setup_from_init_locked()
+            finally:
+                self._mcp_refresh_owner_thread = None
+                if self._mcp_lifecycle_state != "stopping":
+                    self._mcp_lifecycle_state = "active"
+                self._mcp_lifecycle_barrier.clear()
+
+    def _setup_from_init_locked(self) -> None:
         """Full construct/reconstruct from init.json."""
         self._log("refresh_start")
 

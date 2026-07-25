@@ -96,11 +96,12 @@ content with a `lingtai_agent_summarized_result` marker), persists via
 `_save_chat_history`, and the original payload stays traceable in
 `<workdir>/logs/events.jsonl` by `tool_call_id`.
 
-Before a refresh requests deferred relaunch, `_retry_failed_mcps()` must return
-a mapping whose `still_failed` list is empty. An exception, malformed report,
-or unresolved entry fails closed with an actionable error; `_perform_refresh()`
-is not called and no relaunch signal is requested. No MCP specs and an
-all-healthy report preserve the existing successful path.
+Before preset activation/default persistence or deferred relaunch,
+`_retry_failed_mcps()` must return a mapping containing `retried`, `recovered`,
+`still_failed`, and `healthy`, each a list of strings. An exception, missing or
+mistyped field, or unresolved entry fails closed with an actionable error:
+`init.json` is unchanged, `_perform_refresh()` is not called, and no relaunch
+signal is requested. Empty/no-spec and all-healthy reports preserve success.
 
 ## Cross-platform invariants
 

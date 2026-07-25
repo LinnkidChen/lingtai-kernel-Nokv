@@ -18,6 +18,7 @@ related_files:
   - src/lingtai/kernel/mail_transport/ANATOMY.md
   - src/lingtai/kernel/services/ANATOMY.md
   - tests/test_mcp_closed_resource_restart.py
+  - tests/test_mcp_client_lifecycle.py
   - ENVIRONMENT_VARIABLES.md
   - tests/test_mcp_structured_result.py
 maintenance: |
@@ -76,6 +77,14 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 ## Notes
 
 - `MCPClient` uses `stdio_client` transport (subprocess); `HTTPMCPClient` uses `streamablehttp_client` (remote HTTP/SSE). Both expose identical `call_tool()` / `list_tools()` / `close()` API.
+- **Bounded startup/retirement:** both clients accept configurable
+  `startup_timeout` and `close_timeout`. A false `_ready.wait(...)` result is a
+  startup failure, requests transport shutdown, and raises; startup exceptions
+  also perform bounded cleanup. `close()` always rechecks and joins an existing
+  thread even when `_closed` was already set, and raises while the thread
+  remains alive so the Agent can retain keyed pending retirement state instead
+  of declaring cleanup complete. Hermetic tests cover a real stalled stdio
+  subprocess and local streamable-HTTP startup/list/close paths.
 - Lazy start: both clients auto-connect on first `call_tool()`.
 - **Structured MCP results:** `_decode_tool_result` (`mcp.py:44-80`) is shared by stdio and HTTP. It prefers dictionary `structuredContent`, then JSON-object text, and preserves structured error fields at top level while forcing protocol-authoritative `status="error"`; plain-text errors retain the legacy `status`/`message` envelope. Tests: `tests/test_mcp_structured_result.py`.
 - **Structured-result policy:** `isError=false` (or an absent transport bit)

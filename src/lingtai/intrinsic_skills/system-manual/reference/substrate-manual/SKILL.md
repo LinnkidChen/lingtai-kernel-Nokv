@@ -13,13 +13,17 @@ description: >
   and resident substrate maintenance. This is
   a nested skill-reference under `system-manual`, not a standalone catalog skill;
   its folder may carry scripts/assets as the substrate reference grows.
-version: 1.3.0
+version: 1.4.0
 tags: [lingtai, system-manual, substrate, runtime, lifecycle, communication, memory, notifications, mcp, preset]
-last_changed_at: 2026-07-19T00:00:00Z
+last_changed_at: 2026-07-25T00:00:00Z
 related_files:
 - src/lingtai/intrinsic_skills/system-manual/SKILL.md
 - src/lingtai/prompts/substrate/substrate.md
 - src/lingtai/prompts/substrate/substrate.yaml
+- src/lingtai/agent.py
+- src/lingtai/tools/system/preset.py
+- tests/test_mcp_capability.py
+- tests/test_system.py
 maintenance: |
   Tracks the substrate-manual topic it documents; update when that integration changes.
 ---
@@ -430,11 +434,19 @@ requires both `active` and `default` to be members of `allowed`.
    `revert_preset=true` to read `manifest.preset.default` instead. An empty
    optional `preset` string normalizes to absent; supplying both a non-empty
    `preset` and `revert_preset` is a conflict.
-3. The refresh path checks the requested path's `allowed` membership, checks
-   the target preset's context limit fits the current conversation, activates
-   atomically (writes raw `init.json`), persists the new selected default for
-   a named swap, best-effort retries failed MCPs, then rebuilds the runtime
-   (LLM/config/capabilities/MCP/prompt reconstruction, preserving conversation
+3. The refresh path checks the requested path's `allowed` membership and
+   verifies that the target preset's context limit fits the current
+   conversation. Before activating the preset or changing
+   `manifest.preset.default`, it drains pending MCP retirements and retries
+   failed MCPs. The retry report must contain `retried`, `recovered`,
+   `still_failed`, and `healthy`, each as a list of strings. A missing or
+   malformed field, retry exception, still-live transport/thread, or non-empty
+   `still_failed` list blocks refresh without changing `init.json` or requesting
+   relaunch. Fix the MCP configuration or transport, ensure the old process has
+   retired, and call `system(action="refresh", ...)` again; repeated refresh is
+   the supported convergence path. Only after that precondition succeeds does
+   a named swap activate and persist its selected path, followed by runtime
+   reconstruction (LLM/config/capabilities/MCP/prompts, preserving conversation
    history where a live session exists).
 4. A config, prompt, MCP, or capability edit needs `refresh` to take effect;
    `system(action="summarize")` alone does not reconstruct the runtime and
