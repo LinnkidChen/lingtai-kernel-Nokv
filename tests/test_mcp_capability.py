@@ -8,6 +8,7 @@ registry membership.
 from __future__ import annotations
 
 import copy
+import importlib
 import json
 import re
 import socket
@@ -884,29 +885,31 @@ def test_retry_failed_mcps_stopping_is_fail_closed_without_init_specs(tmp_path):
     assert report["still_failed"] == ["lifecycle:stopping"]
 
 
-def test_public_refresh_racing_stop_is_fail_closed(tmp_path, monkeypatch):
+def test_public_refresh_that_owns_lifecycle_lock_wins_race_with_stop(
+    tmp_path, monkeypatch
+):
     agent, _ = _mk_agent(tmp_path)
     performed = []
     monkeypatch.setattr(agent, "_perform_refresh", lambda: performed.append(True))
     agent._mcp_activation_lock.acquire()
     stopping = threading.Thread(target=agent.stop)
     stopping.start()
-    deadline = time.monotonic() + 1.0
-    while not agent._mcp_lifecycle_barrier.is_set() and time.monotonic() < deadline:
-        time.sleep(0.005)
     try:
         result = agent._intrinsics["system"]({"action": "refresh"})
+        assert result["status"] == "ok"
+        assert performed == [True]
+        assert agent._mcp_lifecycle_state == "relaunching"
+        assert agent._mcp_lifecycle_barrier.is_set()
     finally:
         agent._mcp_activation_lock.release()
     stopping.join(timeout=2.0)
 
     assert not stopping.is_alive()
-    assert result["status"] == "error"
-    assert "stop is pending" in result["message"]
-    assert performed == []
+    assert agent._mcp_lifecycle_state == "stopping"
+    assert agent._mcp_lifecycle_barrier.is_set()
 
 
-def test_refresh_stop_after_precondition_blocks_preset_mutation_and_perform(
+def test_refresh_stop_after_precondition_completes_refresh_before_stop(
     tmp_path, monkeypatch
 ):
     agent, workdir = _mk_agent(tmp_path)
@@ -930,12 +933,6 @@ def test_refresh_stop_after_precondition_blocks_preset_mutation_and_perform(
         nonlocal stop_thread
         stop_thread = threading.Thread(target=agent.stop)
         stop_thread.start()
-        deadline = time.monotonic() + 1.0
-        while (
-            not agent._mcp_stop_requested.is_set()
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
         return {
             "retried": [],
             "recovered": [],
@@ -953,10 +950,9 @@ def test_refresh_stop_after_precondition_blocks_preset_mutation_and_perform(
     stop_thread.join(timeout=2.0)
 
     assert not stop_thread.is_alive()
-    assert result["status"] == "error"
-    assert "pending stop" in result["message"]
-    assert activated == []
-    assert performed == []
+    assert result["status"] == "ok"
+    assert activated == ["next"]
+    assert performed == [True]
     assert agent._mcp_lifecycle_state == "stopping"
     assert agent._mcp_stop_requested.is_set()
     assert agent._mcp_lifecycle_barrier.is_set()
@@ -964,26 +960,168 @@ def test_refresh_stop_after_precondition_blocks_preset_mutation_and_perform(
 
 def test_deep_refresh_never_clears_pending_stop(tmp_path):
     agent, _ = _mk_agent(tmp_path)
-    agent._mcp_activation_lock.acquire()
-    stopping = threading.Thread(target=agent.stop)
-    stopping.start()
-    deadline = time.monotonic() + 1.0
-    while (
-        not agent._mcp_stop_requested.is_set()
-        and time.monotonic() < deadline
-    ):
-        time.sleep(0.005)
-    try:
-        with pytest.raises(RuntimeError, match="pending stop"):
-            agent._setup_from_init()
-        assert agent._mcp_lifecycle_barrier.is_set()
-        assert agent._mcp_refresh_owner_thread is None
-        assert agent._mcp_lifecycle_state != "refreshing"
-    finally:
-        agent._mcp_activation_lock.release()
+    agent.stop()
+    with pytest.raises(RuntimeError, match="pending stop"):
+        agent._setup_from_init()
+    assert agent._mcp_lifecycle_state == "stopping"
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
+def test_stop_after_deep_refresh_final_check_keeps_terminal_barrier(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    stopping = None
+    stop_attempted = threading.Event()
+
+    def request_stop():
+        nonlocal stopping
+        def stop():
+            stop_attempted.set()
+            agent.stop()
+
+        stopping = threading.Thread(target=stop)
+        stopping.start()
+        assert stop_attempted.wait(timeout=1.0)
+
+    monkeypatch.setattr(agent, "_setup_from_init_locked", request_stop)
+    agent._setup_from_init()
+    assert stopping is not None
     stopping.join(timeout=2.0)
 
     assert not stopping.is_alive()
+    assert agent._mcp_lifecycle_state == "stopping"
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
+def test_successful_refresh_handoff_remains_terminal_in_old_process(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "ok"
+    assert agent._mcp_lifecycle_state == "relaunching"
+    assert agent._mcp_lifecycle_barrier.is_set()
+    candidate = _ActivationClient([_tool("late")])
+    with pytest.raises(RuntimeError, match="relaunching"):
+        agent._activate_mcp_candidate(candidate)
+    assert candidate.closed
+
+
+def test_stop_winning_before_preset_refresh_preserves_exact_init_bytes(
+    tmp_path, monkeypatch
+):
+    agent, workdir = _mk_agent(tmp_path)
+    init_path = workdir / "init.json"
+    init_path.write_text(
+        '{\n  "manifest": {"preset": {"allowed": ["next"]}},\n'
+        '  "sentinel": "exact bytes"\n}\n'
+    )
+    before = init_path.read_bytes()
+    performed = []
+    monkeypatch.setattr(
+        agent,
+        "load_preset",
+        lambda name: {"manifest": {"llm": {}, "capabilities": {}}},
+    )
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: performed.append(True))
+
+    agent.stop()
+    result = agent._intrinsics["system"](
+        {"action": "refresh", "preset": "next"}
+    )
+
+    assert result["status"] == "error"
+    assert "stop is pending" in result["message"]
+    assert init_path.read_bytes() == before
+    assert performed == []
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
+@pytest.mark.parametrize("window", ["activation", "default_update"])
+def test_stop_during_preset_mutation_linearizes_after_complete_refresh(
+    tmp_path, monkeypatch, window
+):
+    agent, workdir = _mk_agent(tmp_path)
+    init_path = workdir / "init.json"
+    init_path.write_text(
+        json.dumps(
+            {"manifest": {"preset": {"allowed": ["next.json"]}}},
+            indent=2,
+        )
+    )
+    (workdir / "next.json").write_text(
+        json.dumps(
+            {
+                "name": "next",
+                "description": {"summary": "next"},
+                "manifest": {
+                    "llm": {"provider": "gemini", "model": "gemini-test"},
+                    "capabilities": {},
+                },
+            }
+        )
+    )
+    before = init_path.read_bytes()
+    monkeypatch.setattr(
+        agent,
+        "load_preset",
+        lambda name: {
+            "manifest": {
+                "llm": {"provider": "gemini", "model": "gemini-test"},
+                "capabilities": {},
+            }
+        },
+    )
+    performed = []
+    monkeypatch.setattr(agent, "_perform_refresh", lambda: performed.append(True))
+    stopping = None
+    stop_attempted = threading.Event()
+
+    def start_stop():
+        nonlocal stopping
+        def stop():
+            stop_attempted.set()
+            agent.stop()
+
+        stopping = threading.Thread(target=stop)
+        stopping.start()
+        assert stop_attempted.wait(timeout=1.0)
+
+    if window == "activation":
+        activate_preset = agent._activate_preset
+
+        def activate_while_stopping(name):
+            start_stop()
+            activate_preset(name)
+
+        monkeypatch.setattr(agent, "_activate_preset", activate_while_stopping)
+    else:
+        monkeypatch.setattr(agent, "_activate_preset", lambda name: None)
+        preset_module = importlib.import_module("lingtai.tools.system.preset")
+        update_default = preset_module._update_default_preset
+
+        def update_while_stopping(target_agent, name):
+            start_stop()
+            update_default(target_agent, name)
+
+        monkeypatch.setattr(
+            preset_module, "_update_default_preset", update_while_stopping
+        )
+
+    result = agent._intrinsics["system"](
+        {"action": "refresh", "preset": "next.json"}
+    )
+    assert stopping is not None
+    stopping.join(timeout=2.0)
+
+    assert not stopping.is_alive()
+    assert result["status"] == "ok", result
+    assert init_path.read_bytes() != before
+    assert performed == [True]
     assert agent._mcp_lifecycle_state == "stopping"
     assert agent._mcp_lifecycle_barrier.is_set()
 
@@ -1300,7 +1438,14 @@ def test_mcp_activation_publication_failure_exact_restores_initial_state(
 
 @pytest.mark.parametrize(
     "damage",
-    ["omitted", "extra", "duplicate", "handler_only", "owner_only"],
+    [
+        "omitted",
+        "extra",
+        "duplicate",
+        "handler_only",
+        "owner_only",
+        "name_set_only",
+    ],
 )
 def test_activation_outcome_requires_exact_complete_projection(tmp_path, damage):
     agent, _ = _mk_agent(tmp_path)
@@ -1322,6 +1467,8 @@ def test_activation_outcome_requires_exact_complete_projection(tmp_path, damage)
         agent._tool_handlers["handler_only"] = agent._make_mcp_handler(
             client, "handler_only"
         )
+    elif damage == "name_set_only":
+        agent._mcp_tool_names.add("name_set_only")
     else:
         agent._mcp_clients_by_tool["owner_only"] = client
         agent._mcp_tool_names.add("owner_only")
@@ -2233,6 +2380,7 @@ def test_mcp_runtime_owned_env_cannot_be_overridden(tmp_path, monkeypatch):
         "transport",
         "command",
         "args",
+        "source",
         "LINGTAI_AGENT_DIR",
         "PYTHONPATH",
         "DYLD_LIBRARY_PATH",
@@ -2267,6 +2415,8 @@ def test_reserved_provenance_retry_drift_never_starts_replacement(
         cfg["command"] = "/forged/python"
     elif damage == "args":
         cfg["args"] = ["-m", "forged.telegram"]
+    elif damage == "source":
+        agent._mcp_init_specs["telegram"]["source"] = "user"
     else:
         cfg["env"] = {damage: "forged"}
 
@@ -2387,7 +2537,7 @@ def test_legacy_connector_override_cannot_bypass_activation_outcome(
     assert "forged" not in agent._tool_handlers
 
 
-def test_stop_during_candidate_start_prevents_late_publication(tmp_path):
+def test_stop_during_candidate_start_retires_complete_publication(tmp_path):
     agent, _ = _mk_agent(tmp_path)
     started = threading.Event()
     release = threading.Event()
@@ -2416,16 +2566,13 @@ def test_stop_during_candidate_start_prevents_late_publication(tmp_path):
 
     stopping = threading.Thread(target=stop)
     stopping.start()
-    deadline = time.monotonic() + 1.0
-    while not agent._mcp_lifecycle_barrier.is_set() and time.monotonic() < deadline:
-        time.sleep(0.005)
     release.set()
     activation.join(timeout=2.0)
     stopping.join(timeout=2.0)
 
     assert not activation.is_alive()
     assert not stopping.is_alive()
-    assert activation_errors
+    assert activation_errors == []
     assert stop_errors == []
     assert "late" not in agent._tool_handlers
     assert candidate.closed

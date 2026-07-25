@@ -168,6 +168,7 @@ class Agent(BaseAgent):
         self._mcp_lifecycle_barrier = threading.Event()
         self._mcp_stop_requested = threading.Event()
         self._mcp_refresh_owner_thread: int | None = None
+        self._mcp_refresh_handoff_committed = False
         self._mcp_pending_retirements: dict[str, Any] = {}
         self._mcp_reserved_activation_tokens: set[object] = set()
         self._mcp_clients: list[Any] = []
@@ -868,13 +869,14 @@ class Agent(BaseAgent):
         if (
             self._mcp_stop_requested.is_set()
             or self._mcp_lifecycle_barrier.is_set()
-            or self._mcp_lifecycle_state == "stopping"
+            or self._mcp_lifecycle_state != "active"
         ):
             self._mcp_activation_lock.release()
             return False
         self._mcp_lifecycle_generation += 1
         self._mcp_lifecycle_state = "refreshing"
         self._mcp_refresh_owner_thread = threading.get_ident()
+        self._mcp_refresh_handoff_committed = False
         return True
 
     def _assert_mcp_refresh_ownership(self) -> None:
@@ -887,17 +889,25 @@ class Agent(BaseAgent):
         ):
             raise RuntimeError("refresh invalidated by pending stop")
 
+    def _commit_mcp_refresh_handoff(self) -> None:
+        """Make a successful relaunch handoff terminal in this process."""
+        self._assert_mcp_refresh_ownership()
+        self._mcp_refresh_handoff_committed = True
+        self._mcp_lifecycle_state = "relaunching"
+        self._mcp_lifecycle_barrier.set()
+
     def _end_mcp_refresh_ownership(self) -> None:
-        """Release refresh without ever clearing a stop-owned barrier."""
+        """Release an aborted refresh or preserve a committed handoff barrier."""
         try:
             if self._mcp_refresh_owner_thread != threading.get_ident():
                 raise RuntimeError("refresh ownership is not held by this thread")
             self._mcp_refresh_owner_thread = None
-            if self._mcp_stop_requested.is_set():
-                self._mcp_lifecycle_state = "stopping"
+            if self._mcp_refresh_handoff_committed:
+                self._mcp_lifecycle_state = "relaunching"
                 self._mcp_lifecycle_barrier.set()
             else:
                 self._mcp_lifecycle_state = "active"
+                self._mcp_lifecycle_barrier.clear()
         finally:
             self._mcp_activation_lock.release()
 
@@ -1196,6 +1206,8 @@ class Agent(BaseAgent):
             self._mcp_stop_requested = threading.Event()
         if not hasattr(self, "_mcp_refresh_owner_thread"):
             self._mcp_refresh_owner_thread = None
+        if not hasattr(self, "_mcp_refresh_handoff_committed"):
+            self._mcp_refresh_handoff_committed = False
         if not hasattr(self, "_mcp_pending_retirements"):
             self._mcp_pending_retirements = {}
         if not hasattr(self, "_mcp_reserved_activation_tokens"):
@@ -1486,6 +1498,10 @@ class Agent(BaseAgent):
         if len(outcome_names) != len(set(outcome_names)):
             raise RuntimeError("MCP activation outcome contains duplicate tool names")
         expected = set(outcome_names)
+        if set(self._mcp_clients_by_tool) != self._mcp_tool_names:
+            raise RuntimeError(
+                "MCP activation global owner/name-set projection mismatch"
+            )
         owner_names = {
             name
             for name, owner in self._mcp_clients_by_tool.items()
@@ -1883,11 +1899,11 @@ class Agent(BaseAgent):
 
     def stop(self, timeout: float = 5.0) -> None:
         self._ensure_mcp_activation_state()
-        # Signal before waiting on the lifecycle lock so an in-flight candidate
-        # cannot cross its publication boundary after stop was requested.
-        self._mcp_stop_requested.set()
-        self._mcp_lifecycle_barrier.set()
         with self._mcp_activation_lock:
+            # Stop and refresh linearize on this lock. A committed refresh may
+            # finish completely; a stop that owns the lock blocks all mutation.
+            self._mcp_stop_requested.set()
+            self._mcp_lifecycle_barrier.set()
             self._mcp_lifecycle_generation += 1
             self._mcp_lifecycle_state = "stopping"
         # Stop LICC poller before closing MCP clients so any in-flight events
@@ -2058,29 +2074,27 @@ class Agent(BaseAgent):
     def _setup_from_init(self) -> None:
         """Serialize the complete deep-refresh reconstruction lifecycle."""
         self._ensure_mcp_activation_state()
-        self._mcp_lifecycle_barrier.set()
         with self._mcp_activation_lock:
-            if self._mcp_stop_requested.is_set():
+            if (
+                self._mcp_stop_requested.is_set()
+                or self._mcp_lifecycle_barrier.is_set()
+                or self._mcp_lifecycle_state != "active"
+            ):
                 raise RuntimeError("deep refresh blocked by pending stop")
+            self._mcp_lifecycle_barrier.set()
             self._mcp_lifecycle_generation += 1
             self._mcp_lifecycle_state = "refreshing"
             self._mcp_refresh_owner_thread = threading.get_ident()
-            # The generation invalidates waiters. The owning refresh may now
+            self._mcp_refresh_handoff_committed = False
+            # The generation invalidates waiters. The owning refresh may
             # activate replacement clients while holding the same RLock.
-            if self._mcp_stop_requested.is_set():
-                self._mcp_lifecycle_state = "stopping"
-                raise RuntimeError("deep refresh invalidated by pending stop")
             self._mcp_lifecycle_barrier.clear()
             try:
                 self._setup_from_init_locked()
             finally:
                 self._mcp_refresh_owner_thread = None
-                if self._mcp_stop_requested.is_set():
-                    self._mcp_lifecycle_state = "stopping"
-                    self._mcp_lifecycle_barrier.set()
-                elif self._mcp_lifecycle_state != "stopping":
-                    self._mcp_lifecycle_state = "active"
-                    self._mcp_lifecycle_barrier.clear()
+                self._mcp_lifecycle_state = "active"
+                self._mcp_lifecycle_barrier.clear()
 
     def _setup_from_init_locked(self) -> None:
         """Full construct/reconstruct from init.json."""

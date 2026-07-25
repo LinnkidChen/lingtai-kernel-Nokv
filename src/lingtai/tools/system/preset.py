@@ -198,6 +198,13 @@ def _refresh(agent, args: dict) -> dict:
         if callable(end):
             end()
 
+    def _commit_refresh(owned: bool) -> None:
+        if not owned:
+            return
+        commit = getattr(agent, "_commit_mcp_refresh_handoff", None)
+        if callable(commit):
+            commit()
+
     if preset_name is not None:
         # Guard: refuse swap if the requested preset is not in the agent's
         # `allowed` list. Authorization is declared up front in init.json;
@@ -273,6 +280,7 @@ def _refresh(agent, args: dict) -> dict:
             _assert_refresh()
             agent._log("refresh_requested", reason=reason)
             agent._perform_refresh()
+            _commit_refresh(owned)
             return {
                 "status": "ok",
                 "message": t(agent._config.language, "system_tool.refresh_message"),
@@ -291,6 +299,7 @@ def _refresh(agent, args: dict) -> dict:
                 _assert_refresh()
                 agent._log("refresh_requested", reason=reason)
                 agent._perform_refresh()
+                _commit_refresh(owned)
             except RuntimeError as exc:
                 return {
                     "status": "error",

@@ -103,6 +103,13 @@ mistyped field, or unresolved entry fails closed with an actionable error:
 `init.json` is unchanged, `_perform_refresh()` is not called, and no relaunch
 signal is requested. Empty/no-spec and all-healthy reports preserve success.
 
+Stop and refresh are linearized by the agent's MCP lifecycle lock. If stop
+acquires ownership first, refresh fails before preset/default bytes change and
+before `_perform_refresh()`. If refresh owns the lock first, its preset
+mutation and relaunch handoff complete as one unit before stop proceeds. A
+successful handoff leaves the old process in terminal `relaunching` state with
+the lifecycle barrier set; it never reopens MCP activation as `active`.
+
 ## Cross-platform invariants
 
 - Address resolution uses `resolve_address` and all target file access is via
@@ -123,6 +130,7 @@ signal is requested. Empty/no-spec and all-healthy reports preserve success.
 | Unknown/legacy actions return the unknown-action error | `src/lingtai/tools/system/__init__.py:handle` | `tests/test_system.py::test_system_unknown_action`, `tests/test_system.py::test_system_show_action_rejected` |
 | `refresh` with an unauthorized preset is refused | `src/lingtai/tools/system/preset.py:_refresh` | `tests/test_system.py::test_refresh_with_unauthorized_preset_returns_error` |
 | Unresolved MCP retry/cleanup blocks deferred relaunch | `src/lingtai/tools/system/preset.py:_refresh` | `tests/test_system.py::test_refresh_mcp_retry_exception_blocks_perform_refresh`, `tests/test_system.py::test_refresh_mcp_unresolved_report_blocks_perform_refresh` |
+| Stop/preset refresh has a single lifecycle winner and successful handoff remains terminal | `src/lingtai/agent.py:_begin_mcp_refresh_ownership`, `src/lingtai/agent.py:_commit_mcp_refresh_handoff`, `src/lingtai/agent.py:stop` | `tests/test_mcp_capability.py::test_stop_winning_before_preset_refresh_preserves_exact_init_bytes`, `tests/test_mcp_capability.py::test_stop_during_preset_mutation_linearizes_after_complete_refresh`, `tests/test_mcp_capability.py::test_successful_refresh_handoff_remains_terminal_in_old_process` |
 | `refresh` cannot combine `preset` and `revert_preset` | `src/lingtai/tools/system/preset.py:_refresh` | `tests/test_system.py::test_refresh_revert_preset_with_preset_arg_errors` |
 | `presets` lists the allowed library and strips credentials | `src/lingtai/tools/system/preset.py:_presets` | `tests/test_system.py::test_presets_action_lists_full_library`, `tests/test_system.py::test_presets_action_strips_credentials` |
 | `cpr` propagates launch failure instead of reporting success | `src/lingtai/tools/system/karma.py:_cpr` | `tests/test_system.py::test_cpr_propagates_launch_failure_instead_of_resuscitated` |
