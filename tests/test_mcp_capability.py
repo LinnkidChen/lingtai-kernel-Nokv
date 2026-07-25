@@ -25,6 +25,7 @@ from lingtai.kernel.base_agent import (
     RefreshHandoffOutcome,
     RefreshHandoffStatus,
 )
+from lingtai.kernel.base_agent.worker_recovery import request_worker_hang_refresh
 from lingtai.kernel.llm import FunctionSchema
 from lingtai.services.mcp_registry import (
     REGISTRY_FILENAME,
@@ -1171,6 +1172,100 @@ def test_system_refresh_terminal_commit_failure_stays_terminal_and_not_respawned
     assert "terminal lifecycle transition is pending" in second["message"]
     assert len(agent._refresh_watcher.calls) == 1
     assert agent._mcp_refresh_handoff_committed is True
+    assert agent._mcp_lifecycle_state == "relaunching"
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
+def test_system_refresh_end_after_release_failure_stays_terminal_and_not_respawned(
+    tmp_path,
+):
+    agent, _ = _mk_agent(tmp_path)
+    agent._refresh_watcher = make_test_refresh_watcher()
+    real_end = agent._end_mcp_refresh_ownership
+
+    def finalize_then_fail(**kwargs):
+        real_end(**kwargs)
+        raise RuntimeError("simulated finalization return failure")
+
+    agent._end_mcp_refresh_ownership = finalize_then_fail
+
+    first = agent._intrinsics["system"]({"action": "refresh"})
+    second = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert first["status"] == "error"
+    assert "committed with degraded post-spawn completion" in first["message"]
+    assert "finalization failed after terminal handoff" in first["message"]
+    assert second["status"] == "error"
+    assert "terminal lifecycle transition is pending" in second["message"]
+    assert len(agent._refresh_watcher.calls) == 1
+    assert agent._mcp_refresh_handoff_committed is True
+    assert agent._mcp_lifecycle_state == "relaunching"
+    assert agent._mcp_lifecycle_barrier.is_set()
+
+
+def test_system_refresh_uncommitted_end_failure_returns_typed_error(
+    tmp_path, monkeypatch
+):
+    agent, _ = _mk_agent(tmp_path)
+    agent._refresh_watcher = make_test_refresh_watcher()
+    real_end = agent._end_mcp_refresh_ownership
+    monkeypatch.setattr(agent, "_build_launch_cmd", lambda: None)
+
+    def finalize_then_fail(**kwargs):
+        real_end(**kwargs)
+        raise RuntimeError("simulated uncommitted finalization failure")
+
+    agent._end_mcp_refresh_ownership = finalize_then_fail
+
+    result = agent._intrinsics["system"]({"action": "refresh"})
+
+    assert result["status"] == "error"
+    assert "refresh lifecycle finalization failed" in result["message"]
+    assert not agent._refresh_watcher.spawned
+    assert agent._mcp_refresh_handoff_committed is False
+    assert agent._mcp_lifecycle_state == "active"
+    assert not agent._mcp_lifecycle_barrier.is_set()
+
+
+@pytest.mark.parametrize("caller", ["heartbeat_direct", "worker_recovery"])
+def test_refresh_end_after_release_failure_is_typed_for_non_system_callers(
+    tmp_path, caller
+):
+    agent, _ = _mk_agent(tmp_path)
+    agent._refresh_watcher = make_test_refresh_watcher()
+    real_end = agent._end_mcp_refresh_ownership
+    logs = []
+    real_log = agent._log
+
+    def capture_log(event, **fields):
+        logs.append((event, fields))
+        return real_log(event, **fields)
+
+    def finalize_then_fail(**kwargs):
+        real_end(**kwargs)
+        raise RuntimeError("simulated caller finalization return failure")
+
+    agent._log = capture_log
+    agent._end_mcp_refresh_ownership = finalize_then_fail
+
+    if caller == "heartbeat_direct":
+        outcome = agent._perform_refresh()
+        assert outcome.status is RefreshHandoffStatus.COMMITTED_DEGRADED
+    else:
+        request_worker_hang_refresh(agent, source="test")
+        assert agent._llm_worker_refresh_requested is True
+        assert any(
+            event == "worker_hang_refresh_request_degraded"
+            for event, _ in logs
+        )
+        assert not any(
+            event == "worker_hang_refresh_request_failed"
+            for event, _ in logs
+        )
+
+    blocked = agent._perform_refresh()
+    assert blocked.status is RefreshHandoffStatus.LIFECYCLE_BLOCKED
+    assert len(agent._refresh_watcher.calls) == 1
     assert agent._mcp_lifecycle_state == "relaunching"
     assert agent._mcp_lifecycle_barrier.is_set()
 

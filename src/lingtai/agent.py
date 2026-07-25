@@ -890,24 +890,38 @@ class Agent(BaseAgent):
             raise RuntimeError("refresh invalidated by pending stop")
 
     def _commit_mcp_refresh_handoff(self) -> None:
-        """Make a successful relaunch handoff terminal in this process."""
+        """Validate ownership before Agent-owned terminal finalization."""
         self._assert_mcp_refresh_ownership()
-        self._mcp_refresh_handoff_committed = True
-        self._mcp_lifecycle_state = "relaunching"
-        self._mcp_lifecycle_barrier.set()
 
-    def _end_mcp_refresh_ownership(self) -> None:
-        """Release an aborted refresh or preserve a committed handoff barrier."""
+    def _end_mcp_refresh_ownership(
+        self,
+        *,
+        terminal_handoff: bool,
+        diagnostic: str | None = None,
+    ) -> None:
+        """Finalize refresh policy, then release ownership in all cases."""
         try:
-            if self._mcp_refresh_owner_thread != threading.get_ident():
-                raise RuntimeError("refresh ownership is not held by this thread")
+            ownership_matches = (
+                self._mcp_refresh_owner_thread == threading.get_ident()
+            )
             self._mcp_refresh_owner_thread = None
-            if self._mcp_refresh_handoff_committed:
+            self._mcp_refresh_handoff_committed = terminal_handoff
+            if terminal_handoff:
                 self._mcp_lifecycle_state = "relaunching"
                 self._mcp_lifecycle_barrier.set()
             else:
                 self._mcp_lifecycle_state = "active"
                 self._mcp_lifecycle_barrier.clear()
+            if diagnostic:
+                try:
+                    self._log(
+                        "refresh_handoff_finalized_degraded",
+                        diagnostic=diagnostic[:500],
+                    )
+                except Exception:
+                    pass
+            if not ownership_matches:
+                raise RuntimeError("refresh ownership is not held by this thread")
         finally:
             self._mcp_activation_lock.release()
 

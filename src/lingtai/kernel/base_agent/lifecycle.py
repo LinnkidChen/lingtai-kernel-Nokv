@@ -718,7 +718,6 @@ def _coordinate_refresh_handoff(
     end = getattr(agent, "_end_mcp_refresh_ownership", None)
     commit = getattr(agent, "_commit_mcp_refresh_handoff", None)
     owned = False
-    terminal_handoff = False
     if callable(begin):
         if not begin():
             return RefreshHandoffOutcome(
@@ -726,33 +725,36 @@ def _coordinate_refresh_handoff(
                 "agent stop or another terminal lifecycle transition is pending",
             )
         owned = True
+    terminal_diagnostic: str | None = None
     try:
-        try:
-            outcome = operation()
-        except Exception as exc:
-            return RefreshHandoffOutcome(
-                RefreshHandoffStatus.OPERATION_FAILED,
-                f"refresh operation failed: {exc}",
+        outcome = operation()
+    except Exception as exc:
+        outcome = RefreshHandoffOutcome(
+            RefreshHandoffStatus.OPERATION_FAILED,
+            f"refresh operation failed: {exc}",
+        )
+    if not isinstance(outcome, RefreshHandoffOutcome):
+        outcome = RefreshHandoffOutcome(
+            RefreshHandoffStatus.INVALID_OUTCOME,
+            "refresh operation returned no typed handoff outcome",
+        )
+    if outcome.committed and owned:
+        if not callable(commit):
+            terminal_diagnostic = (
+                "watcher started, but lifecycle has no terminal commit hook"
             )
-        if not isinstance(outcome, RefreshHandoffOutcome):
-            return RefreshHandoffOutcome(
-                RefreshHandoffStatus.INVALID_OUTCOME,
-                "refresh operation returned no typed handoff outcome",
+            outcome = RefreshHandoffOutcome(
+                RefreshHandoffStatus.COMMITTED_DEGRADED,
+                terminal_diagnostic,
             )
-        if outcome.committed and owned:
-            # The raw outcome is authoritative: watcher spawn has already
-            # crossed the irreversible boundary. Carry that fact into
-            # finalization even when the optional terminal commit hook fails
-            # before setting its own marker.
-            terminal_handoff = True
-            if not callable(commit):
-                return RefreshHandoffOutcome(
-                    RefreshHandoffStatus.COMMITTED_DEGRADED,
-                    "watcher started, but lifecycle has no terminal commit hook",
-                )
+        else:
             try:
                 commit()
             except Exception as exc:
+                terminal_diagnostic = (
+                    "watcher started, but lifecycle terminal commit "
+                    f"failed: {exc}"
+                )
                 try:
                     agent._log(
                         "refresh_terminal_commit_failed",
@@ -760,30 +762,36 @@ def _coordinate_refresh_handoff(
                     )
                 except Exception:
                     pass
-                return RefreshHandoffOutcome(
+                outcome = RefreshHandoffOutcome(
+                    RefreshHandoffStatus.COMMITTED_DEGRADED,
+                    terminal_diagnostic,
+                )
+    if outcome.degraded and terminal_diagnostic is None:
+        terminal_diagnostic = outcome.message
+    if owned:
+        terminal_handoff = outcome.committed
+        try:
+            if not callable(end):
+                raise RuntimeError("lifecycle has no refresh finalization hook")
+            end(
+                terminal_handoff=terminal_handoff,
+                diagnostic=terminal_diagnostic,
+            )
+        except Exception as exc:
+            if terminal_handoff:
+                outcome = RefreshHandoffOutcome(
                     RefreshHandoffStatus.COMMITTED_DEGRADED,
                     (
-                        "watcher started, but lifecycle terminal commit "
-                        f"failed: {exc}"
+                        f"{outcome.message}; lifecycle finalization failed "
+                        f"after terminal handoff: {exc}"
                     ),
                 )
-        return outcome
-    finally:
-        if owned:
-            try:
-                if terminal_handoff:
-                    # Finalization is independent of the hook's success. Set
-                    # the marker/state/barrier before `_end_*` releases the
-                    # lifecycle lock so it can only preserve the terminal
-                    # disposition, never reopen `active`.
-                    agent._mcp_refresh_handoff_committed = True
-                    agent._mcp_lifecycle_state = "relaunching"
-                    barrier = getattr(agent, "_mcp_lifecycle_barrier", None)
-                    if barrier is not None:
-                        barrier.set()
-            finally:
-                if callable(end):
-                    end()
+            else:
+                outcome = RefreshHandoffOutcome(
+                    RefreshHandoffStatus.OPERATION_FAILED,
+                    f"refresh lifecycle finalization failed: {exc}",
+                )
+    return outcome
 
 
 def _perform_refresh(
