@@ -1,6 +1,10 @@
 """Preset management — refresh, swap, list presets."""
 from __future__ import annotations
 
+from typing import Callable
+
+from lingtai.kernel.base_agent import RefreshHandoffOutcome
+
 # Compatibility re-export — callers/tests import `_preset_ref_in` from here.
 # The implementation lives in the kernel so system and daemon share one
 # normalization primitive; see `lingtai.kernel.presets._preset_ref_in`.
@@ -74,6 +78,64 @@ def _check_context_fits(agent, preset_name: str) -> tuple:
     return True, None, None
 
 
+def _mcp_refresh_precondition(agent) -> dict | None:
+    """Return an error response unless the complete retry report is valid."""
+    retry = getattr(agent, "_retry_failed_mcps", None)
+    if not callable(retry):
+        return None
+    required = {"retried", "recovered", "still_failed", "healthy"}
+    try:
+        report = retry()
+        if not isinstance(report, dict):
+            raise RuntimeError("MCP retry report must be an object")
+        missing = sorted(required - set(report))
+        if missing:
+            raise RuntimeError(
+                "MCP retry report missing fields: " + ", ".join(missing)
+            )
+        unexpected = sorted(set(report) - required)
+        if unexpected:
+            raise RuntimeError(
+                "MCP retry report has unexpected fields: "
+                + ", ".join(unexpected)
+            )
+        for field in sorted(required):
+            value = report[field]
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise RuntimeError(
+                    f"MCP retry report field {field!r} must be a list of strings"
+                )
+        if report["retried"]:
+            agent._log("mcp_retry_summary", **report)
+        if report["still_failed"]:
+            unresolved = report["still_failed"]
+            agent._log(
+                "mcp_retry_error",
+                error="unresolved MCP cleanup or activation",
+                still_failed=unresolved,
+            )
+            return {
+                "status": "error",
+                "message": (
+                    "refresh blocked: MCP cleanup or activation remains "
+                    f"unresolved for {', '.join(unresolved)}; "
+                    "fix the MCP and retry refresh"
+                ),
+            }
+    except Exception as exc:
+        agent._log("mcp_retry_error", error=str(exc))
+        return {
+            "status": "error",
+            "message": (
+                "refresh blocked: MCP cleanup or activation could not be "
+                f"verified: {exc}"
+            ),
+        }
+    return None
+
+
 def _refresh(agent, args: dict) -> dict:
     from lingtai.kernel.i18n import t
     reason = args.get("reason", "")
@@ -117,6 +179,40 @@ def _refresh(agent, args: dict) -> dict:
                     "message": "no default preset configured — manifest.preset.default is missing"}
         preset_name = default_name
 
+    def _perform_refresh_handoff(
+        prepare: Callable[[], str | None],
+    ) -> dict | None:
+        try:
+            outcome = agent._perform_refresh(prepare=prepare)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": f"refresh handoff failed: {exc}",
+            }
+        if not isinstance(outcome, RefreshHandoffOutcome):
+            return {
+                "status": "error",
+                "message": (
+                    "refresh handoff returned no typed outcome; "
+                    "the running agent remains active"
+                ),
+            }
+        if outcome.degraded:
+            return {
+                "status": "error",
+                "message": (
+                    "refresh handoff committed with degraded post-spawn "
+                    "completion: "
+                    f"{outcome.message}"
+                ),
+            }
+        if not outcome.committed:
+            return {
+                "status": "error",
+                "message": f"refresh handoff failed: {outcome.message}",
+            }
+        return None
+
     if preset_name is not None:
         # Guard: refuse swap if the requested preset is not in the agent's
         # `allowed` list. Authorization is declared up front in init.json;
@@ -157,50 +253,59 @@ def _refresh(agent, args: dict) -> dict:
             agent._log("preset_swap_refused_oversize", **log_extra)
             return {"status": "error", "message": refuse_msg}
 
-        try:
-            if revert_preset:
-                agent._activate_default_preset()
-            else:
-                agent._activate_preset(preset_name)
-                # Persist the choice as default so future refreshes/molts
-                # don't silently revert to the previous default preset.
-                _update_default_preset(agent, preset_name)
-        except KeyError:
-            agent._log("preset_swap_failed",
-                       requested=preset_name,
-                       reason="not_found")
-            return {"status": "error",
-                    "message": f"preset {preset_name!r} not found — call system(action='presets') to see available presets"}
-        except (ValueError, OSError, NotImplementedError, RuntimeError) as e:
-            agent._log("preset_swap_failed",
-                       requested=preset_name,
-                       reason=str(e))
-            return {"status": "error",
-                    "message": f"failed to activate preset {preset_name!r}: {e}"}
-        agent._log("preset_swap_started",
-                   preset=preset_name, reason=reason, revert=revert_preset)
+        def _prepare_preset_refresh() -> str | None:
+            try:
+                if revert_preset:
+                    activate = agent._activate_default_preset
+                else:
+                    activate = lambda: agent._activate_preset(preset_name)
+                precondition_error = _mcp_refresh_precondition(agent)
+                if precondition_error is not None:
+                    return precondition_error["message"]
+                activate()
+                if not revert_preset:
+                    # Persist only after the MCP precondition and runtime swap.
+                    _update_default_preset(agent, preset_name)
+            except KeyError:
+                agent._log("preset_swap_failed",
+                           requested=preset_name,
+                           reason="not_found")
+                return (
+                    f"preset {preset_name!r} not found — call "
+                    "system(action='presets') to see what's available"
+                )
+            except (ValueError, OSError, NotImplementedError, RuntimeError) as e:
+                agent._log("preset_swap_failed",
+                           requested=preset_name,
+                           reason=str(e))
+                return f"failed to activate preset {preset_name!r}: {e}"
+            agent._log("preset_swap_started",
+                       preset=preset_name, reason=reason, revert=revert_preset)
+            agent._log("refresh_requested", reason=reason)
+            return None
 
-    agent._log("refresh_requested", reason=reason)
+        handoff_error = _perform_refresh_handoff(_prepare_preset_refresh)
+        if handoff_error is not None:
+            return handoff_error
+        return {
+            "status": "ok",
+            "message": t(agent._config.language, "system_tool.refresh_message"),
+        }
+    else:
+        def _prepare_plain_refresh() -> str | None:
+            precondition_error = _mcp_refresh_precondition(agent)
+            if precondition_error is not None:
+                return precondition_error["message"]
+            agent._log("refresh_requested", reason=reason)
+            return None
 
-    # Re-spawn any init.json MCPs whose subprocess exited at boot (or has
-    # since died). The Agent subclass owns the retry — BaseAgent has no
-    # MCP machinery — so the call is gated on hasattr(). Failures are
-    # logged and swallowed so a flaky MCP cannot block refresh itself.
-    # Closes Lingtai-AI/lingtai#34.
-    retry = getattr(agent, "_retry_failed_mcps", None)
-    if callable(retry):
-        try:
-            report = retry()
-            if report.get("retried"):
-                agent._log("mcp_retry_summary", **report)
-        except Exception as e:
-            agent._log("mcp_retry_error", error=str(e))
-
-    agent._perform_refresh()
-    return {
-        "status": "ok",
-        "message": t(agent._config.language, "system_tool.refresh_message"),
-    }
+        handoff_error = _perform_refresh_handoff(_prepare_plain_refresh)
+        if handoff_error is not None:
+            return handoff_error
+        return {
+            "status": "ok",
+            "message": t(agent._config.language, "system_tool.refresh_message"),
+        }
 
 
 def _presets(agent, args: dict) -> dict:

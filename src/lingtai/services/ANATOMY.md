@@ -18,6 +18,7 @@ related_files:
   - src/lingtai/kernel/mail_transport/ANATOMY.md
   - src/lingtai/kernel/services/ANATOMY.md
   - tests/test_mcp_closed_resource_restart.py
+  - tests/test_mcp_client_lifecycle.py
   - ENVIRONMENT_VARIABLES.md
   - tests/test_mcp_structured_result.py
 maintenance: |
@@ -42,7 +43,7 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 | `file_io_sidecar.py` | 698 | Rust-backed grep/glob: `RustFileIOBackend`, `SidecarAdapter`, `SidecarError`, plus the `resolve_sidecar_binary` resolver and the `default_file_io_service` factory used by `Agent.__init__`. `grep`'s `glob_filter` is applied as a Python-side basename post-filter (the sidecar wire protocol carries no glob field yet) |
 | `mail.py` | 19 | High-level compatibility surface: re-exports the Core `MailTransportPort` as `MailService` and the POSIX adapter as both `PosixFilesystemMailAdapter` and the legacy public name `FilesystemMailService` |
 | `mcp.py` | 565 | `MCPClient` (stdio) + `HTTPMCPClient` (streamable HTTP) — async-to-sync MCP bridges with shared structured-result decoding |
-| `mcp_registry.py` | — | MCP registry infrastructure (the non-tool half of the `lingtai/tools/mcp` capability): record schema (`validate_record`), JSONL registry I/O (`read_registry`, `_append_record`), catalog loader (`_load_catalog`, path constant recomputed for this location), secret-safe identity projection (`read_identities`, `IDENTITY_SAFE_ACCOUNT_KEYS`), boot-time addon decompression (`decompress_addons`), and the system-prompt XML renderer (`_build_registry_xml`). Consumed by the `lingtai/tools/mcp` tool slice (lazy import) and `agent.py` |
+| `mcp_registry.py` | — | MCP registry infrastructure (the non-tool half of the `lingtai/tools/mcp` capability): record schema (`validate_record`), JSONL registry I/O (`read_registry`, `_append_record`), canonical recursive catalog materialization and immutable reserved-authority classification (`materialize_curated_provenance`, `CuratedMCPProvenance`), secret-safe identity projection (`read_identities`, `IDENTITY_SAFE_ACCOUNT_KEYS`), boot-time addon decompression (`decompress_addons`), and the system-prompt XML renderer (`_build_registry_xml`). Consumed by the `lingtai/tools/mcp` tool slice (lazy import) and `agent.py` |
 | `mcp_inbox.py` | — | LICC v1 filesystem inbox poller plus Core projection; in-process publication receives the agent and uses its injected Notification Store while the external inbox path/envelope stays unchanged (`src/lingtai/services/mcp_inbox.py:373-395`). |
 | `mcp_licc.py` | — | LICC v1 client producer (`push_inbox_event`); imports contract constants from `mcp_inbox.py` |
 | `LICC_NOTIFICATION_CONTRACT.md` | — | The LICC notification two-lane projection contract governing curated IM producers; live diagnosis and recovery are documented in `docs/references/licc-notification-wake-runbook.md` |
@@ -66,7 +67,7 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 
 ## State
 
-- **`MCPClient` / `HTTPMCPClient`**: each instance manages a background daemon thread, an asyncio event loop (`_loop`), a `ClientSession` (`_session`), and a 50-entry activity log (`mcp.py:103-118,420-431`). Thread-safe via `threading.Lock` and `threading.Event`.
+- **`MCPClient` / `HTTPMCPClient`**: each instance manages a background daemon thread, an asyncio event loop (`_loop`), a `ClientSession` (`_session`), and a 50-entry activity log (`mcp.py:103-118,420-431`). Thread-safe via `threading.RLock` and `threading.Event`.
 - **`LocalFileIOService`**: facade over a `_backend`; exposes `last_traversal` from the backend for tool metadata.
 - **`LocalFileIOBackend`**: default Python local filesystem backend; state is optional `_root` plus `last_traversal`.
 - **`RustFileIOBackend`**: holds an embedded `LocalFileIOBackend` (for read/write/edit), a `SidecarAdapter` (subprocess client), and a `last_traversal` rebuilt from each sidecar envelope.
@@ -76,8 +77,25 @@ Root services package — pluggable backends for intrinsic tools and MCP clients
 ## Notes
 
 - `MCPClient` uses `stdio_client` transport (subprocess); `HTTPMCPClient` uses `streamablehttp_client` (remote HTTP/SSE). Both expose identical `call_tool()` / `list_tools()` / `close()` API.
+- `materialize_curated_provenance` is the sole owner of catalog substitution and reserved launch identity. Initial activation validates the real registry record; retry re-materializes current config against the frozen initial proof. Telegram's reserved identity requires exact stdio source/command/args plus an env containing only `LINGTAI_TELEGRAM_CONFIG`; runtime routing and Python/dynamic-loader override keys fail closed.
+- **Bounded startup/retirement:** both clients accept configurable
+  `startup_timeout` and `close_timeout`. A false `_ready.wait(...)` result is a
+  startup failure, requests transport shutdown, and raises; startup exceptions
+  also perform bounded cleanup. `close()` always rechecks and joins an existing
+  thread even when `_closed` was already set, and raises while the thread
+  remains alive so the Agent can retain keyed pending retirement state instead
+  of declaring cleanup complete. Hermetic tests cover a real stalled stdio
+  subprocess and local streamable-HTTP startup/list/close paths.
 - Lazy start: both clients auto-connect on first `call_tool()`.
 - **Structured MCP results:** `_decode_tool_result` (`mcp.py:44-80`) is shared by stdio and HTTP. It prefers dictionary `structuredContent`, then JSON-object text, and preserves structured error fields at top level while forcing protocol-authoritative `status="error"`; plain-text errors retain the legacy `status`/`message` envelope. Tests: `tests/test_mcp_structured_result.py`.
+- **Structured-result policy:** `isError=false` (or an absent transport bit)
+  does not add a success status or rewrite an explicit object-level status.
+  For `isError=true`, a missing, empty, or non-string object `message` uses
+  the first text block and then `Unknown MCP error`; a non-empty string,
+  including whitespace-only text, is preserved literally. The same matrix is
+  locked for structured and JSON-object sources on both clients, and a
+  hermetic real-stdio round trip verifies the public five-field typed-error
+  result plus child/thread retirement.
 - **Stale-resource recovery (issue #104):** `MCPClient` detects a dead stdio transport in `call_tool` and recovers. `_format_exception` renders `ClassName: message` (class-only when `str(e)` is empty) so an empty `ClosedResourceError` never surfaces as a blank `{"status":"error","message":""}`. `_is_stale_resource_error` flags closed/broken transports by class name + message substrings. On a stale error `call_tool` calls `restart()` (which `close()`s, clears `_ready`/`_error`, resets `_closed`/`_session`/`_loop`/`_thread`/`*_cm` so `start()` cannot lie) and retries **once**; a failed retry returns a helpful error naming the class and the retry failure. Non-stale errors surface the class name without churning the subprocess. `HTTPMCPClient` reuses `MCPClient._format_exception` for its connect error only — it has no stale-resource restart (stdio is the reported transport). Tests: `tests/test_mcp_closed_resource_restart.py`.
 - The transport lifecycle, `list_tools()`, `_run_loop()`, and `_async_cleanup()` patterns remain duplicated between the two clients; result normalization is deliberately shared.
 - `mail.py` is a compatibility-only alias surface. The normative boundary is `lingtai.kernel.mail_transport.MailTransportPort`; the production implementation is `lingtai.adapters.posix.mail.PosixFilesystemMailAdapter`. The legacy public names remain aliases, not a second implementation or a Core shim.

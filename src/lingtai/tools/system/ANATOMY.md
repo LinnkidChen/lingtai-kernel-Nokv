@@ -9,6 +9,8 @@ related_files:
   - src/lingtai/tools/system/glossary-en.md
   - src/lingtai/tools/system/glossary-zh.md
   - src/lingtai/tools/system/glossary-wen.md
+  - src/lingtai/intrinsic_skills/system-manual/SKILL.md
+  - tests/test_system.py
 maintenance: |
   Keep related_files as repo-relative paths to real files. Include neighboring
   ANATOMY.md files so the anatomy graph stays connected rather than isolated;
@@ -34,7 +36,15 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 - `preset.py` — Preset management and refresh.
   - `_preset_ref_in()` (`preset.py:9-36`) — normalized membership test for preset path strings (~/foo vs absolute).
   - `_check_context_fits()` (`preset.py:39-76`) — verify agent's current context fits within target preset's context_limit.
-  - `_refresh()` (`preset.py:79-199`) — stop, reload config + MCP servers, restart. Handles preset swap (named or revert) with authorization gate and context-limit guard. **Empty-string normalization:** `args.get('preset')` returning `''` or whitespace-only is treated as absent (`preset_name = None`) before any conflict/swap logic; this protects against tool-call providers that serialize optional string fields as `""` instead of omitting them — without normalization, an empty string would fall into the allowed-list gate and surface as `"preset '' is not in this agent's allowed list"`. The `preset='' + revert_preset=True` combination is consequently treated as a plain revert (no conflict). **MCP retry hook (issue #34):** before calling `agent._perform_refresh()`, invokes `agent._retry_failed_mcps()` if the Agent subclass defines it. Failures are logged and swallowed so a flaky MCP cannot block refresh itself. Lets the documented "fix config → refresh" recovery path work in-process.
+  - `_refresh()` (`preset.py`) — handles named/revert preset swaps with authorization, context-limit, and exact four-list MCP retry gates. Empty/whitespace preset names are absent. Missing/malformed retry evidence and pre-spawn handoff failures fail closed without mutation or relaunch.
+  - **Current refresh handoff boundary:** the single BaseAgent lifecycle
+    coordinator owns begin, the System preparation callback, raw handoff,
+    terminal commit, and end for System, heartbeat, and worker recovery.
+    Pre-spawn typed failures restore `active`; watcher spawn followed by failed
+    telemetry, shutdown signaling, or any later step is `committed-degraded`
+    and remains terminal
+    `relaunching` with the barrier set, and returns an actionable System error
+    without permitting a second watcher/activation.
   - `_presets()` (`preset.py:202-282`) — list available presets with LLM connectivity probing.
 
 - `karma.py` — Karma-gated lifecycle actions.
@@ -77,6 +87,10 @@ System intrinsic — runtime, lifecycle, and synchronization. Provides the agent
 - Karma gate checks resolve addresses through `_check_karma_gate()` which validates admin flags before any filesystem mutation.
 - Generic notification dismiss is **not** a `system` verb — it lives on the standalone `notification` tool (delegating to kernel-root `notifications.dismiss_channel`). Its dismissal-taxonomy invariants (guarded producer channels refusing without `force`, protected source-of-truth channels refusing even with `force`, `post-molt` requiring a non-empty `reason`, `large_tool_result` acknowledge/remove handling) are documented at root `ANATOMY.md` "Notifications" and in `tools/notification/ANATOMY.md`.
 - Preset swap has two guards: authorization (allowed list) and context-fit (current tokens ≤ target context_limit).
+- Stop and refresh have one lock-linearized winner. Stop-first preserves the exact
+  `init.json` bytes and never requests relaunch; refresh-first completes the
+  preset/default write and handoff before stop proceeds. A committed handoff
+  never clears the lifecycle barrier or returns the old process to `active`.
 - Producer notification writes (`publish_notification`) are atomic (`tmp + rename` inside `notifications.publish`) — readers never see a half-written file.
 - `summarize` mutates only `ToolResultBlock.content` in the live `ChatInterface._entries` — entry order, role, id, name, synthesized flag, and `tool_call`/`tool_result` pairing are untouched. The durable `logs/events.jsonl` is never modified by `summarize`; the full original remains retrievable by `tool_call_id`.
 - `_is_already_summarized()` detects the `SUMMARIZE_MARKER` sentinel to make re-summarization a per-item error rather than silently overwriting a prior summary.

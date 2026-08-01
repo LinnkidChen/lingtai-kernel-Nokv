@@ -6,8 +6,34 @@ import ast
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+def _stage_curated_telegram(workdir: Path) -> Path:
+    init = _make_init()
+    init["mcp"] = {
+        "telegram": {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": ["-m", "lingtai.mcp_servers.telegram"],
+        }
+    }
+    (workdir / "init.json").write_text(json.dumps(init))
+    registry = {
+        "name": "telegram",
+        "summary": "Telegram bot client",
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": ["-m", "lingtai.mcp_servers.telegram"],
+        "source": "lingtai-curated",
+    }
+    registry_path = workdir / "mcp_registry.jsonl"
+    registry_path.write_text(json.dumps(registry) + "\n")
+    return registry_path
 
 
 def test_resolve_env_fields_resolves_env_var(monkeypatch):
@@ -951,12 +977,7 @@ def test_deep_refresh_re_registers_telegram_task_card_without_leaking_watcher(
             return {"status": "ok", "message_id": "acct:42:100"}
 
     monkeypatch.setattr(mcp_module, "MCPClient", _FakeTelegramMCPClient)
-    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
-    mcp_dir = tmp_path / "mcp"
-    mcp_dir.mkdir()
-    (mcp_dir / "servers.json").write_text(json.dumps({
-        "telegram": {"command": "fake-telegram"},
-    }))
+    _stage_curated_telegram(tmp_path)
 
     service = MagicMock()
     service.provider = "openai"
@@ -1049,7 +1070,7 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
             self.closed = True
 
         def list_tools(self):
-            if self.command == "fake-telegram":
+            if self.command == sys.executable:
                 return [{
                     "name": "telegram",
                     "schema": {
@@ -1072,16 +1093,16 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
 
         def call_tool(self, name, args, timeout=None):
             self.calls.append((name, dict(args)))
-            assert self.command == "fake-telegram"
+            assert self.command == sys.executable
             assert name == "_lingtai_telegram_task_card"
             return {"status": "ok", "message_id": "acct:42:100"}
 
     monkeypatch.setattr(mcp_module, "MCPClient", _FakeMCPClient)
-    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
+    _stage_curated_telegram(tmp_path)
     mcp_dir = tmp_path / "mcp"
     mcp_dir.mkdir()
     servers_path = mcp_dir / "servers.json"
-    servers_path.write_text(json.dumps({"telegram": {"command": "fake-telegram"}}))
+    servers_path.write_text("{}")
 
     service = MagicMock()
     service.provider = "openai"
@@ -1114,6 +1135,7 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
         servers_path.write_text(
             json.dumps({"unrelated": {"command": "fake-unrelated"}})
         )
+        (tmp_path / "init.json").write_text(json.dumps(_make_init()))
         agent._setup_from_init()
 
         assert old_telegram.closed is True
@@ -1140,10 +1162,10 @@ def test_deep_refresh_drops_removed_telegram_route_before_unrelated_mcp_load(
         agent._workdir_lease.release()
 
 
-def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_reconnect(
+def test_telegram_registration_requires_explicit_identity_and_rejects_foreign_task_card(
     tmp_path, monkeypatch
 ):
-    """Telegram-owned registration wins over a colliding MCP tool in either order."""
+    """Reserved names require the explicit Telegram composition identity."""
     from lingtai.agent import Agent
     from lingtai.kernel.config import AgentConfig
     from lingtai.mcp_servers.telegram.task_card import get_description, get_schema
@@ -1175,7 +1197,7 @@ def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_recon
                     },
                     "description": "foreign task card",
                 }]
-            assert self.command == "fake-telegram"
+            assert self.command == sys.executable
             return [{
                 "name": "telegram",
                 "schema": {
@@ -1190,7 +1212,7 @@ def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_recon
             raise AssertionError("registration test must not dispatch an MCP tool")
 
     monkeypatch.setattr(mcp_module, "MCPClient", _FakeMCPClient)
-    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
+    _stage_curated_telegram(tmp_path)
     service = MagicMock()
     service.provider = "openai"
     service.model = "gpt-4o"
@@ -1202,30 +1224,95 @@ def test_telegram_registration_reclaims_foreign_task_card_on_collision_and_recon
         config=AgentConfig(),
     )
     try:
-        # A foreign MCP may claim the public name before Telegram connects.
-        agent.connect_mcp(command="fake-foreign")
-        foreign_handler = agent._tool_handlers["task_card"]
-        assert not hasattr(agent, "_task_card_controller")
-
-        agent.connect_mcp(command="fake-telegram")
         controller = agent._task_card_controller
         schema = [s for s in agent._tool_schemas if s.name == "task_card"]
         assert getattr(agent._tool_handlers["task_card"], "__self__", None) is controller
-        assert agent._tool_handlers["task_card"] is not foreign_handler
         assert len(schema) == 1
         assert schema[0].parameters == get_schema()
         assert schema[0].description == get_description()
 
-        # A later foreign collision must be reclaimed immediately; a Telegram
-        # reconnect must preserve the same controller and exact public surface.
-        agent.connect_mcp(command="fake-foreign")
-        agent.connect_mcp(command="fake-telegram")
+        with pytest.raises(RuntimeError, match="built-in/reserved"):
+            agent.connect_mcp(command="fake-foreign")
+        assert getattr(agent._tool_handlers["task_card"], "__self__", None) is controller
         schema = [s for s in agent._tool_schemas if s.name == "task_card"]
         assert agent._task_card_controller is controller
         assert getattr(agent._tool_handlers["task_card"], "__self__", None) is controller
         assert len(schema) == 1
         assert schema[0].parameters == get_schema()
         assert schema[0].description == get_description()
-        assert agent._mcp_clients_by_tool["telegram"] is _FakeMCPClient.instances[-1]
+        assert agent._mcp_clients_by_tool["telegram"] is _FakeMCPClient.instances[-2]
+    finally:
+        agent._workdir_lease.release()
+
+
+def test_deep_refresh_partial_close_blocks_reconstruction_then_converges(
+    tmp_path, monkeypatch
+):
+    from lingtai.agent import Agent
+    from lingtai.kernel.config import AgentConfig
+    from lingtai.kernel.llm import FunctionSchema
+
+    (tmp_path / "init.json").write_text(json.dumps(_make_init()))
+    service = MagicMock()
+    service.provider = "openai"
+    service.model = "gpt-4o"
+    service._base_url = None
+    agent = Agent(
+        service,
+        agent_name="test-agent",
+        working_dir=tmp_path,
+        config=AgentConfig(),
+    )
+
+    class _Flaky:
+        def __init__(self):
+            self.close_calls = 0
+
+        def is_connected(self):
+            return False
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("deep close blocked")
+
+    client = _Flaky()
+    agent._mcp_clients.append(client)
+    agent._mcp_clients_by_tool["old"] = client
+    agent._mcp_tool_names.add("old")
+    agent._tool_handlers["old"] = agent._make_mcp_handler(client, "old")
+    agent._tool_schemas.append(
+        FunctionSchema(
+            name="old",
+            description="old",
+            parameters={"type": "object", "properties": {}},
+        )
+    )
+    agent._mcp_init_specs = {
+        "old-server": {
+            "cfg": {"type": "stdio", "command": "/bin/false"},
+            "source": "init.json:mcp",
+            "client": client,
+        }
+    }
+    wire_calls = []
+    real_wire = agent._wire_intrinsics
+    monkeypatch.setattr(
+        agent,
+        "_wire_intrinsics",
+        lambda: (wire_calls.append(True), real_wire())[1],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="deep refresh blocked"):
+            agent._setup_from_init()
+        assert wire_calls == []
+        assert "old" not in agent._tool_handlers
+        assert agent._mcp_pending_retirements["old-server"] is client
+
+        agent._setup_from_init()
+        assert client.close_calls == 2
+        assert agent._mcp_pending_retirements == {}
+        assert wire_calls == [True]
+        assert "old" not in agent._tool_handlers
     finally:
         agent._workdir_lease.release()

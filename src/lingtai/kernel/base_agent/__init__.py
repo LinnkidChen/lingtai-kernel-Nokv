@@ -65,6 +65,7 @@ from ..token_ledger import append_token_entry
 from .._fsutil import atomic_write_json, atomic_write_text, read_json
 from ..trace_redaction import redact_for_trajectory
 from ..runtime_identity import runtime_identity_event_fields
+from .refresh_handoff import RefreshHandoffOutcome, RefreshHandoffStatus
 
 logger = get_logger()
 
@@ -1999,12 +2000,14 @@ class BaseAgent:
         *,
         skip_chat_history_save: bool = False,
         skip_save_reason: str | None = None,
-    ) -> None:
+        prepare: Callable[[], str | None] | None = None,
+    ) -> RefreshHandoffOutcome:
         from .lifecycle import _perform_refresh
-        _perform_refresh(
+        return _perform_refresh(
             self,
             skip_chat_history_save=skip_chat_history_save,
             skip_save_reason=skip_save_reason,
+            prepare=prepare,
         )
 
     def load_preset(self, name: str, working_dir: "str | Path | None" = None) -> dict:

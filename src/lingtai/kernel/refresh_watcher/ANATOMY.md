@@ -60,6 +60,10 @@ walkthrough.
 - `BaseAgent._perform_refresh` builds a `RefreshWatcherRequest` and calls the
   outer Port once after handshake ACK, before shutdown signaling
   (`src/lingtai/kernel/base_agent/lifecycle.py:724-829`).
+  That outer spawn is the irreversible point: any later telemetry,
+  shutdown-signal, or future-step exception is committed-degraded and the
+  shared lifecycle coordinator keeps
+  `relaunching` plus its barrier, preventing a duplicate watcher.
 - `lingtai.Agent` and `lingtai.cli.build_agent` obtain the outer Port through
   `select_refresh_watcher` (`src/lingtai/agent.py:194-204` and
   `src/lingtai/cli.py:15-152`).

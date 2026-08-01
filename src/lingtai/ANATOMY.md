@@ -74,7 +74,7 @@ PyPI wrapper package — `Agent(BaseAgent)` with composable capabilities, preset
 
 ### Key functions / classes
 
-**`agent.py`** — `Agent(BaseAgent)`: `__init__` :38 (accept `capabilities=` + `disable=`, expand groups, `apply_core_defaults`, decompress addons, setup caps, install manuals, load MCP) · `_setup_capability` :161 · `_persist_llm_config` :136 · `_install_intrinsic_manuals` :183 · `_build_system_prompt` :368 / `_build_system_prompt_batches` :386 (pass the init-prompt contract's third-party `base_prompt` (`self._base_prompt`) to the kernel builder, which renders it after raw `principle` and before the rest of Batch 1) · `_load_mcp_from_workdir` :398 (also tracks specs in `_mcp_init_specs`) · `_retry_failed_mcps` :550 (re-spawn dead MCPs on `system(refresh)` — issue #34) · `_read_init` :1192 delegates the shared `lingtai.init_reader.read_init` path, then publishes the real reader's effective secret-redacted manifest to `system/manifest.resolved.json` via `lingtai.kernel.workdir.write_resolved_manifest` — issue #259; it never rewrites user-owned init.json. · `_setup_from_init` :1338 (**full reconstruct** — shared by boot and live refresh; reads `manifest.disable` and re-applies `apply_core_defaults`) · `_activate_preset` :1261 (runtime swap, atomic write) · `_reload_prompt_sections` :1602 (init-prompt contract: the externally changeable prompt surface is exactly `base_prompt`/`covenant`/`comment`. Resolves `base_prompt` into `self._base_prompt` (mirrored to `system/base_prompt.md`), writes `covenant`/`rules` plus kernel-owned `substrate`/`principle`/`procedures` (init overrides ignored) and `guidance.json`, then disk-sourced `brief` and `comment`; delegates `character` to `_lingtai_load` and `pad` to `_pad_load` — the canonical composers — so boot/refresh/molt are consistent and hook-order-independent) · `connect_mcp` :771 / `connect_mcp_http` :826 · `start` :764 / `stop` :875
+**`agent.py`** — `Agent(BaseAgent)`: `__init__` :132 (accept `capabilities=` + `disable=` and establish the wrapper-owned MCP activation lock/state before composition) · `_setup_capability` · `_install_intrinsic_manuals` · `_build_system_prompt` / `_build_system_prompt_batches` · `_load_mcp_from_workdir` (also tracks specs in `_mcp_init_specs`) · `_retry_failed_mcps` (re-spawn dead MCPs through exact-predecessor retirement on `system(refresh)`) · `_prepare_mcp_candidate` / `_preflight_mcp_candidate` / `_activate_mcp_candidate` (complete tools/list and schema/ownership validation before copy-on-write publication; exact dead predecessors are depublished and closed before replacement startup) · `_retire_all_mcp_clients` (depublish-first, attempt-all teardown with unresolved clients retained privately for convergence) · `_read_init` delegates the shared `lingtai.init_reader.read_init` path, then publishes the real reader's effective secret-redacted manifest to `system/manifest.resolved.json` via `lingtai.kernel.workdir.write_resolved_manifest`; it never rewrites user-owned init.json. · `_setup_from_init` (**full reconstruct** — shared by boot and live refresh; blocks reconstruction when MCP cleanup remains unresolved) · `_activate_preset` (runtime swap, atomic write) · `_reload_prompt_sections` (canonical boot/refresh/molt prompt reconstruction) · `connect_mcp` / `connect_mcp_http` · `start` / `stop`
 
 **`cli.py`**: `load_init` :26 · `build_agent` :82 · `run` :226 · `_force_exit_if_worker_poisoned` :276 · `_handle_log_command` :319 · `_handle_maintenance_command` :369 · `main` :425
 
@@ -143,6 +143,44 @@ Parent: `src/lingtai/` under `lingtai-kernel/src/` alongside `lingtai/kernel/` (
 - **LLM / preset safelists (issue #78):** `_build_manifest` :262 also re-applies `_LLM_PUBLIC_KEYS = ("provider", "model", "base_url", "api_compat", "context_limit")` to the kernel-supplied `llm` block as defense-in-depth, and reads `manifest.preset` from init.json via `_read_preset_from_init` :300 filtered to `_PRESET_PUBLIC_KEYS = ("active", "default", "allowed")`. Anything outside the safelists never reaches `.agent.json` or the identity prompt section. This is the central safety claim of #78 — see `tests/test_agent_preset_manifest.py::test_manifest_never_contains_api_key`.
 - **AgentConfig hydration:** `_setup_from_init` :1338 rebuilds runtime config via `build_agent_config`, overlaying explicit init.json values onto `lingtai.kernel.config.AgentConfig` defaults. `manifest.cache_miss_budget` overlays `AgentConfig.cache_miss_budget` (default 1,000,000). Legacy `max_turns` and `molt_*` manifest values remain deliberately ignored. `manifest.llm.thinking` hydrates verbatim when present (schema values `none`/`minimal`/`low`/`medium`/`high`/`xhigh`); when omitted, Codex-family providers (`THINKING_PROVIDERS`) keep the `"default"` sentinel so the Codex adapter applies its own default (`reasoning.effort = "xhigh"`), while other providers keep the legacy cross-provider `"high"` main-session default.
 - **Addon decompression** runs BEFORE capability setup so `mcp` capability sees populated `mcp_registry.jsonl` on first reconcile (`Agent.__init__` :33, `_setup_from_init` :1338).
-- **MCP retry contract (issue #34):** `_load_mcp_from_workdir` :376 records every registered init.json mcp entry into `self._mcp_init_specs` (name → `{cfg, source, client}`). `_retry_failed_mcps` :524 walks this dict, closes any dead client (`is_connected()` False), respawns with the original config, and reports `{retried, recovered, still_failed, healthy}`. `system(action="refresh")` calls it via `lingtai/tools/system/preset.py:_refresh` before `_perform_refresh` so the documented "fix config → refresh" recovery path works without full process restart.
+- **MCP activation/retry contract (issue #34):** `_load_mcp_from_workdir`
+  records every registered init.json MCP entry as
+  `{cfg, source, client, reserved_provenance}`. `reserved_provenance` is the
+  frozen result of `services.mcp_registry.materialize_curated_provenance`;
+  initial load and retry both require its exact canonical
+  source/transport/command/args/env materialization. Telegram permits only
+  `LINGTAI_TELEGRAM_CONFIG` in the configured env, while runtime-owned
+  `LINGTAI_AGENT_DIR`/`LINGTAI_MCP_NAME` and Python/dynamic-loader variables
+  cannot confer reserved authority; the runtime-owned values are injected
+  last so ordinary registrations cannot override them. Initial stdio/HTTP candidates remain unpublished
+  through startup, full tools/list preparation, schema validation, duplicate
+  detection, and ownership preflight. `_retry_failed_mcps` accepts a
+  predecessor only after validating its complete handler/owner/schema/name-set,
+  client-list, and init-spec projection. Retirement is keyed by init-spec:
+  depublishing does not discard association, and a failed close remains in
+  `_mcp_pending_retirements` plus the spec until close/thread retirement is
+  verified on a later retry. `MCPActivationOutcome` carries the exact committed
+  replacement identity, whose duplicate-free tool-name set must exactly equal
+  the complete client-owned handlers, schemas, owner map, and name set.
+  Publication failure restores every in-memory projection and compensates the
+  live chat adapter with the restored schema set; a compensation failure is
+  reported together with the original activation failure. Activation, retry,
+  stop, and deep refresh share one lifecycle `RLock`; a generation plus
+  teardown barrier invalidates waiters and prevents a candidate from publishing
+  after stop/refresh begins. Stop and System refresh linearize when the first
+  caller acquires that `RLock`: stop-first blocks mutation, while refresh-first
+  completes its mutation and handoff attempt before stop proceeds.
+  the public `base_agent.RefreshHandoffOutcome` contract and one lifecycle
+  coordinator cover System, heartbeat, and worker-hang recovery callers.
+  Pre-spawn failures return actionable errors and release ownership back to
+  `active`. Once detached watcher spawn succeeds the handoff is irreversible:
+  successful post-spawn telemetry and shutdown signaling is `committed`, while
+  any exception after spawn is `committed-degraded`; both keep terminal
+  `relaunching` plus the barrier and block a second watcher/activation attempt;
+  deep refresh never clears a stop-owned barrier or overwrites `stopping`.
+  Reserved `telegram`/`task_card` claims require the explicit Telegram loader
+  identity rather than a name-only collision bypass. `system(action="refresh")`
+  validates the entire four-list retry report and blocks preset mutation and
+  `_perform_refresh` on malformed reports, exceptions, or `still_failed`.
 - **Runtime venv markers:** `venv_resolve.py` accepts legacy managed venvs without `.lingtai-env.json` if `import lingtai` succeeds, then stamps the marker best-effort. Marker read/parse/probe failures are `error`, not `mismatch`, and never delete the managed runtime. A valid marker that proves a different OS/arch/Python environment is a confirmed mismatch: explicit `init.venv_path` candidates are rejected but left on disk, while only the managed global runtime venv (`~/.lingtai-tui/runtime/venv/`) may be removed before auto-create. The TUI calls this same logic through `python -m lingtai.venv_resolve env-marker {check,stamp} --venv <path>`.
 - **Lazy top-level facade:** `src/lingtai/__init__.py` uses PEP-562 ``__getattr__`` to resolve every public name lazily from its canonical source module (``__init__.py:18-110``). A bare ``import lingtai`` performs only stdlib/importlib.metadata work; it must not load `lingtai.agent`, `lingtai.kernel`, `tools`, `lingtai.llm`, services, MCP servers, or concrete providers. ``__dir__`` returns standard module globals unioned with ``__all__`` (``__init__.py:112-113``). Verified by `tests/test_lingtai_facade.py` and `tests/test_kernel_isolation.py`.

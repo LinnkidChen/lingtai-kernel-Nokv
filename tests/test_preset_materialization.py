@@ -1,6 +1,7 @@
 """Tests for preset materialization at boot — _read_init substitutes the
 active preset's llm + capabilities into manifest before validation."""
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -717,8 +718,8 @@ def test_refresh_preset_omitting_mcp_keeps_channel_reply_surface(tmp_path, monke
     init_data["mcp"] = {
         "telegram": {
             "type": "stdio",
-            "command": "python",
-            "args": ["-m", "fake_telegram_mcp"],
+            "command": sys.executable,
+            "args": ["-m", "lingtai.mcp_servers.telegram"],
             "env": {},
         }
     }
@@ -728,28 +729,37 @@ def test_refresh_preset_omitting_mcp_keeps_channel_reply_surface(tmp_path, monke
             "name": "telegram",
             "summary": "Telegram channel producer",
             "transport": "stdio",
-            "command": "python",
-            "args": ["-m", "fake_telegram_mcp"],
-            "source": "test",
+            "command": sys.executable,
+            "args": ["-m", "lingtai.mcp_servers.telegram"],
+            "source": "lingtai-curated",
         }) + "\n",
         encoding="utf-8",
     )
 
     class FakeClient:
-        def close(self):
+        def __init__(self, **kwargs):
+            self.closed = False
+
+        def start(self):
             pass
 
+        def list_tools(self):
+            return [{
+                "name": "telegram",
+                "description": "Telegram channel producer",
+                "schema": {"type": "object", "properties": {}},
+            }]
+
+        def close(self):
+            self.closed = True
+
         def is_connected(self):
-            return True
+            return not self.closed
 
-    def fake_connect_mcp(self, command, args=None, env=None):
-        self.add_tool("telegram", schema={}, handler=lambda _args: {"status": "ok"})
-        if not hasattr(self, "_mcp_clients"):
-            self._mcp_clients = []
-        self._mcp_clients.append(FakeClient())
-        return ["telegram"]
+        def call_tool(self, name, args):
+            return {"status": "ok"}
 
-    monkeypatch.setattr(Agent, "connect_mcp", fake_connect_mcp)
+    monkeypatch.setattr("lingtai.services.mcp.MCPClient", FakeClient)
 
     svc = MagicMock()
     svc.provider = "mock"

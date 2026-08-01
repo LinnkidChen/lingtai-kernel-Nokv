@@ -13,13 +13,17 @@ description: >
   and resident substrate maintenance. This is
   a nested skill-reference under `system-manual`, not a standalone catalog skill;
   its folder may carry scripts/assets as the substrate reference grows.
-version: 1.3.0
+version: 1.4.0
 tags: [lingtai, system-manual, substrate, runtime, lifecycle, communication, memory, notifications, mcp, preset]
-last_changed_at: 2026-07-19T00:00:00Z
+last_changed_at: 2026-07-25T00:00:00Z
 related_files:
 - src/lingtai/intrinsic_skills/system-manual/SKILL.md
 - src/lingtai/prompts/substrate/substrate.md
 - src/lingtai/prompts/substrate/substrate.yaml
+- src/lingtai/agent.py
+- src/lingtai/tools/system/preset.py
+- tests/test_mcp_capability.py
+- tests/test_system.py
 maintenance: |
   Tracks the substrate-manual topic it documents; update when that integration changes.
 ---
@@ -293,6 +297,14 @@ WeChat, WhatsApp) own their own setup details; do not guess field names from
 memory. If you are an avatar without admin ownership of an MCP, do not
 reconfigure the orchestrator-owned integration; escalate or ask the orchestrator.
 
+Reserved Telegram runtime tools are available only when the registry and
+`init.json` entry still match the shipped curated stdio launch exactly. Its
+configured environment may contain `LINGTAI_TELEGRAM_CONFIG` only; runtime
+routing keys (`LINGTAI_AGENT_DIR`, `LINGTAI_MCP_NAME`) and Python or dynamic
+loader overrides are rejected for reserved authority. A mismatch is a
+configuration error to fix, not a reason to rename a user registration
+`telegram` or forge `source: lingtai-curated`.
+
 ## 9. Idle and soul
 
 When there is no concrete task, go idle/asleep rather than spinning, polling, or
@@ -430,12 +442,33 @@ requires both `active` and `default` to be members of `allowed`.
    `revert_preset=true` to read `manifest.preset.default` instead. An empty
    optional `preset` string normalizes to absent; supplying both a non-empty
    `preset` and `revert_preset` is a conflict.
-3. The refresh path checks the requested path's `allowed` membership, checks
-   the target preset's context limit fits the current conversation, activates
-   atomically (writes raw `init.json`), persists the new selected default for
-   a named swap, best-effort retries failed MCPs, then rebuilds the runtime
-   (LLM/config/capabilities/MCP/prompt reconstruction, preserving conversation
+3. The refresh path checks the requested path's `allowed` membership and
+   verifies that the target preset's context limit fits the current
+   conversation. Before activating the preset or changing
+   `manifest.preset.default`, it drains pending MCP retirements and retries
+   failed MCPs. The retry report must contain `retried`, `recovered`,
+   `still_failed`, and `healthy`, each as a list of strings. A missing or
+   malformed field, retry exception, still-live transport/thread, or non-empty
+   `still_failed` list blocks refresh without changing `init.json` or requesting
+   relaunch. Fix the MCP configuration or transport, ensure the old process has
+   retired, and call `system(action="refresh", ...)` again; repeated refresh is
+   the supported convergence path. Only after that precondition succeeds does
+   a named swap activate and persist its selected path, followed by runtime
+   reconstruction (LLM/config/capabilities/MCP/prompts, preserving conversation
    history where a live session exists).
+   One lifecycle coordinator owns this sequence through the relaunch request
+   for System, heartbeat, and worker recovery, using the same lifecycle lock as
+   stop. The first caller to acquire that lock wins: stop-first refuses preset
+   mutation and relaunch, while refresh-first completes its mutation and
+   handoff attempt before stop proceeds. Refresh reports success only when a
+   detached watcher starts and shutdown signaling succeeds. Missing launch
+   commands, ACK creation failure, and watcher-start failure return an error
+   and restore the old process to `active`. Once the watcher starts, any later
+   telemetry, shutdown-signal, or future-step exception is instead
+   `committed-degraded`: it returns an actionable error but preserves terminal
+   `relaunching` plus the barrier, so a
+   second watcher or activation cannot start. Deep reconstruction never clears
+   a stop-owned or committed-handoff barrier.
 4. A config, prompt, MCP, or capability edit needs `refresh` to take effect;
    `system(action="summarize")` alone does not reconstruct the runtime and
    must not be used as a refresh substitute.

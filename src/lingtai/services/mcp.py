@@ -101,6 +101,9 @@ class MCPClient:
         command: str,
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        *,
+        startup_timeout: float = 30.0,
+        close_timeout: float = 5.0,
     ):
         self._command = command
         self._args = args or []
@@ -110,11 +113,14 @@ class MCPClient:
         self._read_stream: Any = None
         self._write_stream: Any = None
         self._loop: Any = None
+        self._connect_task: Any = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: str | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._closed = False
+        self._startup_timeout = startup_timeout
+        self._close_timeout = close_timeout
         self._stdio_cm: Any = None
         self._session_cm: Any = None
 
@@ -182,23 +188,51 @@ class MCPClient:
 
         Called automatically by call_tool() if not yet connected.
         """
-        if self.is_connected():
-            return
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=30)
-        if self._error:
-            raise RuntimeError(f"MCP server failed to start: {self._error}")
+        with self._lock:
+            if self.is_connected():
+                return
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            ready = self._ready.wait(timeout=self._startup_timeout)
+            if not ready:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        "MCP server startup timed out; transport cleanup "
+                        f"unresolved: {cleanup_error}"
+                    ) from cleanup_error
+                raise RuntimeError("MCP server startup timed out")
+            if self._error:
+                error = self._error
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"MCP server failed to start: {error}; transport "
+                        f"cleanup unresolved: {cleanup_error}"
+                    ) from cleanup_error
+                raise RuntimeError(f"MCP server failed to start: {error}")
 
     def close(self) -> None:
         """Shut down the MCP session and background thread."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=5)
+        with self._lock:
+            self._closed = True
+            if self._loop and self._loop.is_running():
+                def _cancel_and_stop() -> None:
+                    connect_task = self._connect_task
+                    if connect_task is not None and not connect_task.done():
+                        connect_task.cancel()
+                        return
+                    self._loop.stop()
+
+                self._loop.call_soon_threadsafe(_cancel_and_stop)
+            if self._thread and self._thread is not threading.current_thread():
+                self._thread.join(timeout=self._close_timeout)
+                if self._thread.is_alive():
+                    raise RuntimeError(
+                        "MCP client thread is still alive after bounded close"
+                    )
 
     def restart(self) -> None:
         """Tear down a (possibly stale) session and reconnect from scratch.
@@ -218,6 +252,7 @@ class MCPClient:
         self._read_stream = None
         self._write_stream = None
         self._loop = None
+        self._connect_task = None
         self._thread = None
         self._stdio_cm = None
         self._session_cm = None
@@ -439,8 +474,12 @@ class MCPClient:
         self._loop = loop
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._async_connect())
+            self._connect_task = loop.create_task(self._async_connect())
+            loop.run_until_complete(self._connect_task)
             loop.run_forever()
+        except asyncio.CancelledError as e:
+            self._error = self._format_exception(e)
+            self._ready.set()
         except Exception as e:
             # Preserve the class name so a blank str(e) (e.g. ClosedResourceError)
             # does not produce "MCP server failed to start: " (issue #104).
@@ -503,17 +542,23 @@ class HTTPMCPClient:
         self,
         url: str,
         headers: dict[str, str] | None = None,
+        *,
+        startup_timeout: float = 30.0,
+        close_timeout: float = 5.0,
     ):
         self._url = url
         self._headers = headers or {}
 
         self._session: Any = None
         self._loop: Any = None
+        self._connect_task: Any = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: str | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._closed = False
+        self._startup_timeout = startup_timeout
+        self._close_timeout = close_timeout
         self._transport_cm: Any = None
         self._session_cm: Any = None
 
@@ -521,22 +566,50 @@ class HTTPMCPClient:
         self._activity_lock = threading.Lock()
 
     def start(self) -> None:
-        if self.is_connected():
-            return
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=30)
-        if self._error:
-            raise RuntimeError(f"HTTP MCP server failed to connect: {self._error}")
+        with self._lock:
+            if self.is_connected():
+                return
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            ready = self._ready.wait(timeout=self._startup_timeout)
+            if not ready:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        "HTTP MCP startup timed out; transport cleanup "
+                        f"unresolved: {cleanup_error}"
+                    ) from cleanup_error
+                raise RuntimeError("HTTP MCP startup timed out")
+            if self._error:
+                error = self._error
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"HTTP MCP server failed to connect: {error}; "
+                        f"transport cleanup unresolved: {cleanup_error}"
+                    ) from cleanup_error
+                raise RuntimeError(f"HTTP MCP server failed to connect: {error}")
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=5)
+        with self._lock:
+            self._closed = True
+            if self._loop and self._loop.is_running():
+                def _cancel_and_stop() -> None:
+                    connect_task = self._connect_task
+                    if connect_task is not None and not connect_task.done():
+                        connect_task.cancel()
+                        return
+                    self._loop.stop()
+
+                self._loop.call_soon_threadsafe(_cancel_and_stop)
+            if self._thread and self._thread is not threading.current_thread():
+                self._thread.join(timeout=self._close_timeout)
+                if self._thread.is_alive():
+                    raise RuntimeError(
+                        "HTTP MCP client thread is still alive after bounded close"
+                    )
 
     def is_connected(self) -> bool:
         return (
@@ -612,8 +685,12 @@ class HTTPMCPClient:
         self._loop = loop
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._async_connect())
+            self._connect_task = loop.create_task(self._async_connect())
+            loop.run_until_complete(self._connect_task)
             loop.run_forever()
+        except asyncio.CancelledError as e:
+            self._error = MCPClient._format_exception(e)
+            self._ready.set()
         except Exception as e:
             # Preserve the class name so a blank str(e) is not surfaced as an
             # empty connect error (issue #104).

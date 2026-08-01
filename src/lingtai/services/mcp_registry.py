@@ -15,6 +15,7 @@ renderer (``_build_registry_xml``).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import re
@@ -30,6 +31,37 @@ CATALOG_FILENAME = "mcp_catalog.json"
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}$")
 _VALID_TRANSPORTS = {"stdio", "http"}
 _MAX_SUMMARY_LEN = 200
+_CURATED_ENV_ALLOWLISTS = {
+    "telegram": frozenset({"LINGTAI_TELEGRAM_CONFIG"}),
+}
+_RUNTIME_OWNED_ENV_KEYS = frozenset({
+    "LINGTAI_AGENT_DIR",
+    "LINGTAI_MCP_NAME",
+})
+_INTERPRETER_LOADER_ENV_KEYS = frozenset({
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONINSPECT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+})
+
+
+@dataclass(frozen=True)
+class CuratedMCPProvenance:
+    """Immutable proof that one init spec matches a shipped curated launch."""
+
+    name: str
+    source: str
+    transport: str
+    command: str | None
+    args: tuple[str, ...]
+    url: str | None
+    env: tuple[tuple[str, str], ...]
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +94,119 @@ def _load_catalog() -> dict[str, dict]:
         if not name.startswith("_") and isinstance(record, dict)
     }
     return _CATALOG_CACHE
+
+
+def _substitute_catalog_value(value):
+    """Apply the catalog's canonical substitutions recursively."""
+    substitutions = {"{python}": sys.executable}
+    if isinstance(value, str):
+        for marker, replacement in substitutions.items():
+            value = value.replace(marker, replacement)
+        return value
+    if isinstance(value, list):
+        return [_substitute_catalog_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _substitute_catalog_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _materialize_catalog_record(name: str) -> dict | None:
+    template = _load_catalog().get(name)
+    if not isinstance(template, dict):
+        return None
+    record = _substitute_catalog_value(template)
+    return record if isinstance(record, dict) else None
+
+
+def materialize_curated_provenance(
+    name: str,
+    cfg: dict,
+    source: str,
+    *,
+    registry_record: dict | None = None,
+    expected: CuratedMCPProvenance | None = None,
+) -> CuratedMCPProvenance | None:
+    """Classify an exact curated launch using one canonical materialization.
+
+    Initial load supplies the validated registry record. Retry supplies the
+    immutable proof stored by initial load; current config must materialize to
+    the exact same proof. Reserved-name authority is denied when environment
+    keys fall outside the addon's explicit allowlist or attempt to affect the
+    Python interpreter, dynamic loader, or runtime-owned routing variables.
+    """
+    if source != "init.json:mcp" or not isinstance(cfg, dict):
+        return None
+    canonical = _materialize_catalog_record(name)
+    if not isinstance(canonical, dict):
+        return None
+    if canonical.get("source") != "lingtai-curated":
+        return None
+    transport = canonical.get("transport")
+    if transport not in _VALID_TRANSPORTS:
+        return None
+
+    if registry_record is not None:
+        if not isinstance(registry_record, dict):
+            return None
+        compared = ("name", "source", "transport")
+        if any(
+            registry_record.get(key) != canonical.get(key)
+            for key in compared
+        ):
+            return None
+        if transport == "stdio" and (
+            registry_record.get("command") != canonical.get("command")
+            or registry_record.get("args", []) != canonical.get("args", [])
+        ):
+            return None
+        if transport == "http" and (
+            registry_record.get("url") != canonical.get("url")
+        ):
+            return None
+    elif expected is None:
+        return None
+
+    cfg_transport = cfg.get("type", "stdio")
+    if cfg_transport != transport:
+        return None
+    if transport == "stdio" and (
+        cfg.get("command") != canonical.get("command")
+        or cfg.get("args", []) != canonical.get("args", [])
+    ):
+        return None
+    if transport == "http" and cfg.get("url") != canonical.get("url"):
+        return None
+
+    env = cfg.get("env") or {}
+    if not isinstance(env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in env.items()
+    ):
+        return None
+    allowed_env = _CURATED_ENV_ALLOWLISTS.get(name, frozenset())
+    env_keys = set(env)
+    if (
+        not env_keys <= allowed_env
+        or env_keys & _RUNTIME_OWNED_ENV_KEYS
+        or env_keys & _INTERPRETER_LOADER_ENV_KEYS
+    ):
+        return None
+
+    provenance = CuratedMCPProvenance(
+        name=name,
+        source=source,
+        transport=transport,
+        command=canonical.get("command") if transport == "stdio" else None,
+        args=tuple(canonical.get("args", [])) if transport == "stdio" else (),
+        url=canonical.get("url") if transport == "http" else None,
+        env=tuple(sorted(env.items())),
+    )
+    if expected is not None and provenance != expected:
+        return None
+    return provenance
 
 
 # ---------------------------------------------------------------------------
@@ -330,21 +475,6 @@ def decompress_addons(working_dir: Path, addons: list[str]) -> dict:
     unknown: list[str] = []
     invalid: list[dict] = []
 
-    import sys
-    substitutions = {"{python}": sys.executable}
-
-    def _substitute(value):
-        if isinstance(value, str):
-            for k, v in substitutions.items():
-                if k in value:
-                    value = value.replace(k, v)
-            return value
-        if isinstance(value, list):
-            return [_substitute(x) for x in value]
-        if isinstance(value, dict):
-            return {k: _substitute(v) for k, v in value.items()}
-        return value
-
     for name in addons:
         if name in existing_names:
             skipped.append(name)
@@ -353,7 +483,10 @@ def decompress_addons(working_dir: Path, addons: list[str]) -> dict:
             unknown.append(name)
             log.warning("mcp: addon %r not found in catalog", name)
             continue
-        record = _substitute(dict(catalog[name]))
+        record = _materialize_catalog_record(name)
+        if record is None:
+            invalid.append({"name": name, "error": "catalog materialization failed"})
+            continue
         ok, err = validate_record(record)
         if not ok:
             invalid.append({"name": name, "error": err})
